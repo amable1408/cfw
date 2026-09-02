@@ -6,7 +6,7 @@ A modular **C23 framework**: self-contained modules, one translation unit each, 
 per module, and a test suite per module. This repository is the **audited export** of CFW - it
 holds only the modules that have cleared every gate below, together with everything they include.
 
-Version **0.1.0** ships **11 modules** (97 files) - see the table below
+Version **0.1.0** ships **12 modules** (99 files) - see the table below
 for exactly which ones.
 
 ## What "audited" means
@@ -34,16 +34,17 @@ errors that abort in checked builds - is documented in its header's `Error Handl
 
 | Module | Files | Suite | Role |
 | :-- | :-- | :-- | :-- |
-| `chrono` | 1 .c / 1 .h | with its dependencies |  |
-| `console` | 1 .c / 1 .h | with its dependencies | Cross-platform terminal library for x64 systems |
+| `chrono` | 1 .c / 1 .h | tests/chrono/ |  |
+| `console` | 1 .c / 1 .h | tests/console/ | Cross-platform terminal library for x64 systems |
 | `error` | 1 .c / 1 .h | with its dependencies | Centralized error checking utilities for the C Libraries Framework |
-| `log` | 1 .c / 1 .h | with its dependencies | Centralized logging and debug tracing for the C Libraries Framework |
-| `math` | 36 .c / 39 .h | with its dependencies | 2D axis-aligned bounding box operations for the CFW math module |
-| `platform/windows` | 0 .c / 1 .h | header-only | Canonical entry point for the Windows system headers |
+| `log` | 1 .c / 1 .h | tests/log/ | Centralized logging and debug tracing for the C Libraries Framework |
+| `math` | 36 .c / 39 .h | tests/math/ | 2D axis-aligned bounding box operations for the CFW math module |
+| `platform/windows` | 0 .c / 1 .h | tests/platform/windows/ | Canonical entry point for the Windows system headers |
 | `result` | 0 .c / 1 .h | header-only | Packed status/error code type for CFW |
-| `thread` | 1 .c / 1 .h | with its dependencies | Cross-platform thread and synchronization primitives for the C Libraries Framework |
-| `tracelog` | 1 .c / 1 .h | with its dependencies | Manual call-stack tracing for the C Libraries Framework |
-| `tuple` | 3 .c / 4 .h | with its dependencies | Tuple type (bool, USize) for the C Libraries Framework |
+| `test` | 1 .c / 1 .h | tests/test/ | Small test runner for the C Libraries Framework |
+| `thread` | 1 .c / 1 .h | tests/thread/ | Cross-platform thread and synchronization primitives for the C Libraries Framework |
+| `tracelog` | 1 .c / 1 .h | tests/tracelog/ | Manual call-stack tracing for the C Libraries Framework |
+| `tuple` | 3 .c / 4 .h | tests/tuple/ | Tuple type (bool, USize) for the C Libraries Framework |
 | `types` | 0 .c / 1 .h | header-only | Standard type definitions and platform macros for cross-platform C |
 
 ## Building
