@@ -6,7 +6,7 @@ A modular **C23 framework**: self-contained modules, one translation unit each, 
 per module, and a test suite per module. This repository is the **audited export** of CFW - it
 holds only the modules that have cleared every gate below, together with everything they include.
 
-Version **0.1.0** ships **2 modules** (2 files) - see the table below
+Version **0.1.0** ships **3 modules** (4 files) - see the table below
 for exactly which ones.
 
 ## What "audited" means
@@ -34,6 +34,7 @@ errors that abort in checked builds - is documented in its header's `Error Handl
 
 | Module | Files | Suite | Role |
 | :-- | :-- | :-- | :-- |
+| `console` | 1 .c / 1 .h | with its dependencies | Cross-platform terminal library for x64 systems |
 | `platform/windows` | 0 .c / 1 .h | header-only | Canonical entry point for the Windows system headers |
 | `types` | 0 .c / 1 .h | header-only | Standard type definitions and platform macros for cross-platform C |
 
