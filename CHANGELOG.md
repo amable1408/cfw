@@ -8,3 +8,4 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 ## Unreleased
 
 - `platform/windows`
+- `types`
