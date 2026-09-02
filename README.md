@@ -64,7 +64,7 @@ Requires a **C23 compiler** (gcc 14+ or clang 18+; MSVC is not supported) and, a
 
 ```sh
 # Debian / Ubuntu
-sudo apt install libpcre2-dev
+sudo apt install libcglm-dev libpcre2-dev
 
 # MSYS2 (UCRT64)
 pacman -S mingw-w64-ucrt-x86_64-cglm mingw-w64-ucrt-x86_64-pcre2
@@ -82,13 +82,7 @@ nothing elsewhere. Every other suite runs on both legs of CI.
 `make CC=clang`, `CFLAGS=...` and `CSTD=-std=c2x` (for gcc 13 / clang 16-17) work as usual.
 A `CMakeLists.txt` mirrors the same build (`cmake -B build && cmake --build build && ctest --test-dir build`).
 
-**cglm must be 0.9.6.** Debian 13 and MSYS2 package exactly that; **Ubuntu 24.04 packages 0.9.2, which is too old** - it does not declare the `aabb2d` entry points this module calls, and the build fails at compile time rather than silently. Where the distro is behind, build the pin from source (this is what CI does):
-
-```sh
-git clone --depth 1 --branch v0.9.6 https://github.com/recp/cglm
-cmake -S cglm -B cglm/build -DCGLM_STATIC=ON -DCGLM_USE_TEST=OFF -DCMAKE_BUILD_TYPE=Release
-cmake --build cglm/build -j && sudo cmake --install cglm/build && sudo ldconfig
-```
+**cglm must be 0.9.6.** Debian 13 and MSYS2 package exactly that, and CI runs on Debian 13 for the same reason. Ubuntu 24.04's 0.9.2 is too old - it does not declare the `aabb2d` entry points `math` calls, so the build fails at compile time rather than silently. Getting the right version is your package manager's problem, not this Makefile's; note only that a cglm you build yourself may enable a SIMD path whose `rcpps` approximation costs `mat4_inv_fast` about 2^-12 of precision, which the suite's exactness assertions will catch.
 
 **Why 0.9.6 exactly.** `math` was written against a post-0.9.6 cglm snapshot that exports eight compiled entry points the released library does not. `include/math/cglm_compat.h` carries those eight bodies so the facade links against the cglm your package manager ships, and every other cglm symbol the module uses is pinned against 0.9.6's export list upstream. A newer cglm is not tested and a mismatch will show up as duplicate or missing symbols at link time, not silently.
 

@@ -8,31 +8,27 @@ on:
 jobs:
   linux:
     runs-on: ubuntu-latest
+    # Debian 13 rather than the ubuntu-latest image: its gcc is 14 (the default cc on
+    # ubuntu-latest predates -std=c23) and it packages the dependency versions these modules
+    # were audited against. Resolving a dependency is the environment's job, not the build's.
+    container: debian:13
     steps:
       - uses: actions/checkout@v5
-      - name: Install gcc-14 (the default cc predates -std=c23) and system dependencies
-        run: sudo apt-get update && sudo apt-get install -y gcc-14 libpcre2-dev
-      - name: Build cglm 0.9.6 from source (Ubuntu packages 0.9.2, which is too old)
-        run: |
-          git clone --depth 1 --branch v0.9.6 https://github.com/recp/cglm /tmp/cglm
-          cmake -S /tmp/cglm -B /tmp/cglm/build -DCGLM_STATIC=ON -DCGLM_USE_TEST=OFF \
-                -DCMAKE_BUILD_TYPE=Release
-          cmake --build /tmp/cglm/build -j
-          sudo cmake --install /tmp/cglm/build
-          sudo ldconfig
+      - name: Install the toolchain and system dependencies
+        run: apt-get update && apt-get install -y build-essential libcglm-dev libpcre2-dev
       # `make test` alone proves nothing when the export carries no suite yet: TEST_BIN is
       # empty, libcfw.a is only a prerequisite of the test binaries, and the job passes without
       # compiling a file. Build the library explicitly first.
       - name: Build
-        run: make CC=gcc-14
+        run: make
       - name: Test
-        run: make test CC=gcc-14
+        run: make test
       - name: Allocation-failure harness
-        run: make test-oom CC=gcc-14
+        run: make test-oom
       - name: Sanitizer build (ASan/UBSan)
         run: |
           make clean
-          make test CC=gcc-14 CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wall -std=c23"
+          make test CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wall -std=c23"
 
   windows:
     runs-on: windows-latest
