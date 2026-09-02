@@ -6,7 +6,7 @@ A modular **C23 framework**: self-contained modules, one translation unit each, 
 per module, and a test suite per module. This repository is the **audited export** of CFW - it
 holds only the modules that have cleared every gate below, together with everything they include.
 
-Version **0.1.0** ships **22 modules** (125 files) - see the table below
+Version **0.1.0** ships **23 modules** (127 files) - see the table below
 for exactly which ones.
 
 ## What "audited" means
@@ -50,6 +50,7 @@ errors that abort in checked builds - is documented in its header's `Error Handl
 | `memory` | 1 .c / 1 .h | tests/memory/ | Canonical memory management utilities for the C Libraries Framework |
 | `platform/windows` | 0 .c / 1 .h | tests/platform/windows/ | Canonical entry point for the Windows system headers |
 | `process` | 1 .c / 1 .h | tests/process/ | Spawn a child program with piped stdin/stdout and capture what it writes |
+| `regex` | 1 .c / 1 .h | tests/regex/ | PCRE2-based regular expression wrapper for the C Libraries Framework |
 | `result` | 0 .c / 1 .h | header-only | Packed status/error code type for CFW |
 | `test` | 1 .c / 1 .h | tests/test/ | Small test runner for the C Libraries Framework |
 | `thread` | 1 .c / 1 .h | tests/thread/ | Cross-platform thread and synchronization primitives for the C Libraries Framework |
@@ -63,10 +64,10 @@ Requires a **C23 compiler** (gcc 14+ or clang 18+; MSVC is not supported) and, a
 
 ```sh
 # Debian / Ubuntu
-sudo apt install libcglm-dev
+sudo apt install libcglm-dev libpcre2-dev
 
 # MSYS2 (UCRT64)
-pacman -S mingw-w64-ucrt-x86_64-cglm
+pacman -S mingw-w64-ucrt-x86_64-cglm mingw-w64-ucrt-x86_64-pcre2
 ```
 
 ```sh

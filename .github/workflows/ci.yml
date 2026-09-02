@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install gcc-14 (the default cc predates -std=c23) and system dependencies
-        run: sudo apt-get update && sudo apt-get install -y gcc-14 libcglm-dev
+        run: sudo apt-get update && sudo apt-get install -y gcc-14 libcglm-dev libpcre2-dev
       - name: Build and test
         run: make test CC=gcc-14
       - name: Allocation-failure harness
@@ -32,6 +32,6 @@ jobs:
         with:
           msystem: UCRT64
           update: true
-          install: mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cglm make
+          install: mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cglm mingw-w64-ucrt-x86_64-pcre2 make
       - name: Build and test (MinGW)
         run: make test
