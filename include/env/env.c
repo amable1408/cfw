@@ -363,14 +363,9 @@ bool env_exists(char const *const name) {
 Result env_from_char_1(char const *const data, USize const size) {
     trace_log_push(LOG_METADATA);
 
-    /* See env_from_char_2: data is nullable only at size 0. */
+    /* See env_from_char_2: data is nullable only at size 0, and an empty range
+     * is answered there. */
     error_check_wrong_value(LOG_METADATA, "data", size > 0 && memory_empty(data));
-
-    if (size == 0) {
-        trace_log_pop();
-
-        return RESULT_SUCCESS;
-    }
 
     Result const result = env_from_char_2(data, size, false);
 

@@ -106,8 +106,9 @@
  *   - The C runtime copies name and value on write; no module-side state is kept
  *
  * Performance Characteristics:
- *   - env_load is one file read plus a single pass over its bytes; every other
- *     call is O(1) beyond the C runtime's own environment lookup
+ *   - env_load is one size query of its own (file's reader makes a second), one
+ *     file read and a single pass over its bytes; every other call is O(1)
+ *     beyond the C runtime's own environment lookup
  *
  * Dependencies:
  *   - <stdlib.h> (getenv, plus _putenv_s on Windows / setenv, unsetenv on POSIX)
@@ -253,7 +254,8 @@ USize env_get_number_u(char const *const name, USize const fallback);
  * @param path File path, used exactly as given.
  * @return RESULT_SUCCESS; the OS classification when the file is missing or
  *         unreadable (never SUCCESS on a failed open); an IO-category Result
- *         when the path opens but is not a regular file (a directory); a
+ *         when the path opens but is not a regular file (a directory), or is
+ *         over FILE_READ_BYTES_MAX or read short (nothing applied); a
  *         RESULT_FLAG_PARTIAL Result (APPLICATION category, code = skipped line
  *         count) when malformed lines were skipped.
  */

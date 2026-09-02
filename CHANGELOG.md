@@ -8,6 +8,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 ## Unreleased
 
 - `env`
+- sync: env
 
 ## 0.1.0 - first export
 
