@@ -5,6 +5,10 @@ All notable changes to the public CFW export. Versioning follows [SemVer 2.0.0](
 A module arrives in its own commit, the moment it has cleared all five audit dimensions
 upstream; a version is tagged when a family is complete, so entries accumulate here first.
 
+## Unreleased
+
+- `env`
+
 ## 0.1.0 - first export
 
 The foundation and `math`, audited on all five dimensions with their whole include closure:
