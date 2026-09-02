@@ -25,3 +25,4 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - `allocator`
 - `char`
 - `container/str`
+- `container/string`
