@@ -14,3 +14,4 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - `tuple`
 - `thread`
 - `log`
+- `tracelog`
