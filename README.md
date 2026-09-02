@@ -6,7 +6,7 @@ A modular **C23 framework**: self-contained modules, one translation unit each, 
 per module, and a test suite per module. This repository is the **audited export** of CFW - it
 holds only the modules that have cleared every gate below, together with everything they include.
 
-Version **0.1.0** ships **16 modules** (113 files) - see the table below
+Version **0.1.0** ships **17 modules** (115 files) - see the table below
 for exactly which ones.
 
 ## What "audited" means
@@ -36,6 +36,7 @@ errors that abort in checked builds - is documented in its header's `Error Handl
 | :-- | :-- | :-- | :-- |
 | `allocator` | 1 .c / 1 .h | tests/allocator/ | Canonical allocator interface for the C Libraries Framework |
 | `arena` | 4 .c / 4 .h | tests/arena/ | Canonical arena interface for the C Libraries Framework |
+| `char` | 1 .c / 1 .h | with its dependencies | Null-terminated char-buffer string utilities for the CFW framework |
 | `chrono` | 1 .c / 1 .h | tests/chrono/ |  |
 | `console` | 1 .c / 1 .h | tests/console/ | Cross-platform terminal library for x64 systems |
 | `error` | 1 .c / 1 .h | tests/error/ | Centralized error checking utilities for the C Libraries Framework |
