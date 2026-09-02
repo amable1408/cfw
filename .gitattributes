@@ -1,0 +1,3 @@
+# Normalize line endings to LF in the repository (keeps the tree consistent across
+# Windows/Linux/macOS checkouts).
+* text=auto eol=lf

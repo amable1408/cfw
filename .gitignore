@@ -1,0 +1,13 @@
+# Build outputs
+*.o
+*.obj
+*.a
+*.exe
+tests/**/test_*
+!tests/**/test_*.c
+!tests/**/test_*.h
+
+# CMake
+/build/
+CMakeCache.txt
+CMakeFiles/

@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install gcc-14 (the default cc predates -std=c23) and system dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc-14
+      - name: Build and test
+        run: make test CC=gcc-14
+      - name: Allocation-failure harness
+        run: make test-oom CC=gcc-14
+      - name: Sanitizer build (ASan/UBSan)
+        run: |
+          make clean
+          make test CC=gcc-14 CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wall -std=c23"
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-gcc make
+      - name: Build and test (MinGW)
+        run: make test
