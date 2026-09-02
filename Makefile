@@ -6,8 +6,8 @@
 #   make clean
 #
 # Requires a C23 compiler (gcc 14+ / clang 18+) and, as SYSTEM packages:
-#   cglm 0.9.6             Debian/Ubuntu: apt install libcglm-dev        MSYS2: pacman -S mingw-w64-ucrt-x86_64-cglm
-#   PCRE2 (8-bit)          Debian/Ubuntu: apt install libpcre2-dev       MSYS2: pacman -S mingw-w64-ucrt-x86_64-pcre2
+#   cglm 0.9.6             Debian: apt install libcglm-dev (0.9.6+ - see README) MSYS2: pacman -S mingw-w64-ucrt-x86_64-cglm
+#   PCRE2 (8-bit)          Debian: apt install libpcre2-dev           MSYS2: pacman -S mingw-w64-ucrt-x86_64-pcre2
 # Override CC/CFLAGS as usual (e.g. `make CC=clang`). On Windows run under MSYS2 or Git Bash:
 # the `test` and `clean` recipes are POSIX-shell loops.
 
