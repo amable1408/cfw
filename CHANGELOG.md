@@ -24,3 +24,4 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - `process`
 - `allocator`
 - `char`
+- `container/str`
