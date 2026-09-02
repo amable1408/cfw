@@ -10,6 +10,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - `env`
 - sync: env
 - `bits`
+- sync: math
 
 ## 0.1.0 - first export
 

@@ -12,6 +12,7 @@
 // === Helpers ===
 
 #define _FTOL 1e-4
+#define _FTOL_FAST 1e-3
 #define _TOL 1e-9
 
 // Column-major flat index for a 4x4: col * 4 + row.
@@ -100,11 +101,14 @@ int main(void) {
     math_mat4_inv_precise_1(pa, pinvp);
     _check_f("inv_precise_1 set", pinvp[_AT(0, 0)] != 0.0 ? 1.0 : 0.0, 1.0, _TOL);
 
-    // inv_fast is exact for affine matrices whose bottom row is (0,0,0,1) like A.
+    // inv_fast takes the SSE path: cglm divides through _mm_rcp_ps, a 12-bit
+    // hardware approximation whose exact result differs between CPU vendors.
+    // 1 - 2^-12 came back on one CI host where another host gave exactly 1, so
+    // the pin allows what the instruction promises (about 2.4e-4), not _FTOL.
     Mat4 const invf = math_mat4_inv_fast_2(a);
     Mat4 const invf_a = math_mat4_mul_2(invf, a);
-    _check_f("inv_fast*A c0r0", invf_a.m[0][0], 1.0, _FTOL);
-    _check_f("inv_fast*A c1r1", invf_a.m[1][1], 1.0, _FTOL);
+    _check_f("inv_fast*A c0r0", invf_a.m[0][0], 1.0, _FTOL_FAST);
+    _check_f("inv_fast*A c1r1", invf_a.m[1][1], 1.0, _FTOL_FAST);
     FSize pinvf[16] = DEFAULT_INITIALIZATION;
     math_mat4_inv_fast_1(pa, pinvf);
     _check_f("inv_fast_1 set", pinvf[_AT(2, 2)] != 0.0 ? 1.0 : 0.0, 1.0, _TOL);
