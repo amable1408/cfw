@@ -42,6 +42,9 @@ foreach(src ${TEST_SRC})
     if(name STREQUAL "test_oom")
         continue()   # --wrap harness: `make test-oom` under GNU ld
     endif()
+    if(name STREQUAL "test_unchecked")
+        continue()   # built WITHOUT ERROR_CHECK_ENABLED against its own archive: `make test-unchecked`
+    endif()
     file(RELATIVE_PATH rel "${CMAKE_SOURCE_DIR}/tests" "${src}")
     get_filename_component(suite "${rel}" DIRECTORY)
     if(NOT WIN32 AND suite STREQUAL "platform/windows")

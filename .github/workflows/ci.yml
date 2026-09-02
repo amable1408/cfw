@@ -25,6 +25,8 @@ jobs:
         run: make test
       - name: Allocation-failure harness
         run: make test-oom
+      - name: Unchecked-build suites (ERROR_CHECK_ENABLED compiled out)
+        run: make test-unchecked
       - name: Sanitizer build (ASan/UBSan)
         run: |
           make clean
@@ -46,3 +48,5 @@ jobs:
         run: make
       - name: Test (MinGW)
         run: make test
+      - name: Unchecked-build suites (MinGW)
+        run: make test-unchecked

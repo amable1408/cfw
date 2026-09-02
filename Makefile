@@ -3,6 +3,9 @@
 #   make              build libcfw.a (every include/**/*.c except the test harness)
 #   make test         build every tests/**/test_*.c against libcfw.a and run them
 #   make test-oom     Linux only: the allocation-failure harness (needs -Wl,--wrap)
+#   make test-unchecked  every tests/**/test_unchecked.c, built WITHOUT ERROR_CHECK_ENABLED
+#                     against its own archive - the inert-fallback half of a module's
+#                     contract, which no checked build can observe
 #   make clean
 #
 # Requires a C23 compiler (gcc 14+ / clang 18+) and, as SYSTEM packages:
@@ -47,7 +50,7 @@ HARNESS  := include/test/test.c
 LIB_SRC  := $(filter-out $(HARNESS),$(call rwildcard,include,*.c))
 LIB_OBJ  := $(LIB_SRC:.c=.o)
 TEST_SRC := $(foreach f,$(call rwildcard,tests,*.c),$(if $(filter test_%,$(notdir $f)),$f))
-TEST_SRC := $(filter-out %/test_oom.c,$(TEST_SRC))
+TEST_SRC := $(filter-out %/test_oom.c %/test_unchecked.c,$(TEST_SRC))
 # The platform/windows suite exercises Winsock and the Win32 clock directly; the module's own
 # body is #ifdef _WIN32, so on any other OS there is nothing to test and the suite is skipped.
 ifneq ($(OS),Windows_NT)
@@ -57,6 +60,14 @@ TEST_BIN := $(TEST_SRC:.c=$(EXE))
 OOM_SRC  := $(filter %/test_oom.c,$(call rwildcard,tests,*.c))
 OOM_BIN  := $(OOM_SRC:.c=$(EXE))
 OOM_WRAP ?=
+# The unchecked suites pin what a module does with ERROR_CHECK_ENABLED compiled OUT - the
+# inert fallbacks a checked build can only abort on. They need the library built the same
+# way, so they get their own objects (a separate suffix: an object compiled under other
+# defines must never be reused) and their own archive; neither is part of `all`.
+CPPFLAGS_UNCHECKED := $(filter-out -DERROR_CHECK_ENABLED,$(CPPFLAGS))
+LIB_OBJ_UNCHECKED  := $(LIB_SRC:.c=.unchecked.o)
+UNCHECKED_SRC      := $(filter %/test_unchecked.c,$(call rwildcard,tests,*.c))
+UNCHECKED_BIN      := $(UNCHECKED_SRC:.c=$(EXE))
 
 all: libcfw.a
 
@@ -102,7 +113,24 @@ test-oom: $(OOM_BIN)
 	done; \
 	if [ -n "$$failed" ]; then echo "FAILED SUITES:$$failed"; fi; exit $$status
 
-clean:
-	-rm -f libcfw.a $(LIB_OBJ) $(TEST_BIN) $(OOM_BIN)
+libcfw_unchecked.a: $(LIB_OBJ_UNCHECKED)
+	$(AR) rcs $@ $^
 
-.PHONY: all test test-oom clean
+%.unchecked.o: %.c
+	$(CC) $(CFLAGS) $(CPPFLAGS_UNCHECKED) -c $< -o $@
+
+$(UNCHECKED_BIN): %$(EXE): %.c $(HARNESS) libcfw_unchecked.a
+	$(CC) $(CFLAGS) $(CPPFLAGS_UNCHECKED) -o $@ $< $(HARNESS) libcfw_unchecked.a $(LDLIBS)
+
+test-unchecked: $(UNCHECKED_BIN)
+	@status=0; failed=""; \
+	for t in $(UNCHECKED_BIN); do \
+	    echo "== $$t"; ./$$t; rc=$$?; \
+	    if [ $$rc -ne 0 ]; then echo "!! $$t exited with $$rc"; failed="$$failed $$t"; status=1; fi; \
+	done; \
+	if [ -n "$$failed" ]; then echo "FAILED SUITES:$$failed"; fi; exit $$status
+
+clean:
+	-rm -f libcfw.a libcfw_unchecked.a $(LIB_OBJ) $(LIB_OBJ_UNCHECKED) $(TEST_BIN) $(OOM_BIN) $(UNCHECKED_BIN)
+
+.PHONY: all test test-oom test-unchecked clean

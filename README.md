@@ -6,7 +6,7 @@ A modular **C23 framework**: self-contained modules, one translation unit each, 
 per module, and a test suite per module. This repository is the **audited export** of CFW - it
 holds only the modules that have cleared every gate below, together with everything they include.
 
-**24 modules** (129 files) at HEAD; the last tagged release is **0.1.0**. A
+**25 modules** (131 files) at HEAD; the last tagged release is **0.1.0**. A
 module lands in its own commit as soon as it clears the gate; a version is tagged when a family
 is complete. See the table below for exactly which modules are here.
 
@@ -37,6 +37,7 @@ errors that abort in checked builds - is documented in its header's `Error Handl
 | :-- | :-- | :-- | :-- |
 | `allocator` | 1 .c / 1 .h | tests/allocator/ | Canonical allocator interface for the C Libraries Framework |
 | `arena` | 4 .c / 4 .h | tests/arena/ | Canonical arena interface for the C Libraries Framework |
+| `bits` | 1 .c / 1 .h | tests/bits/ | Bit manipulation utilities for the C Libraries Framework |
 | `char` | 1 .c / 1 .h | tests/char/ | Null-terminated char-buffer string utilities for the CFW framework |
 | `chrono` | 1 .c / 1 .h | tests/chrono/ |  |
 | `console` | 1 .c / 1 .h | tests/console/ | Cross-platform terminal library for x64 systems |
@@ -76,6 +77,8 @@ pacman -S mingw-w64-ucrt-x86_64-cglm mingw-w64-ucrt-x86_64-pcre2
 make            # libcfw.a
 make test       # every tests/**/test_*.c, built against libcfw.a and run
 make test-oom   # Linux: the allocation-failure harness (GNU ld --wrap)
+make test-unchecked   # every tests/**/test_unchecked.c, built WITHOUT ERROR_CHECK_ENABLED
+                      # against its own archive: the inert-fallback half of a contract
 ```
 
 `tests/platform/windows/` is built and run on Windows only - the module it covers compiles to
