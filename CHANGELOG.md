@@ -19,3 +19,4 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - `chrono`
 - `math`
 - `test`
+- `memory`
