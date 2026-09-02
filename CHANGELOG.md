@@ -22,3 +22,4 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - `memory`
 - `arena`
 - `process`
+- `allocator`

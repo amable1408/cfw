@@ -6,7 +6,7 @@ A modular **C23 framework**: self-contained modules, one translation unit each, 
 per module, and a test suite per module. This repository is the **audited export** of CFW - it
 holds only the modules that have cleared every gate below, together with everything they include.
 
-Version **0.1.0** ships **15 modules** (111 files) - see the table below
+Version **0.1.0** ships **16 modules** (113 files) - see the table below
 for exactly which ones.
 
 ## What "audited" means
@@ -34,13 +34,14 @@ errors that abort in checked builds - is documented in its header's `Error Handl
 
 | Module | Files | Suite | Role |
 | :-- | :-- | :-- | :-- |
-| `arena` | 4 .c / 4 .h | with its dependencies | Canonical arena interface for the C Libraries Framework |
+| `allocator` | 1 .c / 1 .h | tests/allocator/ | Canonical allocator interface for the C Libraries Framework |
+| `arena` | 4 .c / 4 .h | tests/arena/ | Canonical arena interface for the C Libraries Framework |
 | `chrono` | 1 .c / 1 .h | tests/chrono/ |  |
 | `console` | 1 .c / 1 .h | tests/console/ | Cross-platform terminal library for x64 systems |
 | `error` | 1 .c / 1 .h | tests/error/ | Centralized error checking utilities for the C Libraries Framework |
 | `log` | 1 .c / 1 .h | tests/log/ | Centralized logging and debug tracing for the C Libraries Framework |
 | `math` | 36 .c / 39 .h | tests/math/ | 2D axis-aligned bounding box operations for the CFW math module |
-| `memory` | 1 .c / 1 .h | with its dependencies | Canonical memory management utilities for the C Libraries Framework |
+| `memory` | 1 .c / 1 .h | tests/memory/ | Canonical memory management utilities for the C Libraries Framework |
 | `platform/windows` | 0 .c / 1 .h | tests/platform/windows/ | Canonical entry point for the Windows system headers |
 | `process` | 1 .c / 1 .h | tests/process/ | Spawn a child program with piped stdin/stdout and capture what it writes |
 | `result` | 0 .c / 1 .h | header-only | Packed status/error code type for CFW |

@@ -78,7 +78,7 @@ test: $(TEST_BIN)
 # below gets exactly the --wrap flags its own test_oom.c defines a __wrap_* body for - a fixed
 # set for every binary left --wrap=realloc demanding a __wrap_realloc that a calloc/free-only
 # harness (e.g. container/str's) never defines, an undefined-reference link failure.
-# (no test_oom.c in this export)
+$(subst .c,$(EXE),tests/memory/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=realloc
 $(OOM_BIN): %$(EXE): %.c $(HARNESS) libcfw.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(HARNESS) libcfw.a $(OOM_WRAP) $(LDLIBS)
 
