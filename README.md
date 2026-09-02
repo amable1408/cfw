@@ -6,7 +6,7 @@ A modular **C23 framework**: self-contained modules, one translation unit each, 
 per module, and a test suite per module. This repository is the **audited export** of CFW - it
 holds only the modules that have cleared every gate below, together with everything they include.
 
-Version **0.1.0** ships **19 modules** (119 files) - see the table below
+Version **0.1.0** ships **20 modules** (121 files) - see the table below
 for exactly which ones.
 
 ## What "audited" means
@@ -41,6 +41,7 @@ errors that abort in checked builds - is documented in its header's `Error Handl
 | `console` | 1 .c / 1 .h | tests/console/ | Cross-platform terminal library for x64 systems |
 | `container/str` | 1 .c / 1 .h | tests/container/str/ | Canonical string buffer (Str) utilities for the C Libraries Framework |
 | `container/string` | 1 .c / 1 .h | tests/container/string/ | Canonical String Object for the C Libraries Framework |
+| `datetime` | 1 .c / 1 .h | tests/datetime/ | Date and time utilities for the C Libraries Framework |
 | `error` | 1 .c / 1 .h | tests/error/ | Centralized error checking utilities for the C Libraries Framework |
 | `log` | 1 .c / 1 .h | tests/log/ | Centralized logging and debug tracing for the C Libraries Framework |
 | `math` | 36 .c / 39 .h | tests/math/ | 2D axis-aligned bounding box operations for the CFW math module |
