@@ -5,7 +5,8 @@
 #   make test-oom     Linux only: the allocation-failure harness (needs -Wl,--wrap)
 #   make clean
 #
-# This build has no system library dependencies beyond libc/libm.
+# Requires a C23 compiler (gcc 14+ / clang 18+) and, as SYSTEM packages:
+#   cglm 0.9.6             Debian/Ubuntu: apt install libcglm-dev        MSYS2: pacman -S mingw-w64-ucrt-x86_64-cglm
 # Override CC/CFLAGS as usual (e.g. `make CC=clang`). On Windows run under MSYS2 or Git Bash:
 # the `test` and `clean` recipes are POSIX-shell loops.
 
@@ -24,7 +25,7 @@ CPPFLAGS := -Iinclude -D_GNU_SOURCE -DARENA_IMPLEMENTATION -DERROR_CHECK_ENABLED
 # The per-module system libraries on the line below are computed from the actual export set -
 # see SYSTEM_DEPS in the generator - so a module this build doesn't carry never contributes a
 # dead flag, and one it does carry can never be silently missing.
-LDLIBS   := -lm
+LDLIBS   := -lcglm -lm
 ifeq ($(OS),Windows_NT)
     # CFW's windows.h asserts the Windows 10 API baseline it was audited against.
     CPPFLAGS += -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00

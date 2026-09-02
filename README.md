@@ -6,7 +6,7 @@ A modular **C23 framework**: self-contained modules, one translation unit each, 
 per module, and a test suite per module. This repository is the **audited export** of CFW - it
 holds only the modules that have cleared every gate below, together with everything they include.
 
-Version **0.1.0** ships **10 modules** (22 files) - see the table below
+Version **0.1.0** ships **11 modules** (97 files) - see the table below
 for exactly which ones.
 
 ## What "audited" means
@@ -38,6 +38,7 @@ errors that abort in checked builds - is documented in its header's `Error Handl
 | `console` | 1 .c / 1 .h | with its dependencies | Cross-platform terminal library for x64 systems |
 | `error` | 1 .c / 1 .h | with its dependencies | Centralized error checking utilities for the C Libraries Framework |
 | `log` | 1 .c / 1 .h | with its dependencies | Centralized logging and debug tracing for the C Libraries Framework |
+| `math` | 36 .c / 39 .h | with its dependencies | 2D axis-aligned bounding box operations for the CFW math module |
 | `platform/windows` | 0 .c / 1 .h | header-only | Canonical entry point for the Windows system headers |
 | `result` | 0 .c / 1 .h | header-only | Packed status/error code type for CFW |
 | `thread` | 1 .c / 1 .h | with its dependencies | Cross-platform thread and synchronization primitives for the C Libraries Framework |
@@ -47,7 +48,15 @@ errors that abort in checked builds - is documented in its header's `Error Handl
 
 ## Building
 
-Requires a **C23 compiler** (gcc 14+ or clang 18+; MSVC is not supported); no system library dependencies beyond libc/libm.
+Requires a **C23 compiler** (gcc 14+ or clang 18+; MSVC is not supported) and, as system packages:
+
+```sh
+# Debian / Ubuntu
+sudo apt install libcglm-dev
+
+# MSYS2 (UCRT64)
+pacman -S mingw-w64-ucrt-x86_64-cglm
+```
 
 ```sh
 make            # libcfw.a
@@ -61,7 +70,7 @@ nothing elsewhere. Every other suite runs on both legs of CI.
 `make CC=clang`, `CFLAGS=...` and `CSTD=-std=c2x` (for gcc 13 / clang 16-17) work as usual.
 A `CMakeLists.txt` mirrors the same build (`cmake -B build && cmake --build build && ctest --test-dir build`).
 
-
+**Why 0.9.6 exactly.** `math` was written against a post-0.9.6 cglm snapshot that exports eight compiled entry points the released library does not. `include/math/cglm_compat.h` carries those eight bodies so the facade links against the cglm your package manager ships, and every other cglm symbol the module uses is pinned against 0.9.6's export list upstream. A newer cglm is not tested and a mismatch will show up as duplicate or missing symbols at link time, not silently.
 
 Feature macros (`ARENA_IMPLEMENTATION`, `ERROR_CHECK_ENABLED`, `LOG_THREAD_IMPLEMENTATION`,
 `MEMORY_HOOKS_IMPLEMENTATION`, `MEMORY_NON_DANGLING_POINTER`, `TRACELOG_ENABLED`) select each
