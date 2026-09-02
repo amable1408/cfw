@@ -71,8 +71,16 @@ libcfw.a: $(LIB_OBJ)
 $(TEST_BIN): %$(EXE): %.c $(HARNESS) libcfw.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(HARNESS) libcfw.a $(LDLIBS)
 
+# A suite that exits non-zero without printing a failure (a crash after its summary, a
+# timing-dependent exit) would otherwise leave the log with nothing to name: say which
+# binary and what code, at the point it happens and again at the end.
 test: $(TEST_BIN)
-	@status=0; for t in $(TEST_BIN); do echo "== $$t"; ./$$t || status=1; done; exit $$status
+	@status=0; failed=""; \
+	for t in $(TEST_BIN); do \
+	    echo "== $$t"; ./$$t; rc=$$?; \
+	    if [ $$rc -ne 0 ]; then echo "!! $$t exited with $$rc"; failed="$$failed $$t"; status=1; fi; \
+	done; \
+	if [ -n "$$failed" ]; then echo "FAILED SUITES:$$failed"; fi; exit $$status
 
 # The allocation-failure sweep wraps calloc/realloc/free at link time (GNU ld only) and forks a
 # child to observe memory_alloc's abort-on-OOM contract, so it is its own target. Each binary
@@ -87,7 +95,12 @@ $(OOM_BIN): %$(EXE): %.c $(HARNESS) libcfw.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(HARNESS) libcfw.a $(OOM_WRAP) $(LDLIBS)
 
 test-oom: $(OOM_BIN)
-	@status=0; for t in $(OOM_BIN); do echo "== $$t"; ./$$t || status=1; done; exit $$status
+	@status=0; failed=""; \
+	for t in $(OOM_BIN); do \
+	    echo "== $$t"; ./$$t; rc=$$?; \
+	    if [ $$rc -ne 0 ]; then echo "!! $$t exited with $$rc"; failed="$$failed $$t"; status=1; fi; \
+	done; \
+	if [ -n "$$failed" ]; then echo "FAILED SUITES:$$failed"; fi; exit $$status
 
 clean:
 	-rm -f libcfw.a $(LIB_OBJ) $(TEST_BIN) $(OOM_BIN)
