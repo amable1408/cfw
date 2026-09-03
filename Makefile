@@ -116,6 +116,7 @@ test: $(TEST_BIN) check
 # harness (e.g. container/str's) never defines, an undefined-reference link failure.
 $(subst .c,$(EXE),tests/container/hashset/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
 $(subst .c,$(EXE),tests/container/map/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
+$(subst .c,$(EXE),tests/container/slotmap/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
 $(subst .c,$(EXE),tests/container/str/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
 $(subst .c,$(EXE),tests/dir/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc
 $(subst .c,$(EXE),tests/env/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
