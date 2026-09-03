@@ -114,6 +114,7 @@ test: $(TEST_BIN) check
 # below gets exactly the --wrap flags its own test_oom.c defines a __wrap_* body for - a fixed
 # set for every binary left --wrap=realloc demanding a __wrap_realloc that a calloc/free-only
 # harness (e.g. container/str's) never defines, an undefined-reference link failure.
+$(subst .c,$(EXE),tests/container/hashset/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
 $(subst .c,$(EXE),tests/container/map/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
 $(subst .c,$(EXE),tests/container/str/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
 $(subst .c,$(EXE),tests/dir/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc
