@@ -6,6 +6,9 @@
 #   make test-unchecked  every tests/**/test_unchecked.c, built WITHOUT ERROR_CHECK_ENABLED
 #                     against its own archive - the inert-fallback half of a module's
 #                     contract, which no checked build can observe
+#   make check        the family drift gates under tools/ (a hand-cloned or generated
+#                     family's members still match their canonical file); needs python3,
+#                     skipped with a note without it. `make test` runs it first.
 #   make clean
 #
 # Requires a C23 compiler (gcc 14+ / clang 18+) and, as SYSTEM packages:
@@ -85,7 +88,20 @@ $(TEST_BIN): %$(EXE): %.c $(HARNESS) libcfw.a
 # A suite that exits non-zero without printing a failure (a crash after its summary, a
 # timing-dependent exit) would otherwise leave the log with nothing to name: say which
 # binary and what code, at the point it happens and again at the end.
-test: $(TEST_BIN)
+# A family module (container/arrayList, container/map) is many near-identical files
+# whose review stamps rest on a measured equivalence to one canonical file. The gate
+# that measures it ships under tools/ with the family, so the public tree can prove
+# the same thing the private one does. No gate in this export means nothing to run.
+GATES := $(wildcard tools/*_divergence.py)
+
+check:
+	@if [ -z "$(GATES)" ]; then echo "check: no family gates in this export"; exit 0; fi; \
+	if ! command -v python3 >/dev/null 2>&1; then echo "check: python3 not found - family gates skipped"; exit 0; fi; \
+	status=0; \
+	for g in $(GATES); do echo "== $$g"; python3 $$g || status=1; done; \
+	exit $$status
+
+test: $(TEST_BIN) check
 	@status=0; failed=""; \
 	for t in $(TEST_BIN); do \
 	    echo "== $$t"; ./$$t; rc=$$?; \
@@ -133,4 +149,4 @@ test-unchecked: $(UNCHECKED_BIN)
 clean:
 	-rm -f libcfw.a libcfw_unchecked.a $(LIB_OBJ) $(LIB_OBJ_UNCHECKED) $(TEST_BIN) $(OOM_BIN) $(UNCHECKED_BIN)
 
-.PHONY: all test test-oom test-unchecked clean
+.PHONY: all check test test-oom test-unchecked clean

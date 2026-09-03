@@ -1,0 +1,375 @@
+/*
+ * al_i64.h - Dynamic array list of I64 for the C Libraries Framework
+ *
+ * Features:
+ *   - Dynamic, growable array of I64 values
+ *   - Arena or heap allocation support
+ *   - Add, remove, access, and manage I64 elements efficiently
+ *
+ * Family:
+ *   One of the hand-cloned typed array lists of container/arrayList; al_u64 is
+ *   the canonical instantiation and tools/al_divergence.py measures each
+ *   file's divergence from it. This instantiation is a zero-diff clone of the
+ *   canonical.
+ *
+ * Usage Examples:
+ *   @code
+ *   AL_I64 list = al_i64_init_1();
+ *   al_i64_add_last(&list, 3);
+ *   I64 *val = al_i64_at(&list, 0);
+ *   al_i64_uninit(&list);
+ *   @endcode
+ *
+ * Error Handling:
+ *   Contract violations - a null self, an index past the size - go through
+ *   error_check_*, which LOGS AND ABORTS the process. It does not return early:
+ *   these are programming errors, not runtime conditions, and the old wording
+ *   here promised a recovery that has never existed.
+ *
+ *   Conditions that depend on a VALUE rather than on a broken contract are
+ *   refused instead, and never abort:
+ *     - an allocator that declines (a refused arena, or a capacity whose byte
+ *       size would wrap) leaves the list unchanged, and add() declines with it;
+ *     - back() and front() answer nullptr on an empty list;
+ *     - there is no nullptr element for a numeric value; a size of zero is a
+ *       legal state throughout, never an error;
+ *     - remove_first/remove_last are silent no-ops on an empty list (size
+ *       stays 0).
+ *
+ * Thread Safety:
+ *   Not thread-safe. Caller must synchronize if used from multiple threads.
+ *
+ * Memory Management:
+ *   - The list owns only its backing buffer; the elements are plain values with nothing to
+ *     free. al_i64_uninit releases the buffer. Arena-backed lists are freed by releasing the arena.
+ *
+ * Performance Characteristics:
+ *   - Amortized O(1) append; O(n) insert/remove at an arbitrary index; O(1) indexed access.
+ *
+ * Dependencies:
+ *   - <allocator/allocator.h>
+ *
+ * See al_i64.c for implementation details.
+ */
+
+#ifndef CONTAINER_ARRAYLIST_I64_H
+#define CONTAINER_ARRAYLIST_I64_H
+
+#include <allocator/allocator.h>
+
+/**
+ * @brief Dynamic array list of I64 values.
+ */
+typedef struct {
+#ifdef ARENA_IMPLEMENTATION
+    Arena   *allocator; /**< Arena allocator pointer (if used) */
+#endif // ARENA_IMPLEMENTATION
+    USize   capacity;   /**< Allocated capacity */
+    I64     *data;      /**< Array of I64 values */
+    USize   size;       /**< Number of elements */
+} AL_I64;
+
+#ifdef ARENA_IMPLEMENTATION
+/**
+ * @brief Initialize an empty array list with arena allocator.
+ * @param allocator Arena pointer.
+ * @return Initialized AL_I64.
+ */
+AL_I64 al_i64_alloc_init_1(Arena *allocator);
+
+/**
+ * @brief Initialize array list with capacity and arena allocator.
+ * @param capacity Initial capacity.
+ * @param allocator Arena pointer.
+ * @return Initialized AL_I64.
+ * @note capacity and data_size are CALLER contracts: zero, or a value large
+ *         enough to wrap the byte size, is checked as a programming error. Never
+ *         pass an unvalidated remote length here - validate it first, or the
+ *         check becomes a remote abort.
+ */
+AL_I64 al_i64_alloc_init_2(USize const capacity, Arena *allocator);
+
+/**
+ * @brief Initialize array list from data and size with arena allocator.
+ * @param data Array of I64 values.
+ * @param data_size Number of elements.
+ * @param allocator Arena pointer.
+ * @return Initialized AL_I64.
+ * @note capacity and data_size are CALLER contracts: zero, or a value large
+ *         enough to wrap the byte size, is checked as a programming error. Never
+ *         pass an unvalidated remote length here - validate it first, or the
+ *         check becomes a remote abort.
+ *         A data_size of zero ABORTS rather than building an empty list: this
+ *         argument is the capacity, and a zero capacity is a caller contract
+ *         under the family's empty-value policy (an empty VALUE is legal
+ *         everywhere; a zero capacity or allocation size is not). Construct with
+ *         init_1 when you want an empty list.
+ */
+AL_I64 al_i64_alloc_init_3(I64 const *const data, USize const data_size, Arena *allocator);
+
+/**
+ * @brief Allocate a new AL_I64 on the arena.
+ * @param allocator Arena pointer.
+ * @return Pointer to new AL_I64.
+ */
+AL_I64* al_i64_alloc_new_1(Arena *allocator);
+
+/**
+ * @brief Allocate a new AL_I64 with capacity on the arena.
+ * @param capacity Initial capacity.
+ * @param allocator Arena pointer.
+ * @return Pointer to new AL_I64.
+ * @note capacity and data_size are CALLER contracts: zero, or a value large
+ *         enough to wrap the byte size, is checked as a programming error. Never
+ *         pass an unvalidated remote length here - validate it first, or the
+ *         check becomes a remote abort.
+ */
+AL_I64* al_i64_alloc_new_2(USize const capacity, Arena *allocator);
+
+/**
+ * @brief Allocate a new AL_I64 from data and size on the arena.
+ * @param data Array of I64 values.
+ * @param data_size Number of elements.
+ * @param allocator Arena pointer.
+ * @return Pointer to new AL_I64.
+ * @note capacity and data_size are CALLER contracts: zero, or a value large
+ *         enough to wrap the byte size, is checked as a programming error. Never
+ *         pass an unvalidated remote length here - validate it first, or the
+ *         check becomes a remote abort.
+ *         A data_size of zero ABORTS rather than building an empty list: this
+ *         argument is the capacity, and a zero capacity is a caller contract
+ *         under the family's empty-value policy (an empty VALUE is legal
+ *         everywhere; a zero capacity or allocation size is not). Construct with
+ *         init_1 when you want an empty list.
+ */
+AL_I64* al_i64_alloc_new_3(I64 const *const data, USize const data_size, Arena *allocator);
+#endif // ARENA_IMPLEMENTATION
+
+/**
+ * @brief Add a value at the specified index.
+ * @param self Pointer to AL_I64.
+ * @param data Value to add.
+ * @param index Index to insert at.
+ * @note Declines silently when the allocator refuses the growth (a refused
+ *         arena, or a capacity whose byte size would wrap). The list is left
+ *         unchanged, so a caller that must know checks the size afterwards.
+ * @note The element is taken BY VALUE into a slot this list owns; where the
+ *         element type owns memory of its own, that ownership transfers here and
+ *         is released by remove/clear/uninit.
+ */
+void al_i64_add(AL_I64 *const self, I64 const data, USize const index);
+
+/**
+ * @brief Add a value at the beginning.
+ * @param self Pointer to AL_I64.
+ * @param data Value to add.
+ * @note Declines silently when the allocator refuses the growth (a refused
+ *         arena, or a capacity whose byte size would wrap). The list is left
+ *         unchanged, so a caller that must know checks the size afterwards.
+ * @note The element is taken BY VALUE into a slot this list owns; where the
+ *         element type owns memory of its own, that ownership transfers here and
+ *         is released by remove/clear/uninit.
+ */
+void al_i64_add_first(AL_I64 *const self, I64 const data);
+
+/**
+ * @brief Add a value at the end.
+ * @param self Pointer to AL_I64.
+ * @param data Value to add.
+ * @note Declines silently when the allocator refuses the growth (a refused
+ *         arena, or a capacity whose byte size would wrap). The list is left
+ *         unchanged, so a caller that must know checks the size afterwards.
+ * @note The element is taken BY VALUE into a slot this list owns; where the
+ *         element type owns memory of its own, that ownership transfers here and
+ *         is released by remove/clear/uninit.
+ */
+void al_i64_add_last(AL_I64 *const self, I64 const data);
+
+/**
+ * @brief Get the value at the specified index.
+ * @param self Pointer to AL_I64.
+ * @param index Index to access.
+ * @return Pointer to value at index.
+ * @note Bounded by size, not capacity. The slots a clear() leaves inside the
+ *         retained capacity are out of contract - reading one is a caller error,
+ *         not a way to inspect a released element.
+ * @note The address is valid only until the next add/add_first/add_last/reserve/shrink: any growth may move the backing array and invalidate it.
+ */
+I64* al_i64_at(AL_I64 const *const self, USize const index);
+
+/**
+ * @brief Get the last value in the list.
+ * @param self Pointer to AL_I64.
+ * @return Pointer to the last value, or nullptr when the list is empty.
+ * @note Answers nullptr on an empty list rather than aborting: emptiness is a
+ *         data question, not a broken contract.
+ * @note The address is valid only until the next add/add_first/add_last/reserve/shrink: any growth may move the backing array and invalidate it.
+ */
+I64* al_i64_back(AL_I64 const *const self);
+
+/**
+ * @brief Remove all elements from the list.
+ * @param self Pointer to AL_I64.
+ */
+void al_i64_clear(AL_I64 *const self);
+
+/**
+ * @brief Delete and free the list.
+ * @param self Address of AL_I64 pointer.
+ */
+void al_i64_delete(AL_I64 **const self);
+
+/**
+ * @brief Check if the list is empty.
+ * @param self Pointer to AL_I64.
+ * @return true if empty, false otherwise.
+ */
+bool al_i64_empty(AL_I64 const *const self);
+
+/**
+ * @brief Get the first value in the list.
+ * @param self Pointer to AL_I64.
+ * @return Pointer to the first value, or nullptr when the list is empty.
+ * @note Answers nullptr on an empty list rather than aborting: emptiness is a
+ *         data question, not a broken contract.
+ * @note The address is valid only until the next add/add_first/add_last/reserve/shrink: any growth may move the backing array and invalidate it.
+ */
+I64* al_i64_front(AL_I64 const *const self);
+
+/**
+ * @brief Get the element capacity.
+ * @param self Pointer to AL_I64.
+ * @return The number of elements the list can hold before it must grow.
+ */
+USize al_i64_get_capacity(AL_I64 const *const self);
+
+/**
+ * @brief Get the data array pointer.
+ * @param self Pointer to AL_I64.
+ * @return Pointer to data array.
+ */
+I64* al_i64_get_data(AL_I64 const *const self);
+
+/**
+ * @brief Get the element count.
+ * @param self Pointer to AL_I64.
+ * @return The number of elements currently stored.
+ */
+USize al_i64_get_size(AL_I64 const *const self);
+
+/**
+ * @brief Initialize an empty array list.
+ * @return Initialized AL_I64.
+ */
+AL_I64 al_i64_init_1(void);
+
+/**
+ * @brief Initialize array list with capacity.
+ * @param capacity Initial capacity.
+ * @return Initialized AL_I64.
+ * @note capacity and data_size are CALLER contracts: zero, or a value large
+ *         enough to wrap the byte size, is checked as a programming error. Never
+ *         pass an unvalidated remote length here - validate it first, or the
+ *         check becomes a remote abort.
+ */
+AL_I64 al_i64_init_2(USize const capacity);
+
+/**
+ * @brief Initialize array list from data and size.
+ * @param data Array of I64 values.
+ * @param data_size Number of elements.
+ * @return Initialized AL_I64.
+ * @note capacity and data_size are CALLER contracts: zero, or a value large
+ *         enough to wrap the byte size, is checked as a programming error. Never
+ *         pass an unvalidated remote length here - validate it first, or the
+ *         check becomes a remote abort.
+ *         A data_size of zero ABORTS rather than building an empty list: this
+ *         argument is the capacity, and a zero capacity is a caller contract
+ *         under the family's empty-value policy (an empty VALUE is legal
+ *         everywhere; a zero capacity or allocation size is not). Construct with
+ *         init_1 when you want an empty list.
+ */
+AL_I64 al_i64_init_3(I64 const *const data, USize const data_size);
+
+/**
+ * @brief Allocate a new AL_I64 on the heap.
+ * @return Pointer to new AL_I64.
+ */
+AL_I64* al_i64_new_1(void);
+
+/**
+ * @brief Allocate a new AL_I64 with capacity on the heap.
+ * @param capacity Initial capacity.
+ * @return Pointer to new AL_I64.
+ * @note capacity and data_size are CALLER contracts: zero, or a value large
+ *         enough to wrap the byte size, is checked as a programming error. Never
+ *         pass an unvalidated remote length here - validate it first, or the
+ *         check becomes a remote abort.
+ */
+AL_I64* al_i64_new_2(USize const capacity);
+
+/**
+ * @brief Allocate a new AL_I64 from data and size on the heap.
+ * @param data Array of I64 values.
+ * @param data_size Number of elements.
+ * @return Pointer to new AL_I64.
+ * @note capacity and data_size are CALLER contracts: zero, or a value large
+ *         enough to wrap the byte size, is checked as a programming error. Never
+ *         pass an unvalidated remote length here - validate it first, or the
+ *         check becomes a remote abort.
+ *         A data_size of zero ABORTS rather than building an empty list: this
+ *         argument is the capacity, and a zero capacity is a caller contract
+ *         under the family's empty-value policy (an empty VALUE is legal
+ *         everywhere; a zero capacity or allocation size is not). Construct with
+ *         init_1 when you want an empty list.
+ */
+AL_I64* al_i64_new_3(I64 const *const data, USize const data_size);
+
+/**
+ * @brief Remove the value at the specified index.
+ * @param self Pointer to AL_I64.
+ * @param index Index to remove.
+ */
+void al_i64_remove(AL_I64 *const self, USize const index);
+
+/**
+ * @brief Remove the first value in the list.
+ * @param self Pointer to AL_I64.
+ * @note A call on an empty list is a silent no-op (size stays 0).
+ */
+void al_i64_remove_first(AL_I64 *const self);
+
+/**
+ * @brief Remove the last value in the list.
+ * @param self Pointer to AL_I64.
+ * @note A call on an empty list is a silent no-op (size stays 0).
+ */
+void al_i64_remove_last(AL_I64 *const self);
+
+/**
+ * @brief Reserve capacity for the list.
+ * @param self Pointer to AL_I64.
+ * @param capacity New capacity.
+ * @note capacity and data_size are CALLER contracts: zero, or a value large
+ *         enough to wrap the byte size, is checked as a programming error. Never
+ *         pass an unvalidated remote length here - validate it first, or the
+ *         check becomes a remote abort.
+ */
+void al_i64_reserve(AL_I64 *const self, USize const capacity);
+
+/**
+ * @brief Shrink the list to fit its size.
+ * @param self Pointer to AL_I64.
+ */
+void al_i64_shrink(AL_I64 *const self);
+
+/**
+ * @brief Release all memory and reset the list.
+ * @param self Pointer to AL_I64.
+ * @note Idempotent in every build. The freed pointer is cleared unconditionally
+ *         rather than under MEMORY_NON_DANGLING_POINTER, so a second uninit cannot
+ *         hand a released block back to the allocator.
+ */
+void al_i64_uninit(AL_I64 *const self);
+
+#endif // CONTAINER_ARRAYLIST_I64_H

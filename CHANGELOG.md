@@ -11,6 +11,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - sync: env
 - `bits`
 - sync: math
+- `container/arrayList`
 
 ## 0.1.0 - first export
 
