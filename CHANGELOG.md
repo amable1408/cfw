@@ -10,6 +10,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - `encoding/hex`
 - `encoding/base64`
 - `crypto/random`
+- `crypto/hash`
 
 ## 0.2.0 - release
 
