@@ -15,6 +15,7 @@
 #   OpenSSL 3.0 or newer (libcrypto) Debian: apt install libssl-dev             MSYS2: pacman -S mingw-w64-ucrt-x86_64-openssl
 #   cglm 0.9.6             Debian: apt install libcglm-dev (Debian 13; Ubuntu 24.04's 0.9.2 is too old) MSYS2: pacman -S mingw-w64-ucrt-x86_64-cglm
 #   PCRE2 (8-bit)          Debian: apt install libpcre2-dev           MSYS2: pacman -S mingw-w64-ucrt-x86_64-pcre2
+#   libcurl 8.13 or newer (WebSocket fragmentation reads FIN from there) Debian: apt install libcurl4-openssl-dev   MSYS2: pacman -S mingw-w64-ucrt-x86_64-curl
 # Override CC/CFLAGS as usual (e.g. `make CC=clang`). On Windows run under MSYS2 or Git Bash:
 # the `test` and `clean` recipes are POSIX-shell loops.
 
@@ -33,7 +34,7 @@ CPPFLAGS := -Iinclude -D_GNU_SOURCE -DARENA_IMPLEMENTATION -DERROR_CHECK_ENABLED
 # The per-module system libraries on the line below are computed from the actual export set -
 # see SYSTEM_DEPS in the generator - so a module this build doesn't carry never contributes a
 # dead flag, and one it does carry can never be silently missing.
-LDLIBS   := -lcrypto -lcglm -lpcre2-8 -lm
+LDLIBS   := -lcrypto -lcglm -lpcre2-8 -lcurl -lm
 ifeq ($(OS),Windows_NT)
     # CFW's windows.h asserts the Windows 10 API baseline it was audited against.
     CPPFLAGS += -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00
@@ -81,10 +82,13 @@ libcfw.a: $(LIB_OBJ)
 %.o: %.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
-# Each suite is one binary: its test_*.c, the harness, and the archive. The math suites carry
-# their own reporter (tests/math/check.h) and simply do not call into the harness.
+# Each suite is one binary: its test_*.c, the harness, the archive, and any helper source its
+# directory carries that is NOT itself a suite (tests/websocket/client/fixture.c is a loopback
+# server two suites share) - the directory joins the include path so a helper header resolves.
+# The math suites carry their own reporter (tests/math/check.h) and simply do not call into the
+# harness.
 $(TEST_BIN): %$(EXE): %.c $(HARNESS) libcfw.a
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(HARNESS) libcfw.a $(LDLIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(dir $<) -o $@ $< $(filter-out $(dir $<)test_%,$(wildcard $(dir $<)*.c)) $(HARNESS) libcfw.a $(LDLIBS)
 
 # A suite that exits non-zero without printing a failure (a crash after its summary, a
 # timing-dependent exit) would otherwise leave the log with nothing to name: say which
@@ -140,7 +144,7 @@ libcfw_unchecked.a: $(LIB_OBJ_UNCHECKED)
 	$(CC) $(CFLAGS) $(CPPFLAGS_UNCHECKED) -c $< -o $@
 
 $(UNCHECKED_BIN): %$(EXE): %.c $(HARNESS) libcfw_unchecked.a
-	$(CC) $(CFLAGS) $(CPPFLAGS_UNCHECKED) -o $@ $< $(HARNESS) libcfw_unchecked.a $(LDLIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS_UNCHECKED) -I$(dir $<) -o $@ $< $(filter-out $(dir $<)test_%,$(wildcard $(dir $<)*.c)) $(HARNESS) libcfw_unchecked.a $(LDLIBS)
 
 test-unchecked: $(UNCHECKED_BIN)
 	@status=0; failed=""; \

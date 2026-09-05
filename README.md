@@ -6,7 +6,7 @@ A modular **C23 framework**: self-contained modules, one translation unit each, 
 per module, and a test suite per module. This repository is the **audited export** of CFW - it
 holds only the modules that have cleared every gate below, together with everything they include.
 
-**38 modules** (199 files) at HEAD; the last tagged release is **0.2.0**. A
+**39 modules** (201 files) at HEAD; the last tagged release is **0.2.0**. A
 module lands in its own commit as soon as it clears the gate; a version is tagged when a family
 is complete. See the table below for exactly which modules are here.
 
@@ -73,6 +73,7 @@ errors that abort in checked builds - is documented in its header's `Error Handl
 | `tracelog` | 1 .c / 1 .h | tests/tracelog/ | Manual call-stack tracing for the C Libraries Framework |
 | `tuple` | 3 .c / 4 .h | tests/tuple/ | Tuple type (bool, USize) for the C Libraries Framework |
 | `types` | 0 .c / 1 .h | header-only | Standard type definitions and platform macros for cross-platform C |
+| `websocket/client` | 1 .c / 1 .h | tests/websocket/client/ | WebSocket client wrapper (libcurl curl_ws-based) for the C Libraries Framework |
 
 **Vendored code.** `json` carries [yyjson](https://github.com/ibireme/yyjson) 0.12.0 (MIT) verbatim under `include/json/` - third-party code, compiled and tested with the module but outside the audit gate above, which covers CFW's own files only.
 
@@ -82,10 +83,10 @@ Requires a **C23 compiler** (gcc 14+ or clang 18+; MSVC is not supported) and, a
 
 ```sh
 # Debian / Ubuntu
-sudo apt install libssl-dev libcglm-dev libpcre2-dev
+sudo apt install libssl-dev libcglm-dev libpcre2-dev libcurl4-openssl-dev
 
 # MSYS2 (UCRT64)
-pacman -S mingw-w64-ucrt-x86_64-openssl mingw-w64-ucrt-x86_64-cglm mingw-w64-ucrt-x86_64-pcre2
+pacman -S mingw-w64-ucrt-x86_64-openssl mingw-w64-ucrt-x86_64-cglm mingw-w64-ucrt-x86_64-pcre2 mingw-w64-ucrt-x86_64-curl
 ```
 
 ```sh
