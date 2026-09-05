@@ -12,6 +12,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - `crypto/random`
 - `crypto/hash`
 - `crypto/hmac`
+- `crypto/kdf`
 
 ## 0.2.0 - release
 
