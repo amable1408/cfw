@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Install the toolchain and system dependencies
-        run: apt-get update && apt-get install -y build-essential python3 libcglm-dev libpcre2-dev
+        run: apt-get update && apt-get install -y build-essential python3 libssl-dev libcglm-dev libpcre2-dev
       # `make test` alone proves nothing when the export carries no suite yet: TEST_BIN is
       # empty, libcfw.a is only a prerequisite of the test binaries, and the job passes without
       # compiling a file. Build the library explicitly first.
@@ -43,7 +43,7 @@ jobs:
         with:
           msystem: UCRT64
           update: true
-          install: mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cglm mingw-w64-ucrt-x86_64-pcre2 make
+          install: mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-openssl mingw-w64-ucrt-x86_64-cglm mingw-w64-ucrt-x86_64-pcre2 make
       - name: Build (MinGW)
         run: make
       - name: Test (MinGW)
