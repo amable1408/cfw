@@ -16,6 +16,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - `crypto/password`
 - `json`
 - sync: result
+- `net`
 
 ## 0.2.0 - release
 
