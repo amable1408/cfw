@@ -5,6 +5,10 @@ All notable changes to the public CFW export. Versioning follows [SemVer 2.0.0](
 A module arrives in its own commit, the moment it has cleared all five audit dimensions
 upstream; a version is tagged when a family is complete, so entries accumulate here first.
 
+## Unreleased
+
+- `encoding/hex`
+
 ## 0.2.0 - release
 
 The container wave. Four containers join the foundation, each through the same
