@@ -216,6 +216,18 @@ static inline CFW_ATTR_CONST Result result_from_os_code(U32 const error) {
             category = RESULT_CATEGORY_NETWORK;
             flags    = RESULT_FLAG_RETRYABLE | RESULT_FLAG_TRANSIENT;
             break;
+        case WSAECONNRESET:   /* 10054: connection failures - retryable, but not a */
+        case WSAECONNREFUSED: /* 10061: "temporary condition" in the TRANSIENT sense */
+        case WSAECONNABORTED: /* 10053 */
+        case WSAEHOSTUNREACH: /* 10065 */
+        case WSAENETUNREACH:  /* 10051 */
+        case WSAENOTCONN:     /* 10057 */
+            category = RESULT_CATEGORY_NETWORK;
+            flags    = RESULT_FLAG_RETRYABLE;
+            break;
+        case WSAEADDRINUSE: /* 10048: bind conflict - retrying immediately does not help */
+            category = RESULT_CATEGORY_NETWORK;
+            break;
         case ERROR_IO_PENDING: /* overlapped I/O in progress: wait, don't re-issue */
             flags = RESULT_FLAG_DEFERRED | RESULT_FLAG_TRANSIENT;
             break;
@@ -261,8 +273,9 @@ static inline CFW_ATTR_CONST Result result_from_os_code(U32 const error) {
             break;
         /* Socket-only errnos classify as NETWORK, mirroring the Windows WSA
          * group, so category checks behave identically across platforms. */
-        case ECONNRESET:   /* connection failures: retryable, but not a */
-        case ECONNREFUSED: /* "temporary condition" in the TRANSIENT sense */
+        case ECONNABORTED: /* connection failures: retryable, but not a */
+        case ECONNRESET:   /* "temporary condition" in the TRANSIENT sense */
+        case ECONNREFUSED:
         case EHOSTUNREACH:
         case ENETUNREACH:
         case ENOTCONN:
@@ -273,6 +286,9 @@ static inline CFW_ATTR_CONST Result result_from_os_code(U32 const error) {
         case ETIMEDOUT:
             category = RESULT_CATEGORY_NETWORK;
             flags    = RESULT_FLAG_RETRYABLE | RESULT_FLAG_TRANSIENT;
+            break;
+        case EADDRINUSE: /* bind conflict - retrying immediately does not help */
+            category = RESULT_CATEGORY_NETWORK;
             break;
         case ENOSPC:
         case EIO:

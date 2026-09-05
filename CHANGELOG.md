@@ -15,6 +15,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - `crypto/kdf`
 - `crypto/password`
 - `json`
+- sync: result
 
 ## 0.2.0 - release
 
