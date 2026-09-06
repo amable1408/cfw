@@ -22,6 +22,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - `http/query`
 - sync: websocket/client
 - `http/service/multipart`
+- `http/service/trace`
 
 ## 0.2.0 - release
 
