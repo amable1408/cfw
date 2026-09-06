@@ -90,8 +90,14 @@ libcfw.a: $(LIB_OBJ)
 # server two suites share) - the directory joins the include path so a helper header resolves.
 # The math suites carry their own reporter (tests/math/check.h) and simply do not call into the
 # harness.
+# A suite that borrows another suite's fixture rather than carrying a second copy of it gets
+# its extra include directory and sources through these two, set per target below. Empty for
+# every other suite, so the ordinary recipe is unchanged.
+SUITE_EXTRA_INC :=
+SUITE_EXTRA_SRC :=
+
 $(TEST_BIN): %$(EXE): %.c $(HARNESS) libcfw.a
-	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(dir $<) -o $@ $< $(filter-out $(dir $<)test_%,$(wildcard $(dir $<)*.c)) $(HARNESS) libcfw.a $(LDLIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(dir $<) $(SUITE_EXTRA_INC) -o $@ $< $(filter-out $(dir $<)test_%,$(wildcard $(dir $<)*.c)) $(SUITE_EXTRA_SRC) $(HARNESS) libcfw.a $(LDLIBS)
 
 # A suite that exits non-zero without printing a failure (a crash after its summary, a
 # timing-dependent exit) would otherwise leave the log with nothing to name: say which
@@ -157,7 +163,9 @@ libcfw_unchecked.a: $(LIB_OBJ_UNCHECKED)
 	$(CC) $(CFLAGS) $(CPPFLAGS_UNCHECKED) -c $< -o $@
 
 $(UNCHECKED_BIN): %$(EXE): %.c $(HARNESS) libcfw_unchecked.a
-	$(CC) $(CFLAGS) $(CPPFLAGS_UNCHECKED) -I$(dir $<) -o $@ $< $(filter-out $(dir $<)test_%,$(wildcard $(dir $<)*.c)) $(HARNESS) libcfw_unchecked.a $(LDLIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS_UNCHECKED) -I$(dir $<) $(SUITE_EXTRA_INC) -o $@ $< $(filter-out $(dir $<)test_%,$(wildcard $(dir $<)*.c)) $(SUITE_EXTRA_SRC) $(HARNESS) libcfw_unchecked.a $(LDLIBS)
+
+# (no suite in this export borrows another suite's fixture)
 
 test-unchecked: $(UNCHECKED_BIN)
 	@status=0; failed=""; \

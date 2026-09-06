@@ -57,9 +57,17 @@ foreach(src ${TEST_SRC})
     get_filename_component(suite_dir "${src}" DIRECTORY)
     file(GLOB helpers CONFIGURE_DEPENDS "${suite_dir}/*.c")
     list(FILTER helpers EXCLUDE REGEX "/test_[^/]*\.c$")
+    # A suite that borrows another suite's fixture rather than carrying a second copy of it.
+    # The glob above only ever sees the suite's own directory, so the borrowed sources and
+    # include directory are named here, generated from the export's own borrowing map.
+    set(borrowed_includes "")
+    # (no suite in this export borrows another suite's fixture)
     add_executable(${target} "${src}" ${helpers} "${CMAKE_SOURCE_DIR}/include/test/test.c")
     target_include_directories(${target} PRIVATE "${suite_dir}")
     target_include_directories(${target} PRIVATE "${CMAKE_SOURCE_DIR}/tests/${suite}")
+    foreach(borrowed ${borrowed_includes})
+        target_include_directories(${target} PRIVATE "${borrowed}")
+    endforeach()
     target_link_libraries(${target} cfw)
     add_test(NAME ${target} COMMAND ${target})
 endforeach()

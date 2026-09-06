@@ -1,19 +1,34 @@
 /*
  * cookie.h - HTTP cookie helpers for the C Libraries Framework
+ * @version 0.4.0
  *
  * Builds Set-Cookie response headers and reads values from Cookie request
  * headers. The module has no application-specific state.
  *
  * Features:
- *   - Cookie request header value lookup.
- *   - Set-Cookie response header generation.
+ *   - Cookie request header value lookup, from a NUL-terminated header
+ *     (http_cookie_get_1) or a sized one (http_cookie_get_2).
+ *   - Set-Cookie response header generation, in two spellings: the whole
+ *     response header LINE ("Set-Cookie: ...\r\n", http_cookie_set_header_create
+ *     and http_cookie_clear_header_create_3) and the bare header VALUE
+ *     (http_cookie_set_header_value_create and
+ *     http_cookie_clear_header_value_create_3), which is what
+ *     http_server_response_header_add("Set-Cookie", value) wants. Both
+ *     spellings render through one builder, so an attribute added to one is
+ *     added to both.
  *   - Clear-cookie response header generation, including a self-mirroring
  *     form for a cookie that was not set with the default Secure/HttpOnly/Lax
  *     flags (http_cookie_clear_header_create_3).
+ *   - A per-response render off ONE template cookie
+ *     (http_cookie_set_header_value_create_2): the caller varies the value and
+ *     Max-Age, and no HTTP_Cookie is copied or uninitialized per response.
  *   - Path, Domain, Max-Age, Secure, HttpOnly, SameSite, and Partitioned flags.
- *   - Injection refusal: http_cookie_set_header_create and
- *     http_cookie_clear_header_create_3 refuse (EMPTY String + a WARN log)
- *     rather than emit a malformed or split header - see Error Handling.
+ *   - Injection refusal: every one of the five builders above refuses (EMPTY
+ *     String + a WARN log) rather than emit a malformed or split header - see
+ *     Error Handling.
+ *   - Dropped-cookie refusal: a `__Host-` or `__Secure-` name whose flags do not
+ *     match its prefix is refused the same way, because no browser would keep
+ *     the cookie either - see Error Handling.
  *   - Arena and heap allocation support.
  *
  * Usage Example:
@@ -36,13 +51,25 @@
  *     cookie VALUE ("sid=") is indistinguishable from an absent one - both
  *     read back as the empty String. An empty name is refused as a miss
  *     before scanning, even when the header contains a `; =value` pair.
- *   - http_cookie_set_header_create and http_cookie_clear_header_create_3
+ *   - http_cookie_set_header_create, http_cookie_set_header_value_create,
+ *     http_cookie_set_header_value_create_2, http_cookie_clear_header_create_3
+ *     and http_cookie_clear_header_value_create_3 all
  *     refuse unconditionally (never `error_check`) on a value that would
  *     split or forge the header: a name that is not an RFC 6265 token, a
  *     value with bytes outside cookie-octet (quoted or bare), CTL, `;`, or `,` in
  *     Path/Domain, or SameSite=None / Partitioned without Secure. Refusal
  *     returns the EMPTY String and logs LOG_LEVEL_WARN - callers already
  *     test string_empty (e.g. http/service/security).
+ *   - The same five refuse a cookie NAME whose prefix contradicts its flags: a
+ *     `__Host-` name without Secure or with a Path other than "/", and a
+ *     `__Secure-` name without Secure. This is not syntax - the header would be
+ *     well-formed - but every browser DROPS such a cookie without a word, so a
+ *     login round trip would answer 200 and nothing would ever authenticate.
+ *     Refusing loudly is the only way that failure is visible. It is checked on
+ *     the RENDER, so a service that validates its configuration by rendering it
+ *     once (http/service/session, http/service/csrf) inherits the rule at init.
+ *     http_cookie_clear_header_create_1/_2 are not affected: they emit Secure
+ *     unconditionally and take no template.
  *   - cookie-octet excludes every byte >= 0x80, so a non-ASCII value is always
  *     refused - percent-encode or base64-encode it before calling
  *     http_cookie_value_set.
@@ -53,12 +80,20 @@
  * Thread Safety:
  *   - Not thread-safe. Caller must synchronize shared cookie objects.
  *
- * Memory:
- *   - Cookie fields are copied into owned storage.
- *   - Returned String values must be uninitialized by caller.
+ * Memory Management:
+ *   - Cookie fields are copied into owned storage (string_init_static and
+ *     string_alloc_init_static are OWNED copies despite the historical name),
+ *     so the caller's name/value/path/domain buffers may be released
+ *     immediately after the call that copied them.
+ *   - Returned String values must be uninitialized by caller. A rendered
+ *     header or header value is NUL-terminated, so string_get_data is usable
+ *     as a C string; a REFUSED render is the EMPTY String, whose data is
+ *     nullptr - gate on string_empty before reading it.
  *
- * Performance:
+ * Performance Characteristics:
  *   - Cookie lookup scans the header linearly.
+ *   - A render is one String growing through geometric appends: O(rendered
+ *     size), one allocation in the common case, no per-attribute allocation.
  *
  * Dependencies:
  *   - string.
@@ -147,6 +182,16 @@ String http_cookie_alloc_clear_header_create_2(char const *const name, char cons
 String http_cookie_alloc_get_1(char const *const header, char const *const name, Arena *const allocator);
 
 /**
+ * @brief Read an arena-backed cookie value from a SIZED Cookie request header.
+ * @param header Cookie request header value; need not be NUL-terminated.
+ * @param header_size Bytes of header to scan.
+ * @param name Cookie name.
+ * @param allocator Arena allocator.
+ * @return Cookie value or empty String.
+ */
+String http_cookie_alloc_get_2(char const *const header, USize const header_size, char const *const name, Arena *const allocator);
+
+/**
  * @brief Initialize an arena-backed cookie with default flags, in place.
  *
  * Refuses whole (returns false, `*self` left DEFAULT_INITIALIZATION) if the
@@ -206,6 +251,18 @@ String http_cookie_clear_header_create_2(char const *const name, char const *con
 String http_cookie_clear_header_create_3(HTTP_Cookie const *const self);
 
 /**
+ * @brief Build the bare Set-Cookie header VALUE that clears self's cookie -
+ *        http_cookie_clear_header_create_3 without the "Set-Cookie: " prefix
+ *        and without the trailing CRLF.
+ *
+ * This is the form http_server_response_header_add("Set-Cookie", value) takes;
+ * http/service/session and http/service/csrf build their clear cookies with it.
+ * @param self Cookie whose flags are mirrored; its value is ignored.
+ * @return Header value, or EMPTY on a refused name/path/domain/SameSite.
+ */
+String http_cookie_clear_header_value_create_3(HTTP_Cookie const *const self);
+
+/**
  * @brief Set the cookie Domain attribute.
  * @param self Cookie object.
  * @param domain Cookie domain.
@@ -221,13 +278,25 @@ void http_cookie_domain_set(HTTP_Cookie *const self, char const *const domain);
  * SP and HTAB around `;` are skipped; a pair without `=` is skipped
  * entirely (not treated as a name with an empty value); the first matching
  * name wins (browser order already puts the most specific Path first); a
- * DQUOTE-wrapped value is returned WITH its quotes (RFC 6265 SS4.1.1 allows
+ * DQUOTE-wrapped value is returned WITH its quotes (RFC 6265 section 4.1.1 allows
  * both forms); a trailing SP inside a value is kept as-is.
  * @param header Cookie request header value.
  * @param name Cookie name.
  * @return Cookie value or empty String.
  */
 String http_cookie_get_1(char const *const header, char const *const name);
+
+/**
+ * @brief Read a cookie value from a SIZED Cookie request header - http_cookie_get_1 for a
+ *        header that is not NUL-terminated, such as the bytes behind a Str or a String.
+ *
+ * The scanner rules are http_cookie_get_1's, unchanged.
+ * @param header Cookie request header value; need not be NUL-terminated.
+ * @param header_size Bytes of header to scan.
+ * @param name Cookie name.
+ * @return Cookie value or empty String.
+ */
+String http_cookie_get_2(char const *const header, USize const header_size, char const *const name);
 
 /**
  * @brief Set whether Max-Age should be emitted.
@@ -325,6 +394,44 @@ void http_cookie_secure_set(HTTP_Cookie *const self, bool const enabled);
  * @return Header block, or EMPTY on refusal.
  */
 String http_cookie_set_header_create(HTTP_Cookie const *const self);
+
+/**
+ * @brief Build the bare Set-Cookie header VALUE - http_cookie_set_header_create
+ *        without the "Set-Cookie: " prefix and without the trailing CRLF.
+ *
+ * This is the form http_server_response_header_add("Set-Cookie", value) takes;
+ * http/service/session and http/service/csrf build their cookies with it.
+ * Refuses (EMPTY String + LOG_LEVEL_WARN) on exactly the inputs
+ * http_cookie_set_header_create refuses - see Error Handling.
+ * @param self Cookie object.
+ * @return Header value, or EMPTY on refusal.
+ */
+String http_cookie_set_header_value_create(HTTP_Cookie const *const self);
+
+/**
+ * @brief Render a TEMPLATE cookie with a substitute value and Max-Age - the per-response
+ *        form, which copies nothing.
+ *
+ * A server that sets one cookie per response (a session mint, a CSRF token) holds ONE
+ * configured HTTP_Cookie and varies only the value. Doing that through
+ * http_cookie_value_set means copying the template first, so this renders `template`'s name,
+ * Path, Domain and flags directly against `value`: no HTTP_Cookie is built, copied, or
+ * uninitialized per response, and the template is not mutated (so a shared, read-only
+ * service instance may render concurrently).
+ *
+ * Max-Age is always emitted - the caller passing one is the reason to use this form; use
+ * http_cookie_set_header_value_create when the template's own has_max_age/max_age is wanted.
+ * Refuses (false, `*out` EMPTY + LOG_LEVEL_WARN) on exactly the inputs
+ * http_cookie_set_header_value_create refuses - see Error Handling.
+ * @param template Cookie supplying the name, Path, Domain, and flags; not mutated, and its
+ *        own value is ignored.
+ * @param value Cookie value to render; must be cookie-octet.
+ * @param max_age Max-Age value in seconds.
+ * @param out Destination header value; left EMPTY on false. Caller must uninitialize it
+ *        either way.
+ * @return true when the header value was rendered; false on refusal.
+ */
+bool http_cookie_set_header_value_create_2(HTTP_Cookie const *const template, char const *const value, USize const max_age, String *const out);
 
 /**
  * @brief Release cookie storage.

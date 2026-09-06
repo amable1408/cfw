@@ -368,6 +368,253 @@ static void _test_clear_header_create_3_mirrors_self(Test *const test) {
     test_case_end(test);
 }
 
+static void _test_header_value_create_pair(Test *const test) {
+    test_case_begin(test, "the *_header_value_create_* pair renders the same bytes as its header-line twin, minus \"Set-Cookie: \" and the CRLF");
+
+    /* http/service/session and http/service/csrf each rendered the full line and then sliced
+     * CHAR_STATIC_SIZE("Set-Cookie: ") and "\r\n" back off - prefix arithmetic coupled to this
+     * module's exact spelling, duplicated in two services. These render it directly. The pin is
+     * that the two spellings never drift: a new attribute added to one is added to both. */
+    HTTP_Cookie cookie = http_cookie_init_2("sid", "tok", "/", HTTP_COOKIE_SAME_SITE_STRICT, true, true);
+
+    http_cookie_max_age_set(&cookie, 600);
+
+    String line  = http_cookie_set_header_create(&cookie);
+    String value = http_cookie_set_header_value_create(&cookie);
+
+    test_expect_string(test, "set: the header line is unchanged", "Set-Cookie: sid=tok; Path=/; Max-Age=600; Secure; HttpOnly; SameSite=Strict\r\n", string_get_data(&line));
+    test_expect_string(test, "set: the value form carries no prefix and no CRLF", "sid=tok; Path=/; Max-Age=600; Secure; HttpOnly; SameSite=Strict", string_get_data(&value));
+    test_expect_u(test, "set: the value is exactly the line minus \"Set-Cookie: \" and the CRLF", string_get_size(&line) - CHAR_STATIC_SIZE("Set-Cookie: ") - 2, string_get_size(&value));
+
+    String clear_line  = http_cookie_clear_header_create_3(&cookie);
+    String clear_value = http_cookie_clear_header_value_create_3(&cookie);
+
+    test_expect_string(
+        test, "clear: the header line is unchanged", "Set-Cookie: sid=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure; HttpOnly; SameSite=Strict\r\n",
+        string_get_data(&clear_line));
+    test_expect_string(
+        test, "clear: the value form carries no prefix and no CRLF", "sid=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure; HttpOnly; SameSite=Strict",
+        string_get_data(&clear_value));
+    test_expect_u(
+        test, "clear: the value is exactly the line minus \"Set-Cookie: \" and the CRLF", string_get_size(&clear_line) - CHAR_STATIC_SIZE("Set-Cookie: ") - 2, string_get_size(&clear_value));
+
+    string_uninit(&clear_value);
+    string_uninit(&clear_line);
+    string_uninit(&value);
+    string_uninit(&line);
+    http_cookie_uninit(&cookie);
+
+    /* A cookie with nothing but a name and value: the value form must not leave a stray
+     * separator behind where the omitted attributes were. */
+    HTTP_Cookie bare       = http_cookie_init_2("sid", "tok", "", HTTP_COOKIE_SAME_SITE_UNSET, false, false);
+    String      bare_value = http_cookie_set_header_value_create(&bare);
+
+    test_expect_string(test, "a cookie with no attributes at all renders as just name=value", "sid=tok", string_get_data(&bare_value));
+
+    string_uninit(&bare_value);
+    http_cookie_uninit(&bare);
+
+    test_case_end(test);
+}
+
+static void _test_set_header_value_create_2_matches_the_copying_form(Test *const test) {
+    test_case_begin(test, "set_header_value_create_2 renders a template with a substitute value byte-identically to a copied cookie");
+
+    /* The point of _2 is that a per-response cookie costs NO copy: http/service/session and
+     * http/service/csrf each used to build, render and uninitialize a throwaway HTTP_Cookie per
+     * response. The pin is that skipping the copy changes nothing on the wire. */
+    HTTP_Cookie template = http_cookie_init_2("sid", "", "/", HTTP_COOKIE_SAME_SITE_STRICT, true, true);
+    HTTP_Cookie copied   = http_cookie_init_2("sid", "abcdef", "/", HTTP_COOKIE_SAME_SITE_STRICT, true, true);
+
+    http_cookie_max_age_set(&copied, 600);
+
+    String substituted = DEFAULT_INITIALIZATION;
+    String reference   = http_cookie_set_header_value_create(&copied);
+
+    test_expect_true(test, "create_2 renders the template with the value handed in", http_cookie_set_header_value_create_2(&template, "abcdef", 600, &substituted));
+    test_expect_string(test, "and the bytes are the copying form's, exactly", string_get_data(&reference), string_get_data(&substituted));
+    test_expect_string(test, "spelled out once, so a drift in BOTH forms is still caught", "sid=abcdef; Path=/; Max-Age=600; Secure; HttpOnly; SameSite=Strict", string_get_data(&substituted));
+
+    /* The template is a shared, read-only service field in every real caller: rendering must not
+     * write its value, or the second request would carry the first request's token. */
+    test_expect_u(test, "the template's own value is untouched by the render", 0, string_get_size(&template.value));
+
+    String second = DEFAULT_INITIALIZATION;
+
+    test_expect_true(test, "a second render off the same template succeeds", http_cookie_set_header_value_create_2(&template, "999999", 30, &second));
+    test_expect_string(test, "and carries its own value and Max-Age, not the first render's", "sid=999999; Path=/; Max-Age=30; Secure; HttpOnly; SameSite=Strict", string_get_data(&second));
+
+    String refused = DEFAULT_INITIALIZATION;
+
+    test_expect_false(test, "an injected CRLF is refused exactly as the copying form refuses it", http_cookie_set_header_value_create_2(&template, "x\r\nSet-Cookie: admin=1", 600, &refused));
+    test_expect_u(test, "and *out is left EMPTY, never a bare \"\" on the wire", 0, string_get_size(&refused));
+
+    string_uninit(&refused);
+    string_uninit(&second);
+    string_uninit(&reference);
+    string_uninit(&substituted);
+    http_cookie_uninit(&copied);
+    http_cookie_uninit(&template);
+
+    test_case_end(test);
+}
+
+static void _test_cookie_prefix_rules(Test *const test) {
+    test_case_begin(test, "a `__Host-`/`__Secure-` name whose flags contradict the prefix is refused, not rendered");
+
+    /* Not syntax: the header would be well formed. Every browser DROPS such a cookie without a
+     * word, so a login would answer 200 and nothing would ever authenticate. The rule lived in
+     * http/service/session and http/service/csrf twice; a direct HTTP_Cookie user had neither. */
+    HTTP_Cookie insecure_host = http_cookie_init_2("__Host-session", "tok", "/", HTTP_COOKIE_SAME_SITE_STRICT, false, true);
+    String      insecure_line = http_cookie_set_header_create(&insecure_host);
+
+    test_expect_u(test, "`__Host-` without Secure is refused by the header-line form", 0, string_get_size(&insecure_line));
+
+    String insecure_value = http_cookie_set_header_value_create(&insecure_host);
+
+    test_expect_u(test, "and by the value form", 0, string_get_size(&insecure_value));
+
+    String insecure_clear = http_cookie_clear_header_value_create_3(&insecure_host);
+
+    test_expect_u(test, "and by the clear form, which mirrors the same flags", 0, string_get_size(&insecure_clear));
+
+    HTTP_Cookie scoped_host = http_cookie_init_2("__Host-session", "tok", "/app", HTTP_COOKIE_SAME_SITE_STRICT, true, true);
+    String      scoped_line = http_cookie_set_header_create(&scoped_host);
+
+    test_expect_u(test, "`__Host-` with a Path other than \"/\" is refused even with Secure", 0, string_get_size(&scoped_line));
+
+    HTTP_Cookie empty_path_host = http_cookie_init_2("__Host-session", "tok", "", HTTP_COOKIE_SAME_SITE_STRICT, true, true);
+    String      empty_path_line = http_cookie_set_header_create(&empty_path_host);
+
+    test_expect_u(test, "an OMITTED Path is not Path=\"/\" either - a browser scopes it to the request path", 0, string_get_size(&empty_path_line));
+
+    HTTP_Cookie insecure_secure = http_cookie_init_2("__Secure-session", "tok", "/app", HTTP_COOKIE_SAME_SITE_STRICT, false, true);
+    String      insecure_secure_line = http_cookie_set_header_create(&insecure_secure);
+
+    test_expect_u(test, "`__Secure-` without Secure is refused", 0, string_get_size(&insecure_secure_line));
+
+    /* The prefixes are legal names - only the contradiction is refused. */
+    HTTP_Cookie valid_host = http_cookie_init_2("__Host-session", "tok", "/", HTTP_COOKIE_SAME_SITE_STRICT, true, true);
+    String      valid_line = http_cookie_set_header_value_create(&valid_host);
+
+    test_expect_string(test, "`__Host-` WITH Secure and Path=\"/\" renders normally", "__Host-session=tok; Path=/; Secure; HttpOnly; SameSite=Strict", string_get_data(&valid_line));
+
+    HTTP_Cookie valid_secure      = http_cookie_init_2("__Secure-session", "tok", "/app", HTTP_COOKIE_SAME_SITE_STRICT, true, true);
+    String      valid_secure_line = http_cookie_set_header_value_create(&valid_secure);
+
+    test_expect_string(
+        test, "`__Secure-` WITH Secure renders normally, at any Path", "__Secure-session=tok; Path=/app; Secure; HttpOnly; SameSite=Strict", string_get_data(&valid_secure_line));
+
+    /* A name that merely CONTAINS the text is not prefixed by it. */
+    HTTP_Cookie not_prefixed = http_cookie_init_2("my__Host-session", "tok", "/app", HTTP_COOKIE_SAME_SITE_STRICT, false, true);
+    String      not_prefixed_line = http_cookie_set_header_value_create(&not_prefixed);
+
+    test_expect_string(
+        test, "a name that only contains \"__Host-\" is not prefixed by it", "my__Host-session=tok; Path=/app; HttpOnly; SameSite=Strict", string_get_data(&not_prefixed_line));
+
+    string_uninit(&not_prefixed_line);
+    string_uninit(&valid_secure_line);
+    string_uninit(&valid_line);
+    string_uninit(&insecure_secure_line);
+    string_uninit(&empty_path_line);
+    string_uninit(&scoped_line);
+    string_uninit(&insecure_clear);
+    string_uninit(&insecure_value);
+    string_uninit(&insecure_line);
+    http_cookie_uninit(&not_prefixed);
+    http_cookie_uninit(&valid_secure);
+    http_cookie_uninit(&valid_host);
+    http_cookie_uninit(&insecure_secure);
+    http_cookie_uninit(&empty_path_host);
+    http_cookie_uninit(&scoped_host);
+    http_cookie_uninit(&insecure_host);
+
+    test_case_end(test);
+}
+
+static void _test_get_2_sized_header(Test *const test) {
+    test_case_begin(test, "get_2 scans a SIZED header, so a String's or Str's bytes need no terminator");
+
+    /* The header is deliberately longer than the size handed in: get_2 must stop at the bound
+     * and never read the trailing bytes, which is the whole reason the tier exists. */
+    char const *const header = "a=1; sid=token-value; b=2";
+
+    String bounded = http_cookie_get_2(header, CHAR_STATIC_SIZE("a=1; sid=token-value"), "sid");
+
+    test_expect_string(test, "the value is read up to the bound", "token-value", string_get_data(&bounded));
+
+    String truncated = http_cookie_get_2(header, CHAR_STATIC_SIZE("a=1; sid=token"), "sid");
+
+    test_expect_string(test, "a bound inside the value truncates it rather than over-reading", "token", string_get_data(&truncated));
+
+    String unreachable = http_cookie_get_2(header, CHAR_STATIC_SIZE("a=1;"), "sid");
+
+    test_expect_u(test, "a bound before the pair answers a miss", 0, string_get_size(&unreachable));
+
+    String zero = http_cookie_get_2(header, 0, "sid");
+
+    test_expect_u(test, "a zero size answers a miss without reading a byte", 0, string_get_size(&zero));
+
+    String whole = http_cookie_get_2(header, char_length(header), "sid");
+
+    test_expect_string(test, "at the full length get_2 answers exactly what get_1 answers", "token-value", string_get_data(&whole));
+
+    string_uninit(&whole);
+    string_uninit(&zero);
+    string_uninit(&unreachable);
+    string_uninit(&truncated);
+    string_uninit(&bounded);
+
+    test_case_end(test);
+}
+
+static void _test_header_value_create_refusals(Test *const test) {
+    test_case_begin(test, "the value forms refuse exactly what the header-line forms refuse - a refusal is never a bare \"\" on the wire");
+
+    /* The services' old slicing helper collapsed a REFUSED (EMPTY) render to "" silently, so an
+     * injection attempt became a cookie header with no value rather than no cookie at all. Both
+     * value builders answer the EMPTY String, which every caller already gates on. */
+    HTTP_Cookie bad_name  = http_cookie_init_1("bad name", "tok");
+    String      r1        = http_cookie_set_header_value_create(&bad_name);
+    String      r2        = http_cookie_clear_header_value_create_3(&bad_name);
+
+    test_expect_u(test, "a name that is not a token refuses in the set value form", 0, string_get_size(&r1));
+    test_expect_u(test, "and in the clear value form", 0, string_get_size(&r2));
+
+    string_uninit(&r2);
+    string_uninit(&r1);
+    http_cookie_uninit(&bad_name);
+
+    HTTP_Cookie crlf_value = http_cookie_init_1("sid", "x\r\nSet-Cookie: admin=1");
+    String      r3         = http_cookie_set_header_value_create(&crlf_value);
+
+    test_expect_u(test, "CRLF in the value is refused, never split into a second header", 0, string_get_size(&r3));
+
+    string_uninit(&r3);
+    http_cookie_uninit(&crlf_value);
+
+    HTTP_Cookie bad_path = http_cookie_init_2("sid", "tok", "/a;b", HTTP_COOKIE_SAME_SITE_LAX, true, true);
+    String      r4       = http_cookie_set_header_value_create(&bad_path);
+
+    test_expect_u(test, "';' in Path is refused", 0, string_get_size(&r4));
+
+    string_uninit(&r4);
+    http_cookie_uninit(&bad_path);
+
+    HTTP_Cookie none_insecure = http_cookie_init_2("sid", "tok", "/", HTTP_COOKIE_SAME_SITE_NONE, false, true);
+    String      r5            = http_cookie_set_header_value_create(&none_insecure);
+    String      r6            = http_cookie_clear_header_value_create_3(&none_insecure);
+
+    test_expect_u(test, "SameSite=None without Secure is refused in the set value form", 0, string_get_size(&r5));
+    test_expect_u(test, "and in the clear value form", 0, string_get_size(&r6));
+
+    string_uninit(&r6);
+    string_uninit(&r5);
+    http_cookie_uninit(&none_insecure);
+
+    test_case_end(test);
+}
+
 static void _test_uninit_is_idempotent(Test *const test) {
     test_case_begin(test, "uninit twice is safe");
 
@@ -434,7 +681,9 @@ static void _test_alloc_init_success(Test *const test) {
  *============================================================================*/
 
 int main(void) {
-    log_init((LogConfig){ .level = LOG_LEVEL_ERROR, .stream = stdout, .timestamp_enabled = true, .autoflush = true });
+    LogConfig const log_config = { .level = LOG_LEVEL_ERROR, .stream = stdout, .timestamp_enabled = true, .autoflush = true };
+
+    log_init(log_config);
 
     Test test = test_init("tests/http/cookie/test_all.c");
 
@@ -449,6 +698,11 @@ int main(void) {
     _test_injection_refusals(&test);
     _test_clear_header_create_1_and_2(&test);
     _test_clear_header_create_3_mirrors_self(&test);
+    _test_header_value_create_pair(&test);
+    _test_set_header_value_create_2_matches_the_copying_form(&test);
+    _test_cookie_prefix_rules(&test);
+    _test_get_2_sized_header(&test);
+    _test_header_value_create_refusals(&test);
     _test_uninit_is_idempotent(&test);
     _test_alloc_tier_get_and_clear(&test);
     _test_alloc_init_success(&test);

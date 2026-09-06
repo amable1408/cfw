@@ -1,5 +1,8 @@
 #include <http/cookie/cookie.h>
 
+#define _HTTP_COOKIE_PREFIX_HOST "__Host-"
+#define _HTTP_COOKIE_PREFIX_SECURE "__Secure-"
+
 /*==============================================================================
  * MARK: - Helpers
  *============================================================================*/
@@ -165,7 +168,7 @@ static void _http_cookie_attribute_add_text(String *const header, char const *co
     trace_log_pop();
 }
 
-static char const *_http_cookie_same_site_text(HTTP_Cookie_Same_Site const same_site) {
+static char* _http_cookie_same_site_text(HTTP_Cookie_Same_Site const same_site) {
     switch (same_site) {
         case HTTP_COOKIE_SAME_SITE_LAX:    return "Lax";
         case HTTP_COOKIE_SAME_SITE_NONE:   return "None";
@@ -180,7 +183,7 @@ static bool _http_cookie_name_valid(char const *const data, USize const data_siz
         return false;
     }
 
-    for (USize i = 0; i < data_size; ++i) {
+    for (USize i = 0; i < data_size; i += 1) {
         U8 const byte = (U8) data[i];
 
         if (byte <= 0x20 || byte == 0x7F) {
@@ -236,7 +239,7 @@ static bool _http_cookie_value_valid(char const *const data, USize const data_si
         end   = data_size - 1;
     }
 
-    for (USize i = start; i < end; ++i) {
+    for (USize i = start; i < end; i += 1) {
         if (!_http_cookie_octet_valid((U8) data[i])) {
             return false;
         }
@@ -247,7 +250,7 @@ static bool _http_cookie_value_valid(char const *const data, USize const data_si
 
 /* Path/Domain: no CTL, no ';', no ',' (a bare attribute value is otherwise free text). */
 static bool _http_cookie_attribute_valid(char const *const data, USize const data_size) {
-    for (USize i = 0; i < data_size; ++i) {
+    for (USize i = 0; i < data_size; i += 1) {
         U8 const byte = (U8) data[i];
 
         if (byte <= 0x1F || byte == 0x7F || byte == ';' || byte == ',') {
@@ -258,17 +261,52 @@ static bool _http_cookie_attribute_valid(char const *const data, USize const dat
     return true;
 }
 
+/* A cookie-name prefix test that reads the String's bytes directly: the name is not required to
+ * be NUL-terminated here, so char_starts_with_1 is not usable. */
+static bool _http_cookie_name_has_prefix(String const *const name, char const *const prefix, USize const prefix_size) {
+    USize const name_size = string_get_size(name);
+
+    if (name_size < prefix_size) {
+        return false;
+    }
+
+    return char_compare_equal_2(string_get_data(name), prefix_size, prefix, prefix_size);
+}
+
+/*
+ * Every rule whose breach makes a browser DROP the cookie without a word, checked in one place.
+ *
+ * The `__Host-` / `__Secure-` prefix rules live here rather than in each caller because they are
+ * the same class as SameSite=None-without-Secure directly below them: a header this module would
+ * happily render and no browser would keep. http/service/session and http/service/csrf each
+ * carried their own copy of the two tests before this; a direct HTTP_Cookie user had neither.
+ *
+ * `value_data` may be nullptr with a `value_size` of 0 - the clear renderer emits no value at all.
+ */
 static bool _http_cookie_header_fields_valid(
-    char const *const caller, String const *const name, String const *const value, String const *const path, String const *const domain, HTTP_Cookie_Same_Site const same_site,
-    bool const secure, bool const partitioned) {
+    char const *const caller, String const *const name, char const *const value_data, USize const value_size, String const *const path, String const *const domain,
+    HTTP_Cookie_Same_Site const same_site, bool const secure, bool const partitioned) {
     if (!_http_cookie_name_valid(string_get_data(name), string_get_size(name))) {
         log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "%s: refusing - the cookie name is not a valid token", caller);
 
         return false;
     }
 
-    if (value != nullptr && !_http_cookie_value_valid(string_get_data(value), string_get_size(value))) {
+    if (!_http_cookie_value_valid(value_data, value_size)) {
         log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "%s: refusing - the cookie value has bytes outside cookie-octet", caller);
+
+        return false;
+    }
+
+    if (_http_cookie_name_has_prefix(name, _HTTP_COOKIE_PREFIX_HOST, CHAR_STATIC_SIZE(_HTTP_COOKIE_PREFIX_HOST)) &&
+        (!secure || string_get_size(path) != 1 || string_get_data(path)[0] != '/')) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "%s: refusing - the `__Host-` name prefix requires Secure and Path=\"/\" (browsers drop the cookie otherwise)", caller);
+
+        return false;
+    }
+
+    if (_http_cookie_name_has_prefix(name, _HTTP_COOKIE_PREFIX_SECURE, CHAR_STATIC_SIZE(_HTTP_COOKIE_PREFIX_SECURE)) && !secure) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "%s: refusing - the `__Secure-` name prefix requires Secure (browsers drop the cookie otherwise)", caller);
 
         return false;
     }
@@ -346,14 +384,155 @@ static String _http_cookie_clear_header_create(char const *const name, char cons
     return header;
 }
 
-static String _http_cookie_get(char const *const header, char const *const name, Arena *const allocator) {
+/*
+ * The two Set-Cookie renderers, written once each and reachable in two spellings.
+ *
+ * `header_line` true emits the whole response header line - "Set-Cookie: " ... CRLF.
+ * `header_line` false emits only the bare VALUE ("sid=abc; Path=/; ..."), which is what a
+ * caller hands to http_server_response_header_add("Set-Cookie", value). http/service/session
+ * and http/service/csrf each carried a private copy that rendered the full line and then
+ * sliced CHAR_STATIC_SIZE("Set-Cookie: ") and the CRLF back off - arithmetic coupled to this
+ * module's exact spelling, in two places, with a refused (EMPTY) render collapsing silently
+ * to "". Both now call the value forms directly.
+ *
+ * A rendered value needs no explicit terminator: string_add_2 writes the NUL after every
+ * append. A refusal answers the EMPTY String, whose data IS nullptr - callers gate on
+ * string_empty, exactly as they already do for the header-line forms.
+ */
+static String _http_cookie_clear_render_3(HTTP_Cookie const *const self, bool const header_line) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+
+    if (!_http_cookie_header_fields_valid(
+            header_line ? "http_cookie_clear_header_create_3" : "http_cookie_clear_header_value_create_3", &self->name, nullptr, 0, &self->path, &self->domain, self->same_site,
+            self->secure, self->partitioned)) {
+        String const empty = _http_cookie_string_init(self->allocator);
+
+        trace_log_pop();
+
+        return empty;
+    }
+
+    String header = _http_cookie_string_init(self->allocator);
+
+    if (header_line) {
+        _http_cookie_string_add(&header, "Set-Cookie: ");
+    }
+
+    string_add_last_4(&header, &self->name);
+    _http_cookie_string_add(&header, "=");
+    _http_cookie_attribute_add(&header, "Path", &self->path);
+    _http_cookie_attribute_add(&header, "Domain", &self->domain);
+    _http_cookie_string_add(&header, "; Max-Age=0");
+    _http_cookie_string_add(&header, "; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+
+    if (self->secure) {
+        _http_cookie_string_add(&header, "; Secure");
+    }
+
+    if (self->http_only) {
+        _http_cookie_string_add(&header, "; HttpOnly");
+    }
+
+    _http_cookie_attribute_add_text(&header, "SameSite", _http_cookie_same_site_text(self->same_site));
+
+    if (self->partitioned) {
+        _http_cookie_string_add(&header, "; Partitioned");
+    }
+
+    if (header_line) {
+        _http_cookie_string_add(&header, "\r\n");
+    }
+
+    trace_log_pop();
+
+    return header;
+}
+
+/*
+ * The set renderer proper: `self` supplies the name, Path, Domain and flags, while the VALUE and
+ * the Max-Age are passed in. http_cookie_set_header_value_create_2 uses that to render one
+ * template with a substitute value, so a per-response cookie (a session mint, a CSRF token) costs
+ * no copy of the name/path/value at all - the two services each used to build, render and then
+ * uninitialize a throwaway HTTP_Cookie per response.
+ */
+static String _http_cookie_set_render_fields(HTTP_Cookie const *const self,
+    char const *const caller, char const *const value_data, USize const value_size, bool const has_max_age, USize const max_age, bool const header_line) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+    error_check_null(LOG_METADATA, "caller", (void*) caller);
+
+    if (!_http_cookie_header_fields_valid(caller, &self->name, value_data, value_size, &self->path, &self->domain, self->same_site, self->secure, self->partitioned)) {
+        String const empty = _http_cookie_string_init(self->allocator);
+
+        trace_log_pop();
+
+        return empty;
+    }
+
+    String header = _http_cookie_string_init(self->allocator);
+
+    if (header_line) {
+        _http_cookie_string_add(&header, "Set-Cookie: ");
+    }
+
+    string_add_last_4(&header, &self->name);
+    _http_cookie_string_add(&header, "=");
+    _http_cookie_string_add_2(&header, value_data == nullptr ? "" : value_data, value_size);
+    _http_cookie_attribute_add(&header, "Path", &self->path);
+    _http_cookie_attribute_add(&header, "Domain", &self->domain);
+
+    if (has_max_age) {
+        _http_cookie_string_add(&header, "; Max-Age=");
+        _http_cookie_number_add(&header, max_age);
+    }
+
+    if (self->secure) {
+        _http_cookie_string_add(&header, "; Secure");
+    }
+
+    if (self->http_only) {
+        _http_cookie_string_add(&header, "; HttpOnly");
+    }
+
+    _http_cookie_attribute_add_text(&header, "SameSite", _http_cookie_same_site_text(self->same_site));
+
+    if (self->partitioned) {
+        _http_cookie_string_add(&header, "; Partitioned");
+    }
+
+    if (header_line) {
+        _http_cookie_string_add(&header, "\r\n");
+    }
+
+    trace_log_pop();
+
+    return header;
+}
+
+static String _http_cookie_set_render(HTTP_Cookie const *const self, bool const header_line) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+
+    String const header = _http_cookie_set_render_fields(
+        self, header_line ? "http_cookie_set_header_create" : "http_cookie_set_header_value_create", string_get_data(&self->value), string_get_size(&self->value), self->has_max_age,
+        self->max_age, header_line);
+
+    trace_log_pop();
+
+    return header;
+}
+
+static String _http_cookie_get(char const *const header, USize const header_size, char const *const name, Arena *const allocator) {
     trace_log_push(LOG_METADATA);
 
     error_check_null(LOG_METADATA, "header", (void*) header);
     error_check_null(LOG_METADATA, "name", (void*) name);
 
     String      value       = _http_cookie_string_init(allocator);
-    USize const header_size = char_length(header);
     USize const name_size   = char_length(name);
 
     /* An empty name names no cookie - it is a value's own text ("; =1" is a pair with an empty
@@ -480,7 +659,21 @@ String http_cookie_alloc_get_1(char const *const header, char const *const name,
     error_check_null(LOG_METADATA, "name", (void*) name);
     error_check_null(LOG_METADATA, "allocator", (void*) allocator);
 
-    String const value = _http_cookie_get(header, name, allocator);
+    String const value = _http_cookie_get(header, char_length(header), name, allocator);
+
+    trace_log_pop();
+
+    return value;
+}
+
+String http_cookie_alloc_get_2(char const *const header, USize const header_size, char const *const name, Arena *const allocator) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "header", (void*) header);
+    error_check_null(LOG_METADATA, "name", (void*) name);
+    error_check_null(LOG_METADATA, "allocator", (void*) allocator);
+
+    String const value = _http_cookie_get(header, header_size, name, allocator);
 
     trace_log_pop();
 
@@ -564,43 +757,23 @@ String http_cookie_clear_header_create_3(HTTP_Cookie const *const self) {
 
     error_check_null(LOG_METADATA, "self", (void*) self);
 
-    if (!_http_cookie_header_fields_valid("http_cookie_clear_header_create_3", &self->name, nullptr, &self->path, &self->domain, self->same_site, self->secure, self->partitioned)) {
-        String const empty = _http_cookie_string_init(self->allocator);
-
-        trace_log_pop();
-
-        return empty;
-    }
-
-    String header = _http_cookie_string_init(self->allocator);
-
-    _http_cookie_string_add(&header, "Set-Cookie: ");
-    string_add_last_4(&header, &self->name);
-    _http_cookie_string_add(&header, "=");
-    _http_cookie_attribute_add(&header, "Path", &self->path);
-    _http_cookie_attribute_add(&header, "Domain", &self->domain);
-    _http_cookie_string_add(&header, "; Max-Age=0");
-    _http_cookie_string_add(&header, "; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
-
-    if (self->secure) {
-        _http_cookie_string_add(&header, "; Secure");
-    }
-
-    if (self->http_only) {
-        _http_cookie_string_add(&header, "; HttpOnly");
-    }
-
-    _http_cookie_attribute_add_text(&header, "SameSite", _http_cookie_same_site_text(self->same_site));
-
-    if (self->partitioned) {
-        _http_cookie_string_add(&header, "; Partitioned");
-    }
-
-    _http_cookie_string_add(&header, "\r\n");
+    String const header = _http_cookie_clear_render_3(self, true);
 
     trace_log_pop();
 
     return header;
+}
+
+String http_cookie_clear_header_value_create_3(HTTP_Cookie const *const self) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+
+    String const value = _http_cookie_clear_render_3(self, false);
+
+    trace_log_pop();
+
+    return value;
 }
 
 void http_cookie_domain_set(HTTP_Cookie *const self, char const *const domain) {
@@ -620,7 +793,20 @@ String http_cookie_get_1(char const *const header, char const *const name) {
     error_check_null(LOG_METADATA, "header", (void*) header);
     error_check_null(LOG_METADATA, "name", (void*) name);
 
-    String const value = _http_cookie_get(header, name, nullptr);
+    String const value = _http_cookie_get(header, char_length(header), name, nullptr);
+
+    trace_log_pop();
+
+    return value;
+}
+
+String http_cookie_get_2(char const *const header, USize const header_size, char const *const name) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "header", (void*) header);
+    error_check_null(LOG_METADATA, "name", (void*) name);
+
+    String const value = _http_cookie_get(header, header_size, name, nullptr);
 
     trace_log_pop();
 
@@ -757,47 +943,39 @@ String http_cookie_set_header_create(HTTP_Cookie const *const self) {
 
     error_check_null(LOG_METADATA, "self", (void*) self);
 
-    if (!_http_cookie_header_fields_valid("http_cookie_set_header_create", &self->name, &self->value, &self->path, &self->domain, self->same_site, self->secure, self->partitioned)) {
-        String const empty = _http_cookie_string_init(self->allocator);
-
-        trace_log_pop();
-
-        return empty;
-    }
-
-    String header = _http_cookie_string_init(self->allocator);
-
-    _http_cookie_string_add(&header, "Set-Cookie: ");
-    string_add_last_4(&header, &self->name);
-    _http_cookie_string_add(&header, "=");
-    string_add_last_4(&header, &self->value);
-    _http_cookie_attribute_add(&header, "Path", &self->path);
-    _http_cookie_attribute_add(&header, "Domain", &self->domain);
-
-    if (self->has_max_age) {
-        _http_cookie_string_add(&header, "; Max-Age=");
-        _http_cookie_number_add(&header, self->max_age);
-    }
-
-    if (self->secure) {
-        _http_cookie_string_add(&header, "; Secure");
-    }
-
-    if (self->http_only) {
-        _http_cookie_string_add(&header, "; HttpOnly");
-    }
-
-    _http_cookie_attribute_add_text(&header, "SameSite", _http_cookie_same_site_text(self->same_site));
-
-    if (self->partitioned) {
-        _http_cookie_string_add(&header, "; Partitioned");
-    }
-
-    _http_cookie_string_add(&header, "\r\n");
+    String const header = _http_cookie_set_render(self, true);
 
     trace_log_pop();
 
     return header;
+}
+
+String http_cookie_set_header_value_create(HTTP_Cookie const *const self) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+
+    String const value = _http_cookie_set_render(self, false);
+
+    trace_log_pop();
+
+    return value;
+}
+
+bool http_cookie_set_header_value_create_2(HTTP_Cookie const *const template, char const *const value, USize const max_age, String *const out) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "template", (void*) template);
+    error_check_null(LOG_METADATA, "value", (void*) value);
+    error_check_null(LOG_METADATA, "out", (void*) out);
+
+    *out = _http_cookie_set_render_fields(template, "http_cookie_set_header_value_create_2", value, char_length(value), true, max_age, false);
+
+    bool const success = !string_empty(out);
+
+    trace_log_pop();
+
+    return success;
 }
 
 void http_cookie_uninit(HTTP_Cookie *const self) {
