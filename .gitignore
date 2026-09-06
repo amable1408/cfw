@@ -7,6 +7,9 @@ tests/**/test_*
 !tests/**/test_*.c
 !tests/**/test_*.h
 
+# Test fixtures written at runtime (survive only a crashed run)
+http_server_suite_fixture*.txt
+
 # CMake
 /build/
 CMakeCache.txt

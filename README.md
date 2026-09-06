@@ -6,7 +6,7 @@ A modular **C23 framework**: self-contained modules, one translation unit each, 
 per module, and a test suite per module. This repository is the **audited export** of CFW - it
 holds only the modules that have cleared every gate below, together with everything they include.
 
-**46 modules** (217 files) at HEAD; the last tagged release is **0.2.0**. A
+**47 modules** (219 files) at HEAD; the last tagged release is **0.2.0**. A
 module lands in its own commit as soon as it clears the gate; a version is tagged when a family
 is complete. See the table below for exactly which modules are here.
 
@@ -63,6 +63,7 @@ errors that abort in checked builds - is documented in its header's `Error Handl
 | `http/cookie` | 1 .c / 1 .h | tests/http/cookie/ | HTTP cookie helpers for the C Libraries Framework |
 | `http/headers` | 1 .c / 1 .h | tests/http/headers/ | HTTP header helpers for the C Libraries Framework |
 | `http/query` | 1 .c / 1 .h | tests/http/query/ |  |
+| `http/server` | 1 .c / 1 .h | tests/http/server/ |  |
 | `http/service/body_parser` | 1 .c / 1 .h | tests/http/service/body_parser/ | HTTP request body parser service for the C Libraries Framework |
 | `http/service/multipart` | 2 .c / 2 .h | tests/http/service/multipart/ | Dynamic array list of HTTP_Service_Multipart_Node values for the C Libraries Framework |
 | `http/service/trace` | 1 .c / 1 .h | tests/http/service/trace/ | HTTP request/response access trace service for the C Libraries Framework |
@@ -90,10 +91,10 @@ Requires a **C23 compiler** (gcc 14+ or clang 18+; MSVC is not supported) and, a
 
 ```sh
 # Debian / Ubuntu
-sudo apt install libssl-dev libcurl4-openssl-dev libcglm-dev libpcre2-dev
+sudo apt install libssl-dev libcurl4-openssl-dev libwebsockets-dev libcglm-dev libpcre2-dev
 
 # MSYS2 (UCRT64)
-pacman -S mingw-w64-ucrt-x86_64-openssl mingw-w64-ucrt-x86_64-curl mingw-w64-ucrt-x86_64-cglm mingw-w64-ucrt-x86_64-pcre2
+pacman -S mingw-w64-ucrt-x86_64-openssl mingw-w64-ucrt-x86_64-curl mingw-w64-ucrt-x86_64-libwebsockets mingw-w64-ucrt-x86_64-cglm mingw-w64-ucrt-x86_64-pcre2
 ```
 
 ```sh
