@@ -24,6 +24,7 @@
 #define _DATETIME_HOUR_IN_DAY 24
 #define _DATETIME_HOUR_IN_SECONDS 3600
 #define _DATETIME_HOUR_MAX 23
+#define _DATETIME_HTTP_DATE_SIZE CHAR_STATIC_SIZE("Sun, 06 Nov 1994 08:49:37 GMT")
 #define _DATETIME_MINUTE_IN_SECONDS 60
 #define _DATETIME_MINUTE_MAX 59
 #define _DATETIME_MONTH_IN_YEAR 12
@@ -178,6 +179,86 @@ static bool _datetime_parse_iso_date(char const *const date, USize const date_si
     }
 
     *out = datetime_init_5(year, month - 1, day, 0, 0, 0);
+
+    return true;
+}
+
+/**
+ * Parse an RFC 7231 SS7.1.1.1 IMF-fixdate ("Sun, 06 Nov 1994 08:49:37 GMT"),
+ * VALIDATING it exactly like _datetime_parse_iso_date: fixed total length,
+ * fixed literal bytes at fixed offsets, digit-only numeric fields, and a
+ * day-of-week/month name drawn from a fixed abbreviation list rather than a
+ * %a/%b-style locale lookup. The obsolete RFC 850 ("Sunday, 06-Nov-94
+ * 08:49:37 GMT") and asctime ("Sun Nov  6 08:49:37 1994") forms never reach
+ * the field parsing below - both fail the length/layout checks first.
+ */
+static bool _datetime_parse_http_date(char const *const text, USize const text_size, Datetime *const out) {
+    if (memory_empty((void*) text) || text_size != _DATETIME_HTTP_DATE_SIZE) {
+        return false;
+    }
+
+    if (text[3] != ',' || text[4] != ' ' || text[7] != ' ' || text[11] != ' ' || text[16] != ' ' ||
+        text[19] != ':' || text[22] != ':' || text[25] != ' ') {
+        return false;
+    }
+
+    if (!char_compare_equal_2(text + 26, CHAR_STATIC_SIZE("GMT"), "GMT", CHAR_STATIC_SIZE("GMT"))) {
+        return false;
+    }
+
+    USize const digit_positions[] = { 5, 6, 12, 13, 14, 15, 17, 18, 20, 21, 23, 24 };
+
+    for (USize i = 0; i < sizeof(digit_positions) / sizeof(digit_positions[0]); i += 1) {
+        if (!char_is_number(text[digit_positions[i]])) {
+            return false;
+        }
+    }
+
+    static char const day_names[_DATETIME_DAY_IN_WEEK][_DATETIME_ABBREVIATED_NAME_SIZE] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    static char const month_names[_DATETIME_MONTH_IN_YEAR][_DATETIME_ABBREVIATED_NAME_SIZE] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    USize const name_size = _DATETIME_ABBREVIATED_NAME_SIZE - CHAR_END_CHARACTER;
+
+    I32 week_day = -1;
+
+    for (I32 i = 0; i < _DATETIME_DAY_IN_WEEK; i += 1) {
+        if (char_compare_equal_2(text, name_size, day_names[i], name_size)) {
+            week_day = i;
+
+            break;
+        }
+    }
+
+    if (week_day < 0) {
+        return false;
+    }
+
+    I32 month = -1;
+
+    for (I32 i = 0; i < _DATETIME_MONTH_IN_YEAR; i += 1) {
+        if (char_compare_equal_2(text + 8, name_size, month_names[i], name_size)) {
+            month = i;
+
+            break;
+        }
+    }
+
+    if (month < 0) {
+        return false;
+    }
+
+    I32 const day    = (I32) char_to_numbers_uint_2(text + 5, 2);
+    I32 const year   = (I32) char_to_numbers_uint_2(text + 12, 4);
+    I32 const hour   = (I32) char_to_numbers_uint_2(text + 17, 2);
+    I32 const minute = (I32) char_to_numbers_uint_2(text + 20, 2);
+    I32 const second = (I32) char_to_numbers_uint_2(text + 23, 2);
+
+    /* Year 0 is this module's INVALID sentinel - see _datetime_parse_iso_date. */
+    if (year < 1 || day < 1 || day > _datetime_days_in_month(year, month) ||
+        hour > _DATETIME_HOUR_MAX || minute > _DATETIME_MINUTE_MAX || second > _DATETIME_SECOND_MAX) {
+        return false;
+    }
+
+    *out = datetime_init_5(year, month, day, hour, minute, second);
 
     return true;
 }
@@ -601,6 +682,22 @@ bool datetime_from_char_try(char const *const date, USize const date_size, char 
     }
 
     bool const parsed = _datetime_parse_iso_date(date, date_size, out);
+
+    trace_log_pop();
+
+    return parsed;
+}
+
+bool datetime_from_http_try(char const *const text, USize const text_size, Datetime *const out) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "text", (void*) text);
+    error_check_null(LOG_METADATA, "out", (void*) out);
+
+    /* The reporting form: see datetime_from_char_try. */
+    *out = (Datetime) DEFAULT_INITIALIZATION;
+
+    bool const parsed = _datetime_parse_http_date(text, text_size, out);
 
     trace_log_pop();
 

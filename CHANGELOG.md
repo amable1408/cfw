@@ -26,6 +26,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - `http/client`
 - `http/headers`
 - `http/cookie`
+- sync: datetime
 
 ## 0.2.0 - release
 

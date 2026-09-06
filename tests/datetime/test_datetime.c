@@ -434,6 +434,69 @@ static void _test_parse_try(Test *const self) {
 }
 
 /*==============================================================================
+ * MARK: - Parse HTTP-date (try_) suite
+ *============================================================================*/
+
+static void _test_parse_http(Test *const self) {
+    test_suite_begin(self, "parse http date");
+
+    test_case_begin(self, "the canonical IMF-fixdate round-trips");
+
+    Datetime out = DEFAULT_INITIALIZATION;
+    char const *const canonical = "Sun, 06 Nov 1994 08:49:37 GMT";
+
+    test_expect_true(self, "the canonical example parses", datetime_from_http_try(canonical, CHAR_STATIC_SIZE("Sun, 06 Nov 1994 08:49:37 GMT"), &out));
+    test_expect_i(self, "year 1994", 1994, out.year);
+    test_expect_i(self, "month November (10)", DATETIME_MONTH_NOVEMBER, out.month);
+    test_expect_i(self, "date 6", 6, out.date);
+    test_expect_i(self, "hour 8", 8, out.hours);
+    test_expect_i(self, "minute 49", 49, out.minutes);
+    test_expect_i(self, "second 37", 37, out.seconds);
+    test_expect_true(self, "out is a valid Datetime", datetime_is_valid(&out));
+
+    test_case_end(self);
+
+    test_case_begin(self, "malformed shapes are refused, never aborted");
+
+    Datetime bad = DEFAULT_INITIALIZATION;
+
+    test_expect_false(self, "one byte short refuses", datetime_from_http_try(canonical, CHAR_STATIC_SIZE("Sun, 06 Nov 1994 08:49:37 GMT") - 1, &bad));
+    test_expect_i(self, "... leaving out zeroed", 0, bad.year);
+    test_expect_false(self, "one byte long refuses", datetime_from_http_try("Sun, 06 Nov 1994 08:49:37 GMT ", CHAR_STATIC_SIZE("Sun, 06 Nov 1994 08:49:37 GMT "), &bad));
+    test_expect_false(self, "an unknown weekday name refuses", datetime_from_http_try("Xxx, 06 Nov 1994 08:49:37 GMT", CHAR_STATIC_SIZE("Xxx, 06 Nov 1994 08:49:37 GMT"), &bad));
+    test_expect_false(self, "an unknown month name refuses", datetime_from_http_try("Sun, 06 Xxx 1994 08:49:37 GMT", CHAR_STATIC_SIZE("Sun, 06 Xxx 1994 08:49:37 GMT"), &bad));
+    test_expect_false(self, "a non-digit in a numeric field refuses", datetime_from_http_try("Sun, XX Nov 1994 08:49:37 GMT", CHAR_STATIC_SIZE("Sun, XX Nov 1994 08:49:37 GMT"), &bad));
+    test_expect_false(self, "the obsolete RFC 850 form refuses", datetime_from_http_try("Sunday, 06-Nov-94 08:49:37 GMT", CHAR_STATIC_SIZE("Sunday, 06-Nov-94 08:49:37 GMT"), &bad));
+    test_expect_false(self, "the obsolete asctime form refuses", datetime_from_http_try("Sun Nov  6 08:49:37 1994", CHAR_STATIC_SIZE("Sun Nov  6 08:49:37 1994"), &bad));
+
+    test_case_end(self);
+
+    test_case_begin(self, "leap-day and boundary fields");
+
+    Datetime leap         = DEFAULT_INITIALIZATION;
+    Datetime not_leap     = DEFAULT_INITIALIZATION;
+    Datetime boundary     = DEFAULT_INITIALIZATION;
+    Datetime out_of_range = DEFAULT_INITIALIZATION;
+
+    test_expect_true(self, "29 Feb of a leap year parses", datetime_from_http_try("Thu, 29 Feb 1996 12:00:00 GMT", CHAR_STATIC_SIZE("Thu, 29 Feb 1996 12:00:00 GMT"), &leap));
+    test_expect_i(self, "leap year 1996", 1996, leap.year);
+    test_expect_i(self, "leap date 29", 29, leap.date);
+
+    test_expect_false(self, "29 Feb of a non-leap year refuses", datetime_from_http_try("Wed, 29 Feb 1995 12:00:00 GMT", CHAR_STATIC_SIZE("Wed, 29 Feb 1995 12:00:00 GMT"), &not_leap));
+
+    test_expect_true(self, "23:59:59 is accepted", datetime_from_http_try("Sun, 06 Nov 1994 23:59:59 GMT", CHAR_STATIC_SIZE("Sun, 06 Nov 1994 23:59:59 GMT"), &boundary));
+    test_expect_i(self, "hour 23", 23, boundary.hours);
+    test_expect_i(self, "minute 59", 59, boundary.minutes);
+    test_expect_i(self, "second 59", 59, boundary.seconds);
+
+    test_expect_false(self, "hour 25 refuses", datetime_from_http_try("Sun, 06 Nov 1994 25:00:00 GMT", CHAR_STATIC_SIZE("Sun, 06 Nov 1994 25:00:00 GMT"), &out_of_range));
+
+    test_case_end(self);
+
+    test_suite_end(self);
+}
+
+/*==============================================================================
  * MARK: - Comparison suite
  *============================================================================*/
 
@@ -1047,6 +1110,7 @@ int main(void) {
     _test_encode(&test);
     _test_parse_validation(&test);
     _test_parse_try(&test);
+    _test_parse_http(&test);
     _test_compare(&test);
     _test_days_operation(&test);
     _test_timestamp_time(&test);

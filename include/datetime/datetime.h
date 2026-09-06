@@ -301,6 +301,21 @@ Datetime datetime_from_char_4(char const *const date, USize const date_size, cha
 bool datetime_from_char_try(char const *const date, USize const date_size, char const *const format, USize const format_size, Datetime *const out);
 
 /**
+ * @brief Parse an RFC 7231 SS7.1.1.1 IMF-fixdate HTTP date, reporting success
+ *        instead of encoding it in the result (see datetime_from_char_try).
+ *        Only the fixed-format IMF-fixdate is accepted - the obsolete RFC 850
+ *        and asctime date forms HTTP/1.1 also permits on receipt are refused.
+ * @param text HTTP-date text, e.g. "Sun, 06 Nov 1994 08:49:37 GMT". Must not
+ *             be nullptr; may be short, long, or malformed.
+ * @param text_size Bytes available in text. Any size other than 29 is a parse
+ *                  failure.
+ * @param out Receives the parsed value on success, the invalid Datetime on failure.
+ * @return True when text is exactly a well-formed IMF-fixdate and every field
+ *         was in range (leap day included).
+ */
+bool datetime_from_http_try(char const *const text, USize const text_size, Datetime *const out);
+
+/**
  * @brief Parse a Datetime from a Str and format.
  * @param date Str date.
  * @param format C string format.
