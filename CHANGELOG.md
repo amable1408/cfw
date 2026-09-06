@@ -21,6 +21,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - `http/service/body_parser`
 - `http/query`
 - sync: websocket/client
+- `http/service/multipart`
 
 ## 0.2.0 - release
 

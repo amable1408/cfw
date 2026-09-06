@@ -126,6 +126,7 @@ $(subst .c,$(EXE),tests/container/str/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc
 $(subst .c,$(EXE),tests/dir/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc
 $(subst .c,$(EXE),tests/env/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
 $(subst .c,$(EXE),tests/http/service/body_parser/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
+$(subst .c,$(EXE),tests/http/service/multipart/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
 $(subst .c,$(EXE),tests/memory/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=realloc
 $(OOM_BIN): %$(EXE): %.c $(HARNESS) libcfw.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(HARNESS) libcfw.a $(OOM_WRAP) $(LDLIBS)
