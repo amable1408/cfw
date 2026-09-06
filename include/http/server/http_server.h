@@ -264,6 +264,11 @@
 #define HTTP_SERVER_STATUS_CODE_SERVICE_UNAVAILABLE HTTP_STATUS_SERVICE_UNAVAILABLE
 /* 307, not 302: the temporary redirect that preserves the request method. */
 #define HTTP_SERVER_STATUS_CODE_TEMPORARY_REDIRECT 307
+/* libwebsockets' HTTP_STATUS_* enum has no name for 429, so the number is
+ * written out here rather than aliased to a token that does not exist. Pair it
+ * with a Retry-After header - RFC 6585 SHOULD; http_service_rate_limit_check_*
+ * answers the seconds to put there. */
+#define HTTP_SERVER_STATUS_CODE_TOO_MANY_REQUESTS 429
 #define HTTP_SERVER_STATUS_CODE_UNAUTHORIZED HTTP_STATUS_UNAUTHORIZED
 #define HTTP_SERVER_STATUS_CODE_UNSUPPORTED_MEDIA_TYPE HTTP_STATUS_UNSUPPORTED_MEDIA_TYPE
 

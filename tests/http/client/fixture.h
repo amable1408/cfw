@@ -60,6 +60,15 @@ typedef struct Fixture_Server {
     USize keep_alive_request_count;        /**< FIXTURE_SCRIPT_KEEP_ALIVE: requests to serve before closing. */
     USize max_connections;                 /**< Accept-loop bound; 0 means 1. */
 
+    /* Response-body script inputs. FIXTURE_SCRIPT_OK and FIXTURE_SCRIPT_STATUS only; both
+     * default to null, and a null field leaves that script's own historical output byte for
+     * byte unchanged (body "ok-body-content" / "status-body", and no Content-Type header at
+     * all). Set them to answer an arbitrary payload - a `{"success":true}` siteverify reply,
+     * a `{"error":"invalid_grant"}` 400 - without a live provider. Both point at
+     * caller-owned, NUL-terminated storage that must outlive fixture_server_join. */
+    char const *response_body;             /**< Body to send instead of the script's default literal. */
+    char const *response_content_type;     /**< Content-Type value; null omits the header entirely. */
+
     /* Script outputs - valid only after fixture_server_join. Reflect the LAST request parsed. */
     USize  connection_count;               /**< Number of TCP connections actually accepted. */
     USize  request_count;                  /**< Total requests parsed across every connection. */

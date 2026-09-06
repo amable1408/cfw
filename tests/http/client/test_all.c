@@ -134,6 +134,76 @@ static void _test_status_4xx_5xx_are_transport_success(Test *const test) {
     test_case_end(test);
 }
 
+/* Fixture capability pin, not an http_client pin: response_body / response_content_type let a
+ * suite script an arbitrary payload (a siteverify `{"success":true}`, a 400 JSON error) instead
+ * of the two fixed literals the OK/STATUS scripts used to hardcode. Left unset, every other
+ * case in this file still sees the historical bytes - which is why their expectations above
+ * are untouched. Added for the captcha/oauth/email rounds, which share this fixture. */
+static void _test_scripted_response_body_round_trips(Test *const test) {
+    test_case_begin(test, "loopback: a scripted response_body and Content-Type reach the caller verbatim");
+
+    char const *const scripted = "{\"success\":true,\"hostname\":\"h\"}";
+
+    Fixture_Server server = DEFAULT_INITIALIZATION;
+    server.script = FIXTURE_SCRIPT_OK;
+    server.response_body = scripted;
+    server.response_content_type = "application/json";
+
+    if (_start(test, &server)) {
+        char url[64] = DEFAULT_INITIALIZATION;
+        _url_for(fixture_server_port(&server), "/", url, sizeof(url));
+
+        HTTP_Client *client = http_client_new();
+        String response = string_init_1();
+        HTTP_Client_Result result = http_client_get(client, url, &response);
+
+        test_expect_true(test, "success", result.success);
+        test_expect_u(test, "200", 200, result.response_code);
+        test_expect_string(test, "the scripted JSON body arrives byte-exact", scripted, string_get_data(&response));
+
+        char const *const content_type = http_client_response_header_find(client, "Content-Type");
+
+        test_expect_true(test, "the scripted Content-Type arrives", content_type != nullptr && strcmp(content_type, "application/json") == 0);
+
+        http_client_result_uninit(&result);
+        string_uninit(&response);
+        http_client_delete(&client);
+        fixture_server_join(&server);
+        string_uninit(&server.request_body);
+    }
+
+    // A 400 with a scripted JSON error body - the shape the oauth/captcha rounds need.
+    Fixture_Server error_server = DEFAULT_INITIALIZATION;
+    error_server.script = FIXTURE_SCRIPT_STATUS;
+    error_server.status_code = 400;
+    error_server.response_body = "{\"error\":\"invalid_grant\"}";
+
+    if (!_start(test, &error_server)) {
+        test_case_end(test);
+
+        return;
+    }
+
+    char error_url[64] = DEFAULT_INITIALIZATION;
+    _url_for(fixture_server_port(&error_server), "/", error_url, sizeof(error_url));
+
+    HTTP_Client *error_client = http_client_new();
+    String error_response = string_init_1();
+    HTTP_Client_Result error_result = http_client_get(error_client, error_url, &error_response);
+
+    test_expect_true(test, "transport success on a scripted 400", error_result.success);
+    test_expect_u(test, "400", 400, error_result.response_code);
+    test_expect_string(test, "the scripted error body replaces \"status-body\"", "{\"error\":\"invalid_grant\"}", string_get_data(&error_response));
+
+    http_client_result_uninit(&error_result);
+    string_uninit(&error_response);
+    http_client_delete(&error_client);
+    fixture_server_join(&error_server);
+    string_uninit(&error_server.request_body);
+
+    test_case_end(test);
+}
+
 static void _test_redirect_final_hop_headers_only(Test *const test) {
     test_case_begin(test, "loopback: 302 -> only the final hop's headers survive");
 
@@ -1539,6 +1609,7 @@ int main(void) {
 
     _test_ok_headers_and_status(&test);
     _test_status_4xx_5xx_are_transport_success(&test);
+    _test_scripted_response_body_round_trips(&test);
     _test_redirect_final_hop_headers_only(&test);
     _test_redirect_loop_exceeds_maxredirects(&test);
     _test_redirect_to_ftp_refused(&test);

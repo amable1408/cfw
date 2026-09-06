@@ -22,6 +22,10 @@
 #define _FIXTURE_IO_TIMEOUT_MS               3000
 #define _FIXTURE_KEEPALIVE_IDLE_TIMEOUT_MS   700
 #define _FIXTURE_REQUEST_BUFFER_SIZE         16384
+/* Bytes the status line, the fixed headers and a Content-Type line can occupy ahead of a
+ * scripted body; a body that would push past _FIXTURE_RESPONSE_SIZE is refused, never cut. */
+#define _FIXTURE_RESPONSE_HEADER_ROOM        512
+#define _FIXTURE_RESPONSE_SIZE               2048
 #define _FIXTURE_STALL_HOLD_MS               4000
 
 /* gzip of "gzip-body-ok\n" (mtime=0, level 9) - precomputed so the fixture
@@ -235,19 +239,44 @@ static bool _fixture_parse_request(Net_Socket const conn, bool const first, Fixt
  * MARK: - Scripted responses
  *============================================================================*/
 
-static bool _fixture_respond_ok(Net_Socket const conn) {
-    char const *const body = "ok-body-content";
-    char response[512] = DEFAULT_INITIALIZATION;
+/* Renders the optional Content-Type header line for the two scriptable responses. A null
+ * content_type yields an EMPTY line, so an unscripted FIXTURE_SCRIPT_OK / _STATUS emits the
+ * exact bytes it always did - the http/client suite's own totals must not move. */
+static void _fixture_content_type_line(char const *const content_type, char *const line, USize const line_size) {
+    line[0] = '\0';
+
+    if (content_type == nullptr) {
+        return;
+    }
+
+    snprintf(line, line_size, "Content-Type: %s\r\n", content_type);
+}
+
+static bool _fixture_respond_ok(Net_Socket const conn, char const *const response_body, char const *const content_type) {
+    char const *const body = response_body != nullptr ? response_body : "ok-body-content";
+    char content_type_line[256] = DEFAULT_INITIALIZATION;
+
+    // A body the buffer cannot hold is refused outright rather than truncated under a
+    // Content-Length that still claims the full size - that would fail at the client with a
+    // misleading short-read instead of here, where the script is wrong.
+    if (char_length(body) + _FIXTURE_RESPONSE_HEADER_ROOM > _FIXTURE_RESPONSE_SIZE) {
+        return false;
+    }
+
+    _fixture_content_type_line(content_type, content_type_line, sizeof(content_type_line));
+
+    char response[_FIXTURE_RESPONSE_SIZE] = DEFAULT_INITIALIZATION;
     I32 const written = snprintf(response, sizeof(response),
         "HTTP/1.1 200 OK\r\n"
         "Content-Length: %zu\r\n"
+        "%s"
         "X-Dup: first-value\r\n"
         "X-Dup: second-value\r\n"
         "x-MiXeD-case: mixed-value\r\n"
         "X-Empty:\r\n"
         "Connection: close\r\n"
         "\r\n"
-        "%s", char_length(body), body);
+        "%s", char_length(body), content_type_line, body);
 
     if (written > 0) {
         _fixture_send_all(conn, response, _fixture_written_size(written, sizeof(response)));
@@ -256,13 +285,21 @@ static bool _fixture_respond_ok(Net_Socket const conn) {
     return true;
 }
 
-static bool _fixture_respond_status(Net_Socket const conn, USize const status_code) {
-    char const *const body   = "status-body";
+static bool _fixture_respond_status(Net_Socket const conn, USize const status_code, char const *const response_body, char const *const content_type) {
+    char const *const body   = response_body != nullptr ? response_body : "status-body";
     char const *const reason = status_code == 404 ? "Not Found" : status_code == 500 ? "Internal Server Error" : "Status";
-    char response[512] = DEFAULT_INITIALIZATION;
+    char content_type_line[256] = DEFAULT_INITIALIZATION;
+
+    if (char_length(body) + _FIXTURE_RESPONSE_HEADER_ROOM > _FIXTURE_RESPONSE_SIZE) {
+        return false;
+    }
+
+    _fixture_content_type_line(content_type, content_type_line, sizeof(content_type_line));
+
+    char response[_FIXTURE_RESPONSE_SIZE] = DEFAULT_INITIALIZATION;
     I32 const written = snprintf(response, sizeof(response),
-        "HTTP/1.1 %zu %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
-        status_code, reason, char_length(body), body);
+        "HTTP/1.1 %zu %s\r\nContent-Length: %zu\r\n%sConnection: close\r\n\r\n%s",
+        status_code, reason, char_length(body), content_type_line, body);
 
     if (written > 0) {
         _fixture_send_all(conn, response, _fixture_written_size(written, sizeof(response)));
@@ -470,8 +507,8 @@ static bool _fixture_respond_keep_alive(Net_Socket const conn, USize const reque
 /* Returns true when the connection should close after this response. */
 static bool _fixture_dispatch(Net_Socket const conn, Fixture_Server *const self, char const *const path, USize const request_number) {
     switch (self->script) {
-        case FIXTURE_SCRIPT_OK:            return _fixture_respond_ok(conn);
-        case FIXTURE_SCRIPT_STATUS:        return _fixture_respond_status(conn, self->status_code);
+        case FIXTURE_SCRIPT_OK:            return _fixture_respond_ok(conn, self->response_body, self->response_content_type);
+        case FIXTURE_SCRIPT_STATUS:        return _fixture_respond_status(conn, self->status_code, self->response_body, self->response_content_type);
         case FIXTURE_SCRIPT_REDIRECT:      return _fixture_respond_redirect(conn, path);
         case FIXTURE_SCRIPT_REDIRECT_LOOP: return _fixture_respond_redirect_loop(conn);
         case FIXTURE_SCRIPT_REDIRECT_FTP:  return _fixture_respond_redirect_ftp(conn);
