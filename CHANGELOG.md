@@ -24,6 +24,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - `http/service/multipart`
 - `http/service/trace`
 - `http/client`
+- `http/headers`
 
 ## 0.2.0 - release
 
