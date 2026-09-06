@@ -25,6 +25,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - `http/service/trace`
 - `http/client`
 - `http/headers`
+- `http/cookie`
 
 ## 0.2.0 - release
 
