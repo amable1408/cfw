@@ -19,6 +19,7 @@
 #include <log/log.h>
 #include <net/net.h>
 #include <test/test.h>
+#include <thread/thread.h>
 
 /*==============================================================================
  * MARK: - Constants
@@ -233,6 +234,62 @@ static bool _client_read(Net_Socket const socket, _Reply *const reply) {
 
     reply->body[reply->body_size] = '\0';
     reply->complete = body_have >= expected;
+
+    return true;
+}
+
+/**
+ * @brief Read one reply's status line and header block only, never its body.
+ *
+ * The body loop in _client_read waits for Content-Length bytes, which a HEAD reply
+ * declares but never sends - so a HEAD read on a keep-alive socket either blocks for the
+ * whole IO timeout or, when the server is buggy enough to write a SECOND reply, silently
+ * consumes that reply as the HEAD's body. This helper stops at the header terminator so
+ * the caller can prove what does (or does not) arrive next on the same connection.
+ */
+static bool _client_read_headers(Net_Socket const socket, _Reply *const reply) {
+    USize raw_size      = 0;
+    USize header_end    = 0;
+
+    *reply = (_Reply) DEFAULT_INITIALIZATION;
+
+    while (raw_size + 1 < sizeof(_raw)) {
+        USize   received    = 0;
+        Result  result      = net_socket_recv_1(socket, _raw + raw_size, sizeof(_raw) - 1 - raw_size, &received);
+
+        if (result_is_error(result) || received == 0) {
+            break;
+        }
+
+        raw_size = raw_size + received;
+        _raw[raw_size] = '\0';
+
+        char const *const terminator = char_find_slice_5(_raw, raw_size, 0, "\r\n\r\n", 4);
+
+        if (terminator != nullptr) {
+            header_end = (USize) (terminator - _raw) + 4;
+
+            break;
+        }
+    }
+
+    if (header_end == 0) {
+        return false;
+    }
+
+    reply->headers_size = header_end < sizeof(reply->headers) ? header_end : sizeof(reply->headers) - 1;
+
+    memory_copy_1((Byte*) reply->headers, (Byte*) _raw, reply->headers_size);
+
+    reply->headers[reply->headers_size] = '\0';
+
+    if (raw_size >= 12) {
+        reply->status = (U16) (((_raw[9] - '0') * 100) + ((_raw[10] - '0') * 10) + (_raw[11] - '0'));
+    }
+
+    /* Whatever the peer had already written past this reply's headers - zero for a correct
+     * HEAD answer, the first bytes of a spurious second reply otherwise. */
+    reply->body_size = raw_size - header_end;
 
     return true;
 }
@@ -1235,7 +1292,68 @@ static void _test_responses(Test *const test) {
         test_expect_u(test, "HEAD on a served file carries no body", 0, reply.body_size);
     }
 
-    test_expect_true(test, "the fixture file is removed", file_remove_1(_fixture_file_name) == RESULT_SUCCESS);
+    /*
+     * The keep-alive half of the same promise, and the regression pin for the defect it
+     * caught: lws_serve_http_file answers a HEAD itself and reports the transaction already
+     * COMPLETE (>0), so returning "a file is streaming, leave the wsi alone" from the http
+     * callback let libwebsockets re-enter the handler for a request that was already
+     * answered, and the module wrote a SECOND reply - a 404 - onto the same socket. A
+     * keep-alive client read that 404 as the answer to its NEXT request.
+     */
+    Net_Socket closing = DEFAULT_INITIALIZATION;
+
+    if (test_expect_true(test, "HEAD closing connection opens", _client_open(port, &closing))) {
+        bool const ok = _client_write(closing, "HEAD /file HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+                                      CHAR_STATIC_SIZE("HEAD /file HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"));
+
+        if (test_expect_true(test, "HEAD on a closing socket answers", ok && _client_read_headers(closing, &reply))) {
+            test_expect_u(test, "the HEAD is 200", 200, reply.status);
+            test_expect_u(test, "nothing follows the HEAD reply in the same read", 0, reply.body_size);
+        }
+
+        _Reply second = DEFAULT_INITIALIZATION;
+
+        test_expect_false(test, "and no SECOND reply is written onto the same socket", _client_read_headers(closing, &second));
+
+        net_socket_close(closing);
+    }
+
+    Net_Socket keep_alive = DEFAULT_INITIALIZATION;
+
+    if (test_expect_true(test, "HEAD keep-alive connection opens", _client_open(port, &keep_alive))) {
+        bool ok = _client_write(keep_alive, "HEAD /file HTTP/1.1\r\nHost: t\r\n\r\n", CHAR_STATIC_SIZE("HEAD /file HTTP/1.1\r\nHost: t\r\n\r\n"));
+
+        if (test_expect_true(test, "HEAD on a kept-alive socket answers", ok && _client_read_headers(keep_alive, &reply))) {
+            test_expect_u(test, "the kept-alive HEAD is 200", 200, reply.status);
+            test_expect_u(test, "nothing follows the HEAD reply on the wire", 0, reply.body_size);
+        }
+
+        ok = _client_write(keep_alive, "GET /nul HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+                           CHAR_STATIC_SIZE("GET /nul HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"));
+
+        if (test_expect_true(test, "the socket still serves the next request", ok && _client_read(keep_alive, &reply))) {
+            test_expect_u(test, "the request after a HEAD is answered normally", 200, reply.status);
+            test_expect_u(test, "and gets its own body, not the HEAD's leftovers", 8, reply.body_size);
+        }
+
+        net_socket_close(keep_alive);
+    }
+
+    /*
+     * Retried, not attempted once: on Windows a file libwebsockets still holds open cannot be
+     * deleted, and the HEAD cases above finish the moment the CLIENT has its reply - the server
+     * thread may not have torn its wsi down yet. Without the retry this pin failed intermittently
+     * and left a stray fixture behind. The assertion is unchanged: the file must be gone.
+     */
+    Result removed = file_remove_1(_fixture_file_name);
+
+    for (USize attempt = 0; attempt < 40 && removed != RESULT_SUCCESS; attempt += 1) {
+        thread_sleep(25);
+
+        removed = file_remove_1(_fixture_file_name);
+    }
+
+    test_expect_true(test, "the fixture file is removed", removed == RESULT_SUCCESS);
     http_server_delete(&server);
 
     test_case_end(test);

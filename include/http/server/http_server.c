@@ -27,7 +27,10 @@ typedef enum {
 typedef enum {
     _HTTP_SERVER_DISPATCH_STATUS_ERROR       = -1,
     _HTTP_SERVER_DISPATCH_STATUS_SUCCESS     = 0,
-    _HTTP_SERVER_DISPATCH_STATUS_FILE_SERVED = 1
+    _HTTP_SERVER_DISPATCH_STATUS_FILE_SERVED = 1,
+    /* libwebsockets finished the transaction inside lws_serve_http_file and asked for the
+     * connection to be closed - see http_server_response_send_file. */
+    _HTTP_SERVER_DISPATCH_STATUS_COMPLETED   = 2
 } _HTTP_Server_Dispatch_Status;
 
 typedef struct HTTP_Server_Request {
@@ -45,6 +48,9 @@ struct HTTP_Server_Response {
     U16         status_code;
     bool        headers_sent;
     bool        file_served;
+    /* Set only when libwebsockets both completed the transaction itself and asked for the
+     * connection to be closed (lws_serve_http_file > 0). */
+    bool        transaction_completed;
     bool        is_head;
     bool        write_success;
     String      extra_headers;
@@ -153,13 +159,14 @@ static bool _http_server_header_field_valid(char const *const value) {
 
 /** @brief Initialize a stack response for one transaction. */
 static void _http_server_response_init(HTTP_Server_Response *const self, struct lws *const wsi, bool const is_head) {
-    self->wsi           = wsi;
-    self->status_code   = HTTP_SERVER_STATUS_CODE_OK;
-    self->headers_sent  = false;
-    self->file_served   = false;
-    self->is_head       = is_head;
-    self->write_success = true;
-    self->extra_headers = string_init_1();
+    self->wsi                   = wsi;
+    self->status_code           = HTTP_SERVER_STATUS_CODE_OK;
+    self->headers_sent          = false;
+    self->file_served           = false;
+    self->transaction_completed = false;
+    self->is_head               = is_head;
+    self->write_success         = true;
+    self->extra_headers         = string_init_1();
 }
 
 /** @brief Read the peer transport address, without the reverse DNS lookup lws_get_peer_addresses does. */
@@ -637,7 +644,14 @@ static _HTTP_Server_Dispatch_Status _http_server_dispatch_request(HTTP_Server *c
         string_uninit(&request.payload);
     }
 
-    _HTTP_Server_Dispatch_Status const status = response.file_served ? _HTTP_SERVER_DISPATCH_STATUS_FILE_SERVED : _HTTP_SERVER_DISPATCH_STATUS_SUCCESS;
+    _HTTP_Server_Dispatch_Status status = _HTTP_SERVER_DISPATCH_STATUS_SUCCESS;
+
+    if (response.transaction_completed) {
+        status = _HTTP_SERVER_DISPATCH_STATUS_COMPLETED;
+    }
+    else if (response.file_served) {
+        status = _HTTP_SERVER_DISPATCH_STATUS_FILE_SERVED;
+    }
 
     string_uninit(&response.extra_headers);
 
@@ -744,6 +758,13 @@ static I32 _http_server_callback_http(struct lws *wsi, enum lws_callback_reasons
             _HTTP_Server_Dispatch_Status const result = _http_server_dispatch_request(self, wsi, method, uri_buffer, (USize) uri_buffer_size, nullptr, 0);
 
             if (result == _HTTP_SERVER_DISPATCH_STATUS_ERROR) {
+                return -1;
+            }
+
+            /* lws completed the transaction inside lws_serve_http_file and asked for the
+             * close. Returning 0 here instead left it re-parsing a finished transaction and
+             * dispatching the same request a second time (see send_file). */
+            if (result == _HTTP_SERVER_DISPATCH_STATUS_COMPLETED) {
                 return -1;
             }
 
@@ -884,6 +905,13 @@ static I32 _http_server_callback_http(struct lws *wsi, enum lws_callback_reasons
             _http_server_session_reset(session);
 
             if (result == _HTTP_SERVER_DISPATCH_STATUS_ERROR) {
+                return -1;
+            }
+
+            /* lws completed the transaction inside lws_serve_http_file and asked for the
+             * close. Returning 0 here instead left it re-parsing a finished transaction and
+             * dispatching the same request a second time (see send_file). */
+            if (result == _HTTP_SERVER_DISPATCH_STATUS_COMPLETED) {
                 return -1;
             }
 
@@ -2841,17 +2869,37 @@ bool http_server_response_send_file(HTTP_Server_Response *const self, char const
      * short the way a single one-shot lws_write of the whole body can. */
     I32 const result = lws_serve_http_file(self->wsi, path, content_type, extra_size > 0 ? extra : nullptr, (I32) extra_size);
 
-    if (result < 0) {
-        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_server_response_send_file: libwebsockets refused to serve '%s'", path);
+    /* The status line and the header block are on the wire from here, whichever branch
+     * below applies, so a second send on this response is refused like send_2's. */
+    self->headers_sent  = true;
+    self->file_served   = true;
 
-        self->write_success = false;
+    /*
+     * ZERO is the only answer that means "the transfer started, service it later, leave the
+     * wsi alone". Anything else means libwebsockets took the transaction to its end itself:
+     * it wrote the status line and headers, called lws_http_transaction_completed, and is
+     * telling this callback to close the connection - positive plainly, and NEGATIVE when
+     * the completion asked for the close, which is exactly what a HEAD on a
+     * `Connection: close` request produces and is indistinguishable here from a real serve
+     * failure.
+     *
+     * Reading that negative as "refused, nothing written" is what made a HEAD answer TWICE:
+     * send_file reported false with a 200 already on the wire, the caller ran its own
+     * not-found branch, and a second reply - a 404 - went out behind it. A keep-alive client
+     * reads that 404 as the answer to its NEXT request. Both non-zero answers are recorded
+     * as a completed transaction here, and the dispatcher closes instead of re-entering.
+     */
+    if (result != 0) {
+        /* Negative on a HEAD is the expected close-after-completion answer (see above) and
+         * stays silent; negative on anything else is a genuine serve failure - a header-buffer
+         * overflow or a short header write - worth LOG_LEVEL_ERROR. The completion semantics
+         * above are unchanged either way. */
+        if (result < 0 && lws_hdr_total_length(self->wsi, WSI_TOKEN_HEAD_URI) == 0) {
+            log_message_2(LOG_LEVEL_ERROR, LOG_METADATA, "http_server_response_send_file: '%s' serve failed (result %d)", path, (int) result);
+        }
 
-        trace_log_pop();
-
-        return false;
+        self->transaction_completed = true;
     }
-
-    self->file_served = true;
 
     trace_log_pop();
 
