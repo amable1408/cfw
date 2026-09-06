@@ -15,7 +15,7 @@
 #   OpenSSL 3.0 or newer (libcrypto) Debian: apt install libssl-dev             MSYS2: pacman -S mingw-w64-ucrt-x86_64-openssl
 #   cglm 0.9.6             Debian: apt install libcglm-dev (Debian 13; Ubuntu 24.04's 0.9.2 is too old) MSYS2: pacman -S mingw-w64-ucrt-x86_64-cglm
 #   PCRE2 (8-bit)          Debian: apt install libpcre2-dev           MSYS2: pacman -S mingw-w64-ucrt-x86_64-pcre2
-#   libcurl 8.13 or newer (WebSocket fragmentation reads FIN from there) Debian: apt install libcurl4-openssl-dev   MSYS2: pacman -S mingw-w64-ucrt-x86_64-curl
+#   libcurl 8.13 or newer (http/client needs 7.85; websocket/client 8.13) Debian: apt install libcurl4-openssl-dev   MSYS2: pacman -S mingw-w64-ucrt-x86_64-curl
 # Override CC/CFLAGS as usual (e.g. `make CC=clang`). On Windows run under MSYS2 or Git Bash:
 # the `test` and `clean` recipes are POSIX-shell loops.
 
@@ -125,6 +125,7 @@ $(subst .c,$(EXE),tests/container/slotmap/test_oom.c): OOM_WRAP := -Wl,--wrap=ca
 $(subst .c,$(EXE),tests/container/str/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
 $(subst .c,$(EXE),tests/dir/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc
 $(subst .c,$(EXE),tests/env/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
+$(subst .c,$(EXE),tests/http/service/body_parser/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
 $(subst .c,$(EXE),tests/memory/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=realloc
 $(OOM_BIN): %$(EXE): %.c $(HARNESS) libcfw.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(HARNESS) libcfw.a $(OOM_WRAP) $(LDLIBS)
