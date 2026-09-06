@@ -66,6 +66,62 @@ static Result _winsock_ensure_started(void) {
 #endif // OS_WINDOWS
 
 /**
+ * @brief Answer whether a 16-byte IPv6 address is the IPv4-mapped form: ten
+ * zero bytes, then 0xff 0xff, then the 4 IPv4 bytes. Both key tiers unwrap
+ * that form so "1.2.3.4" and "::ffff:1.2.3.4" are one client, not two.
+ */
+static bool _net_address_key_mapped(Byte const *const bytes) {
+    bool mapped = bytes[10] == 0xff && bytes[11] == 0xff;
+
+    for (USize i = 0; i < 10 && mapped; i += 1) {
+        mapped = bytes[i] == 0;
+    }
+
+    return mapped;
+}
+
+/**
+ * @brief Parse the literal both key tiers are handed - text NOT required to
+ * be NUL-terminated at `size` - into an address, answering false when it is
+ * not a numeric literal at all.
+ *
+ * Every refusal here is a VALUE answer, not an error_check abort: this text is
+ * untrusted (a proxy header, a peer literal), and a data-dependent decision is
+ * never an abort primitive. `text` null or empty, and a length no address
+ * literal could have (INET6_ADDRSTRLEN is the honest bound), answer false
+ * before any parse; so does an embedded NUL within `size` (it would truncate
+ * the literal inet_pton sees to something shorter than the caller intended);
+ * a bracketed, zone-id, port-suffixed or simply malformed literal answers
+ * false through inet_pton itself. The caller then falls back to comparing
+ * the raw text.
+ */
+static bool _net_address_key_parse(char const *const text, USize const size, Net_Socket_Address *const address) {
+    if (text == nullptr || size == 0 || size >= INET6_ADDRSTRLEN) {
+        return false;
+    }
+
+    /* An embedded NUL truncates the literal inet_pton actually sees below `size` - a caller
+     * relying on the (text, size) contract could be silently matched against a shorter,
+     * different literal. Refuse rather than let the copy hide the mismatch. */
+    if (memchr(text, '\0', size) != nullptr) {
+        return false;
+    }
+
+    /* A NUL-terminated copy, because inet_pton (inside net_socket_address_init_2) reads to a
+     * terminator and `text` is explicitly not required to carry one at `size`. */
+    char literal[INET6_ADDRSTRLEN] = DEFAULT_INITIALIZATION;
+
+    memcpy(literal, text, size);
+
+    /* A colon never appears in an IPv4 literal, so its presence picks the family to try -
+     * net_socket_address_init_2 requires the family to match the literal's own form and does
+     * not auto-detect. */
+    Net_Family const family = memchr(literal, ':', size) != nullptr ? NET_FAMILY_IPV6 : NET_FAMILY_IPV4;
+
+    return !result_is_error(net_socket_address_init_2(family, 0, literal, address));
+}
+
+/**
  * @brief Refuse an address whose `size` cannot possibly describe real
  * storage: zero, or larger than the storage this module ever allocates.
  * Value-dependent, not a caller contract - the size can come from
@@ -709,6 +765,125 @@ Result net_socket_address_init_2(Net_Family const family, U16 const port, char c
     return RESULT_SUCCESS;
 }
 
+USize net_socket_address_key_1(char const *const text, USize const size, Byte *const out, USize const capacity) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "out", (void*) out);
+
+    Net_Socket_Address address = DEFAULT_INITIALIZATION;
+
+    /* A caller buffer below the widest key is a VALUE refusal like every other unusable input -
+     * see _net_address_key_parse for why nothing on this path may end the process. */
+    if (capacity < NET_SOCKET_ADDRESS_KEY_SIZE || !_net_address_key_parse(text, size, &address)) {
+        trace_log_pop();
+
+        return 0;
+    }
+
+    if (address.storage.ss_family != AF_INET6) {
+        struct sockaddr_in const *const in4 = (struct sockaddr_in const*) &address.storage;
+
+        memcpy(out, &in4->sin_addr, sizeof(in4->sin_addr));
+
+        trace_log_pop();
+
+        return sizeof(in4->sin_addr);
+    }
+
+    struct sockaddr_in6 const *const    in6     = (struct sockaddr_in6 const*) &address.storage;
+    Byte const *const                   bytes   = (Byte const*) &in6->sin6_addr;
+
+    if (_net_address_key_mapped(bytes)) {
+        memcpy(out, bytes + 12, 4);
+
+        trace_log_pop();
+
+        return 4;
+    }
+
+    // The /64 network prefix: the high 8 bytes, host part dropped. Policy, not arithmetic - see
+    // the header's collapse note before widening or narrowing it.
+    memcpy(out, bytes, NET_SOCKET_ADDRESS_KEY_SIZE);
+
+    trace_log_pop();
+
+    return NET_SOCKET_ADDRESS_KEY_SIZE;
+}
+
+USize net_socket_address_key_2(char const *const text, USize const size, char *const out, USize const capacity) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "out", (void*) out);
+
+    Net_Socket_Address  address = DEFAULT_INITIALIZATION;
+    I32                 written = 0;
+
+    /* The empty answer is written FIRST, so every refusal below leaves `out` a valid empty C
+     * string rather than whatever the caller's buffer held - a caller that keys on the text and
+     * ignores the length can then never read a stale key. */
+    if (capacity != 0) {
+        out[0] = '\0';
+    }
+
+    if (capacity < NET_SOCKET_ADDRESS_KEY_TEXT_SIZE || !_net_address_key_parse(text, size, &address)) {
+        trace_log_pop();
+
+        return 0;
+    }
+
+    /* inet_ntop lives in ws2_32.dll on Windows, but the parse above only succeeds once
+     * net_socket_address_init_2 has started Winsock, so no lazy start is needed here. */
+    char host[INET6_ADDRSTRLEN] = DEFAULT_INITIALIZATION;
+
+    if (address.storage.ss_family != AF_INET6) {
+        struct sockaddr_in const *const in4 = (struct sockaddr_in const*) &address.storage;
+
+        if (inet_ntop(AF_INET, (void*) &in4->sin_addr, host, sizeof(host)) != nullptr) {
+            written = snprintf(out, capacity, "%s", host);
+        }
+    }
+    else {
+        struct sockaddr_in6 const *const    in6     = (struct sockaddr_in6 const*) &address.storage;
+        Byte const *const                   bytes   = (Byte const*) &in6->sin6_addr;
+
+        if (_net_address_key_mapped(bytes)) {
+            struct in_addr unwrapped = DEFAULT_INITIALIZATION;
+
+            memcpy(&unwrapped, bytes + 12, 4);
+
+            if (inet_ntop(AF_INET, (void*) &unwrapped, host, sizeof(host)) != nullptr) {
+                written = snprintf(out, capacity, "%s", host);
+            }
+        }
+        else {
+            // The /64 network: the host half zeroed, then rendered compressed by inet_ntop, so
+            // "2001:db8::1" and "2001:db8:0:0:dead:beef:0:1" write the one key "2001:db8::/64".
+            struct in6_addr network = DEFAULT_INITIALIZATION;
+
+            memcpy(&network, bytes, NET_SOCKET_ADDRESS_KEY_SIZE);
+
+            if (inet_ntop(AF_INET6, (void*) &network, host, sizeof(host)) != nullptr) {
+                written = snprintf(out, capacity, "%s/64", host);
+            }
+        }
+    }
+
+    /* A failed inet_ntop or a truncating snprintf is practically unreachable - the family is one
+     * this module itself parsed and NET_SOCKET_ADDRESS_KEY_TEXT_SIZE bounds the widest answer -
+     * but it degrades to the same empty VALUE answer rather than a half-written key. */
+    if (written <= 0 || (USize) written >= capacity) {
+        out[0] = '\0';
+
+        trace_log_pop();
+
+        return 0;
+    }
+
+    trace_log_pop();
+
+    return (USize) written;
+}
+
 U16 net_socket_address_port(Net_Socket_Address const *const address) {
     trace_log_push(LOG_METADATA);
 
@@ -728,7 +903,8 @@ Result net_socket_address_resolve(Net_Family const family, char const *const hos
 
     error_check_null(LOG_METADATA, "host", (void*) host);
     error_check_null(LOG_METADATA, "out", (void*) out);
-    error_check_wrong_value(LOG_METADATA, "family must be NET_FAMILY_ANY, NET_FAMILY_IPV4, or NET_FAMILY_IPV6", family != NET_FAMILY_ANY && family != NET_FAMILY_IPV4 && family != NET_FAMILY_IPV6);
+    error_check_wrong_value(LOG_METADATA, "family must be NET_FAMILY_ANY, NET_FAMILY_IPV4, or NET_FAMILY_IPV6",
+        family != NET_FAMILY_ANY && family != NET_FAMILY_IPV4 && family != NET_FAMILY_IPV6);
 
 #ifdef OS_WINDOWS
     Result const startup = _winsock_ensure_started();

@@ -42,8 +42,8 @@
  *     calling in here; this header intentionally does not duplicate that logic.
  *
  * Address semantics:
- *   - Every add/add_strike/at/blocked/exists call parses its `ip` text via
- *     net_socket_address_init_2 and compares a NORMALIZED key instead of the literal text
+ *   - Every add/add_strike/at/blocked/exists call reduces its `ip` text via
+ *     net_socket_address_key_1 and compares that NORMALIZED key instead of the literal text
  *     whenever that parse succeeds: a plain IPv4 literal compares as its 4 raw address bytes; an
  *     IPv6 literal compares as its /64 network-prefix (the high 8 bytes, host part dropped) so an
  *     ISP rotating a client within its own /64 keeps hitting one entry; an IPv4-mapped IPv6
@@ -63,7 +63,7 @@
  *   - Public functions validate non-null pointers.
  *   - An empty IP is treated as UNTRACKED, never an error - including an empty Str, whose
  *     data pointer is null. Network-derived input must not be able to abort the server.
- *   - An address of _HTTP_SERVICE_IP_BLOCK_KEY_SIZE bytes or longer is also treated as
+ *   - An address of HTTP_SERVICE_IP_BLOCK_ADDRESS_SIZE bytes or longer is also treated as
  *     UNTRACKED (logged at WARN) rather than truncated or aborted - no real IPv4/IPv6 text
  *     representation is anywhere close to that long.
  *
@@ -88,7 +88,7 @@
  *
  * Performance Characteristics:
  *   - Lookups are linear over the tracked records, up to the fixed capacity
- *     (_HTTP_SERVICE_IP_BLOCK_MAX_ENTRIES, currently 4096). Measured at 22.5 us per blocked_2
+ *     (HTTP_SERVICE_IP_BLOCK_CAPACITY, currently 4096). Measured at 22.5 us per blocked_2
  *     call with the table full at 4096 entries (decision log, 2026-09-06); revisit a hashset
  *     backing only if a real deployment's profile disagrees.
  *   - Intended for small local deny/strike lists.
@@ -126,6 +126,9 @@
 
 /** @brief Buffer size http_service_ip_block_get_record's address field needs, NUL included. */
 #define HTTP_SERVICE_IP_BLOCK_ADDRESS_SIZE 64
+
+/** @brief Ceiling on tracked IPs. Not yet configurable - see Performance Characteristics. */
+#define HTTP_SERVICE_IP_BLOCK_CAPACITY 4096
 
 /*==============================================================================
  * MARK: - Types
@@ -396,7 +399,7 @@ bool http_service_ip_block_get_ip_copy(HTTP_Service_IP_Block *const self, USize 
 
 /**
  * @brief Snapshot one record - address, strikes, and block state - under a single lock
- *        acquisition (report Misc 10). Prefer this over the get_ip_copy/get_strikes/get_blocked
+ *        acquisition. Prefer this over the get_ip_copy/get_strikes/get_blocked
  *        trio for an admin listing route: reading a row through three separate calls lets the
  *        record array move (insert/evict) between them, so the address, strike count and block
  *        state in the caller's assembled row can each come from a DIFFERENT underlying record.

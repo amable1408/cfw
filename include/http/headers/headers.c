@@ -873,3 +873,45 @@ void http_headers_security_uninit(HTTP_Headers_Security *const self) {
 
     trace_log_pop();
 }
+
+/*==============================================================================
+ * MARK: - Token API
+ *============================================================================*/
+
+bool http_headers_token_valid_1(char const *const value) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "value", (void*) value);
+
+    bool const valid = http_headers_token_valid_2(value, char_length(value));
+
+    trace_log_pop();
+
+    return valid;
+}
+
+/* One copy of RFC 9110's tchar set for the whole framework: cors and traceparent each
+ * carried a byte-identical private version, and the next header-emitting service would
+ * have made it three. The answer is about DATA - a configuration value, a request method,
+ * a list element - so an empty value refuses rather than aborting. */
+bool http_headers_token_valid_2(char const *const value, USize const size) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "value", (void*) value);
+
+    bool valid = size > 0;
+
+    for (USize i = 0; valid && i < size; i += 1) {
+        char const byte = value[i];
+
+        valid = (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+            (byte >= '0' && byte <= '9') ||
+            byte == '!' || byte == '#' || byte == '$' || byte == '%' || byte == '&' ||
+            byte == '\'' || byte == '*' || byte == '+' || byte == '-' || byte == '.' ||
+            byte == '^' || byte == '_' || byte == '`' || byte == '|' || byte == '~';
+    }
+
+    trace_log_pop();
+
+    return valid;
+}

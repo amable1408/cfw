@@ -417,6 +417,16 @@ String* string_alloc_new_static(char const *const data, USize const data_size, A
  * @param allocator Arena allocator to use.
  */
 void string_alloc_trim(String *const self, Arena *const allocator);
+
+/**
+ * @brief Initialize an empty String backed by an OPTIONAL arena.
+ * @param allocator Arena allocator, or nullptr for the heap.
+ * @return String by value; the empty String, arena-backed when allocator is non-null and
+ *         exactly string_init_1 otherwise. Release with string_uninit either way.
+ * @note For a service that supports both allocation modes through one nullable field, so
+ *       the "arena if I have one, heap if I do not" branch is not hand-rolled per module.
+ */
+String string_init_optional(Arena *const allocator);
 #endif // ARENA_IMPLEMENTATION
 
 /*==============================================================================

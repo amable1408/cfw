@@ -33,6 +33,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - `http/service/ip_block`
 - `http/service/security`
 - sync: http/client, http/server
+- sync: container/string, http/headers, http/service/ip_block, net
 
 ## 0.2.0 - release
 

@@ -782,6 +782,19 @@ void string_alloc_trim(String *const self, Arena *const allocator) {
     trace_log_pop();
 }
 
+/* A NULL allocator is the documented HEAP case, not a programming error, so this one
+ * constructor deliberately has no error_check on its only argument. Eight services had
+ * hand-rolled the same ifdef-wrapped branch around string_alloc_init_1/string_init_1. */
+String string_init_optional(Arena *const allocator) {
+    trace_log_push(LOG_METADATA);
+
+    String const string = _string_init(allocator);
+
+    trace_log_pop();
+
+    return string;
+}
+
 #endif // ARENA_IMPLEMENTATION
 
 /*==============================================================================

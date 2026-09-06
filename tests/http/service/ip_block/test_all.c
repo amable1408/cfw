@@ -1,10 +1,11 @@
 #include <stdio.h>
 
 #include <http/service/ip_block/ip_block.h>
+#include <net/net.h>
 #include <test/test.h>
 
 /* ip_block reaches production through main_traymon, main_crm and main.c. This suite pins the
- * defects fixed live in this file plus the R1 record-array/expiry rewrite: the 0-index sentinel
+ * defects fixed in this module's record-array/expiry rewrite: the 0-index sentinel
  * that struck the wrong client, the U8 length that let a long string walk past a block, the
  * entry cap that was not authoritative, registration now starting at ZERO strikes (add_strike
  * auto-registers instead), lazy block expiry, and remove/clear. */
@@ -21,7 +22,7 @@ static void _test_ip_block_strike_to_block(Test *const test) {
     test_expect_false(test, "unknown ip is not blocked", http_service_ip_block_blocked_1(&ip_block, ip));
     test_expect_false(test, "unknown ip is not tracked", http_service_ip_block_exists_1(&ip_block, ip));
 
-    /* Registering no longer counts as a strike (report High 3): a fresh add starts at 0. */
+    /* Registering no longer counts as a strike: a fresh add starts at 0. */
     test_expect_true(test, "add tracks the ip", http_service_ip_block_add_1(&ip_block, ip));
 
     test_expect_true(test, "ip is tracked after add", http_service_ip_block_exists_1(&ip_block, ip));
@@ -204,7 +205,7 @@ static void _test_ip_block_index_accessors(Test *const test) {
     test_expect_true(test, "get_strikes is 0 past the end", http_service_ip_block_get_strikes(&ip_block, 1) == 0);
     test_expect_false(test, "get_blocked is false past the end", http_service_ip_block_get_blocked(&ip_block, 1));
 
-    /* Report Misc 10: get_record's one-lock snapshot must agree with the trio it replaces. */
+    /* get_record's one-lock snapshot must agree with the trio it replaces. */
     HTTP_Service_IP_Block_Record record = DEFAULT_INITIALIZATION;
 
     test_expect_true(test, "get_record snapshots index 0", http_service_ip_block_get_record(&ip_block, 0, &record));
@@ -234,7 +235,7 @@ static void _test_ip_block_absent_sentinel(Test *const test) {
     test_expect_true(test, "the first entry really is index 0", http_service_ip_block_at_1(&ip_block, "203.0.113.1") == 0);
     test_expect_true(test, "a miss is still USIZE_MAX with entries present", http_service_ip_block_at_1(&ip_block, "203.0.113.2") == USIZE_MAX);
 
-    /* Striking an untracked ip now REGISTERS it (report High 3) rather than no-op'ing - it must
+    /* Striking an untracked ip now REGISTERS it rather than no-op'ing - it must
      * not touch any OTHER entry while doing so. */
     http_service_ip_block_add_strike_1(&ip_block, "203.0.113.2");
 
@@ -293,7 +294,7 @@ static void _test_ip_block_oversize_ip_refused(Test *const test) {
     test_expect_false(test, "a 64-byte address is declined", http_service_ip_block_add_2(&ip_block, long_ip, 64));
     test_expect_false(test, "it is not tracked", http_service_ip_block_exists_2(&ip_block, long_ip, 64));
 
-    /* Report Low 6: add_strike_2's own oversize refusal (its false answer means the striker is
+    /* add_strike_2's own oversize refusal (its false answer means the striker is
      * NOT being counted) was unpinned even though add_2's was. */
     test_expect_false(test, "add_strike_2 on the same oversize address is declined too", http_service_ip_block_add_strike_2(&ip_block, long_ip, 64));
 
@@ -333,7 +334,7 @@ static void _test_ip_block_empty_ip_is_untracked(Test *const test) {
  * A VALID IPv4 literal, deliberately: the old form was "10.0.<suffix>" counted up to 4999, and
  * "10.0.300" / "10.0.4999" are not IPv4 at all - they failed _http_service_ip_block_normalize
  * and were tracked as raw TEXT, so pins meant to exercise a full table of normalized keys were
- * exercising the malformed-address fallback instead (report item 9). Three octets carry the
+ * exercising the malformed-address fallback instead. Three octets carry the
  * counter, so 0..16777215 are all distinct and all real.
  */
 static void _ip_block_test_ip(char *const ip, USize const suffix) {
@@ -702,6 +703,39 @@ static void _test_ip_block_malformed_address_falls_back_to_raw_compare(Test *con
     test_case_end(test);
 }
 
+static void _test_ip_block_normalizer_is_net_socket_address_key_1(Test *const test) {
+    test_case_begin(test, "tracking agrees with net_socket_address_key_1's own answer");
+
+    /* The /64 bucketing and the IPv4-mapped unwrap are not this module's own code: the private
+     * helper delegates to net_socket_address_key_1, so what an address IS has one definition.
+     * This pins that the two halves still agree - whatever net says shares a key, ip_block
+     * tracks as one entry, and whatever net refuses to normalize, ip_block tracks by raw text. */
+    Byte first[NET_SOCKET_ADDRESS_KEY_SIZE]  = DEFAULT_INITIALIZATION;
+    Byte second[NET_SOCKET_ADDRESS_KEY_SIZE] = DEFAULT_INITIALIZATION;
+
+    USize const first_size  = net_socket_address_key_1("2001:db8::1", 11, first, sizeof(first));
+    USize const second_size = net_socket_address_key_1("2001:db8::2", 11, second, sizeof(second));
+
+    test_expect_true(test, "net answers one key for both literals",
+        first_size == second_size && first_size > 0 && char_compare_equal_2((char const*) first, first_size, (char const*) second, second_size));
+
+    HTTP_Service_IP_Block ip_block = DEFAULT_INITIALIZATION;
+
+    http_service_ip_block_init_1(&ip_block, 1);
+
+    test_expect_true(test, "adding the first literal", http_service_ip_block_add_1(&ip_block, "2001:db8::1"));
+    test_expect_true(test, "the second literal is the same entry", http_service_ip_block_exists_1(&ip_block, "2001:db8::2"));
+    test_expect_u(test, "so only one record exists", 1, http_service_ip_block_get_size(&ip_block));
+
+    /* Text net cannot normalize (it answers 0) stays a distinct raw-text entry. */
+    test_expect_u(test, "net refuses to normalize a bracketed literal", 0, net_socket_address_key_1("[2001:db8::1]", 13, first, sizeof(first)));
+    test_expect_false(test, "so ip_block does not unify it with the plain form", http_service_ip_block_exists_1(&ip_block, "[2001:db8::1]"));
+
+    http_service_ip_block_uninit(&ip_block);
+
+    test_case_end(test);
+}
+
 int main(void) {
     LogConfig const log_config = {
         .level             = LOG_LEVEL_ERROR,
@@ -740,6 +774,7 @@ int main(void) {
     _test_ip_block_ipv6_different_64_does_not_collide(&test);
     _test_ip_block_ipv4_mapped_unifies_with_ipv4(&test);
     _test_ip_block_malformed_address_falls_back_to_raw_compare(&test);
+    _test_ip_block_normalizer_is_net_socket_address_key_1(&test);
     test_suite_end(&test);
 
     return test_uninit(&test);

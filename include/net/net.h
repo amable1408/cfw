@@ -10,6 +10,9 @@
  *     blocking mode, TCP_NODELAY
  *   - Address helpers: wildcard/literal construction, DNS resolution,
  *     text formatting, equality, and getters - all IPv4/IPv6-agnostic
+ *   - net_socket_address_key_1/_2: an address literal reduced to one key per
+ *     client - comparison BYTES for a sized table, canonical TEXT
+ *     ("1.2.3.4", "2001:db8::/64") for a table keyed by C string
  *   - net_socket_wait: single-socket readiness over poll/WSAPoll
  *
  * Usage Example (loopback TCP echo - first block Result-checked; the rest
@@ -228,7 +231,19 @@ typedef struct Net_Socket_Address {
 /** @brief Result code (RESULT_CATEGORY_ARGUMENT) for a syntactically bad address literal. */
 #define NET_ARGUMENT_BAD_LITERAL 1U
 
-/** @brief Buffer size for net_socket_address_format: the platform's own INET6_ADDRSTRLEN (65 on MinGW, 46 on POSIX) + brackets + ':' + 5 port digits + NUL, rounded up - derived, not a literal, so it tracks whichever platform is building. */
+/**
+ * @brief Byte capacity net_socket_address_key_1's widest answer needs: an IPv6
+ *        /64 network prefix. An IPv4 key fills only the first 4 of these bytes.
+ */
+#define NET_SOCKET_ADDRESS_KEY_SIZE 8
+
+/** @brief Buffer size for net_socket_address_key_2's widest answer: a compressed IPv6 /64 network
+ *         literal plus its "/64" suffix and the NUL - bounded by the platform's own
+ *         INET6_ADDRSTRLEN, so it tracks whichever platform is building rather than a literal. */
+#define NET_SOCKET_ADDRESS_KEY_TEXT_SIZE (INET6_ADDRSTRLEN + 4)
+
+/** @brief Buffer size for net_socket_address_format: the platform's own INET6_ADDRSTRLEN (65 on MinGW, 46 on POSIX)
+ *         + brackets + ':' + 5 port digits + NUL, rounded up - derived, not a literal, so it tracks whichever platform is building. */
 #define NET_SOCKET_ADDRESS_TEXT_SIZE (INET6_ADDRSTRLEN + 10)
 
 #ifdef OS_WINDOWS
@@ -491,6 +506,85 @@ Net_Socket_Address net_socket_address_init_1(Net_Family const family, U16 const 
  *         silent wildcard fallback.
  */
 Result net_socket_address_init_2(Net_Family const family, U16 const port, char const *const literal, Net_Socket_Address *const out);
+
+/**
+ * @brief Reduce an address literal to the canonical BYTES a per-client table should key on.
+ *
+ * A table that keys on address TEXT gives one client several independent entries: an ISP
+ * rotating a subscriber inside its own /64 hands out a fresh IPv6 address per connection, and
+ * the same host reached over IPv4 and over an IPv4-mapped IPv6 socket spells itself two ways.
+ * This answers one key per client instead:
+ *   - IPv4 literal ("1.2.3.4"): the plain 4 address bytes.
+ *   - IPv4-mapped IPv6 literal ("::ffff:1.2.3.4"): unwrapped to the SAME 4 bytes, so the two
+ *     spellings unify rather than being bucketed apart.
+ *   - Any other IPv6 literal: the /64 network prefix - the high 8 bytes, host part dropped.
+ *
+ * Use net_socket_address_key_2 instead when the table keys on a NUL-terminated C string: these
+ * bytes carry embedded and trailing NULs, so a keyer measuring them with char_length truncates
+ * "2001:db8::1" to 4 bytes and refuses "::1" outright.
+ *
+ * @param text     Address literal; NOT required to be NUL-terminated at `size`.
+ * @param size     Byte length of `text`.
+ * @param out      Receives the key bytes. Untouched when the answer is 0.
+ * @param capacity Byte capacity of `out`; must be at least NET_SOCKET_ADDRESS_KEY_SIZE.
+ * @return 4 or 8 - the number of key bytes written - or 0 when `text` is not a normalizable
+ *         address and the caller should fall back to comparing the literal itself. The two
+ *         lengths MIX in one table, so equality is (length, bytes) together: an IPv4 key and the
+ *         first 4 bytes of an 8-byte /64 key can be identical, and a memcmp of 4 bytes alone
+ *         would call them one client.
+ * @note Only a numeric literal is accepted - a formatted "1.2.3.4:80" or "[::1]:80" (what
+ *       net_socket_address_format writes) answers 0. Strip the port and the brackets first.
+ * @note Every unusable INPUT is a VALUE, never an abort: a null or empty `text`, a literal too
+ *       long to be any address (INET6_ADDRSTRLEN bounds it), text carrying an embedded NUL within
+ *       `size` (it would otherwise be parsed shorter than the caller intended), malformed text, a
+ *       bracketed literal ("[::1]"), a zone-id literal ("fe80::1%eth0" - the zone is not part of
+ *       the /64, so keying it would silently merge two different links), and a `capacity` below
+ *       NET_SOCKET_ADDRESS_KEY_SIZE all answer 0. Untrusted network text reaches this function
+ *       directly, so it must never be able to end the process. Only a null `out` is a contract
+ *       violation, and only under ERROR_CHECK_ENABLED.
+ * @note Two different unnormalizable strings never collide, because they never produce a key at
+ *       all - the caller's fallback compares them as text.
+ * @note The /64 is POLICY, not arithmetic, and it deliberately collapses: every link-local peer
+ *       (fe80::/64) shares one key; "::" and "::1" share one key; and every Teredo client behind
+ *       one relay shares one key. That is the intended trade - one subscriber must not buy extra
+ *       budget by rotating inside their own prefix - but a deployment that needs a /48 wants a
+ *       future _3 taking the prefix bits, not a memcmp of fewer bytes here. The deprecated
+ *       IPv4-compatible spelling ("::1.2.3.4") is NOT unwrapped; it keys as the zero /64,
+ *       alongside "::1".
+ */
+USize net_socket_address_key_1(char const *const text, USize const size, Byte *const out, USize const capacity);
+
+/**
+ * @brief Reduce an address literal to the canonical TEXT key a per-client table should key on.
+ *
+ * The same one-key-per-client answer as net_socket_address_key_1, written as a NUL-terminated
+ * literal instead of raw bytes - the form a table keyed by C string (map_char_*, hashset, an
+ * http service keying by char_length) can actually store:
+ *   - IPv4 literal ("1.2.3.4"): itself, canonicalized.
+ *   - IPv4-mapped IPv6 literal ("::ffff:1.2.3.4"): the unwrapped "1.2.3.4", so the two spellings
+ *     unify rather than being bucketed apart.
+ *   - Any other IPv6 literal ("2001:db8::1"): its /64 network in canonical compressed form with
+ *     the host part zeroed, plus the prefix length - "2001:db8::/64".
+ *
+ * @param text     Address literal; NOT required to be NUL-terminated at `size`.
+ * @param size     Byte length of `text`.
+ * @param out      Receives the NUL-terminated key. Set to the empty string when the answer is 0.
+ * @param capacity Byte capacity of `out`; must be at least NET_SOCKET_ADDRESS_KEY_TEXT_SIZE.
+ * @return The key's length in characters (NUL excluded), or 0 when `text` is not a normalizable
+ *         address - and then `out` is the empty string, so a caller that ignores the length
+ *         still cannot read a stale key.
+ * @note Only a numeric literal is accepted - a formatted "1.2.3.4:80" or "[::1]:80" (what
+ *       net_socket_address_format writes) answers 0. Strip the port and the brackets first.
+ * @note Every unusable INPUT is a VALUE, never an abort - the same list as
+ *       net_socket_address_key_1, plus a `capacity` below NET_SOCKET_ADDRESS_KEY_TEXT_SIZE.
+ *       Only a null `out` is a contract violation, and only under ERROR_CHECK_ENABLED.
+ * @note Two keys are equal exactly when their text is - unlike the byte form, there is no length
+ *       to compare separately, which is the whole reason this tier exists.
+ * @note The /64 is POLICY and collapses exactly as net_socket_address_key_1's does: all of
+ *       fe80::/64 is one key, "::" and "::1" are both "::/64", and one Teredo relay's clients
+ *       are one key.
+ */
+USize net_socket_address_key_2(char const *const text, USize const size, char *const out, USize const capacity);
 
 /**
  * @brief Read an address's port back out (host order).

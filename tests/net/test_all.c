@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <char/char.h>
 #include <log/log.h>
 #include <net/net.h>
 #include <test/test.h>
@@ -740,6 +741,148 @@ static void _test_wait_timeout_clamp(Test *const test) {
     test_case_end(test);
 }
 
+static void _test_address_key_1(Test *const test) {
+    test_case_begin(test, "net_socket_address_key_1 reduces a literal to one key per client");
+
+    Byte key[NET_SOCKET_ADDRESS_KEY_SIZE]  = DEFAULT_INITIALIZATION;
+    Byte other[NET_SOCKET_ADDRESS_KEY_SIZE] = DEFAULT_INITIALIZATION;
+
+    /* An IPv4 literal keys as its four raw address bytes. */
+    test_expect_u(test, "an IPv4 literal answers 4 bytes", 4, net_socket_address_key_1("1.2.3.4", 7, key, sizeof(key)));
+    test_expect_true(test, "which are the address itself", key[0] == 1 && key[1] == 2 && key[2] == 3 && key[3] == 4);
+
+    /* `text` is a sized view, not a C string: only the first `size` bytes may be read, so a
+     * longer buffer must key exactly as the short literal does. */
+    test_expect_u(test, "text longer than `size` reads only `size` bytes", 4, net_socket_address_key_1("1.2.3.4xyz", 7, other, sizeof(other)));
+    test_expect_true(test, "and answers the same key", memcmp(key, other, 4) == 0);
+
+    /* The IPv4-mapped IPv6 spelling of the SAME host must unify with it, or a client reaching a
+     * dual-stack listener gets two independent entries in every table keyed this way. */
+    test_expect_u(test, "an IPv4-mapped IPv6 literal answers 4 bytes too", 4, net_socket_address_key_1("::ffff:1.2.3.4", 14, other, sizeof(other)));
+    test_expect_true(test, "and the same four bytes", memcmp(key, other, 4) == 0);
+
+    test_expect_u(test, "the uppercase mapped spelling answers 4 as well", 4, net_socket_address_key_1("::FFFF:1.2.3.4", 14, other, sizeof(other)));
+    test_expect_true(test, "and still the same four bytes", memcmp(key, other, 4) == 0);
+
+    /* Two addresses inside one /64 are one subscriber whose ISP rotates them, so they share a
+     * key; a genuinely different /64 must not collide with it. */
+    test_expect_u(test, "an IPv6 literal answers the 8-byte /64 prefix", 8, net_socket_address_key_1("2001:db8::1", 11, key, sizeof(key)));
+    test_expect_u(test, "a sibling inside the same /64 answers 8 too", 8, net_socket_address_key_1("2001:db8::2", 11, other, sizeof(other)));
+    test_expect_true(test, "and buckets to the same prefix", memcmp(key, other, 8) == 0);
+
+    test_expect_u(test, "a different /64 also answers 8", 8, net_socket_address_key_1("2001:db9::1", 11, other, sizeof(other)));
+    test_expect_true(test, "but a different prefix", memcmp(key, other, 8) != 0);
+
+    /* A documented collapse of the /64 policy, pinned so it cannot change silently: the
+     * unspecified address and loopback both live in the zero /64 and share ONE key. */
+    test_expect_u(test, "\"::1\" answers the zero /64", 8, net_socket_address_key_1("::1", 3, key, sizeof(key)));
+    test_expect_u(test, "\"::\" answers it too", 8, net_socket_address_key_1("::", 2, other, sizeof(other)));
+    test_expect_true(test, "so the two share one key", memcmp(key, other, 8) == 0);
+
+    /* Every unusable input is a VALUE answer of 0 - never an abort - because untrusted network
+     * text reaches this function directly. The caller falls back to comparing the literal. */
+    test_expect_u(test, "malformed text answers 0", 0, net_socket_address_key_1("not-an-ip-address", 17, key, sizeof(key)));
+    test_expect_u(test, "a bracketed literal answers 0", 0, net_socket_address_key_1("[::1]", 5, key, sizeof(key)));
+    test_expect_u(test, "a zone-id literal answers 0", 0, net_socket_address_key_1("fe80::1%eth0", 12, key, sizeof(key)));
+    test_expect_u(test, "an empty literal answers 0", 0, net_socket_address_key_1("", 0, key, sizeof(key)));
+    test_expect_u(test, "a null literal answers 0", 0, net_socket_address_key_1(nullptr, 4, key, sizeof(key)));
+    test_expect_u(test, "a buffer below NET_SOCKET_ADDRESS_KEY_SIZE answers 0", 0, net_socket_address_key_1("1.2.3.4", 7, key, NET_SOCKET_ADDRESS_KEY_SIZE - 1));
+
+    /* A formatted address is NOT a literal: net_socket_address_format's own output has to have
+     * its port (and brackets) stripped before it can be keyed. */
+    test_expect_u(test, "a formatted \"ip:port\" answers 0", 0, net_socket_address_key_1("1.2.3.4:80", 10, key, sizeof(key)));
+    test_expect_u(test, "a formatted \"[ip]:port\" answers 0", 0, net_socket_address_key_1("[::1]:80", 8, key, sizeof(key)));
+
+    /* `out` is untouched on a 0 answer, so a caller reusing one buffer across calls cannot read
+     * a previous client's key as this one's. */
+    Byte untouched[NET_SOCKET_ADDRESS_KEY_SIZE] = DEFAULT_INITIALIZATION;
+
+    memset(untouched, 0xAB, sizeof(untouched));
+    test_expect_u(test, "a refusal answers 0", 0, net_socket_address_key_1("not-an-ip-address", 17, untouched, sizeof(untouched)));
+
+    bool intact = true;
+
+    for (USize i = 0; i < sizeof(untouched); i += 1) {
+        intact = intact && untouched[i] == 0xAB;
+    }
+
+    test_expect_true(test, "and leaves `out` untouched", intact);
+
+    char oversize[INET6_ADDRSTRLEN + 8] = DEFAULT_INITIALIZATION;
+
+    for (USize i = 0; i < INET6_ADDRSTRLEN; i += 1) {
+        oversize[i] = '1';
+    }
+
+    test_expect_u(test, "text no address could be that long answers 0", 0, net_socket_address_key_1(oversize, INET6_ADDRSTRLEN, key, sizeof(key)));
+
+    test_case_end(test);
+}
+
+static void _test_address_key_2(Test *const test) {
+    test_case_begin(test, "net_socket_address_key_2 answers the same key as text a C-string table can hold");
+
+    char key[NET_SOCKET_ADDRESS_KEY_TEXT_SIZE]      = DEFAULT_INITIALIZATION;
+    char other[NET_SOCKET_ADDRESS_KEY_TEXT_SIZE]    = DEFAULT_INITIALIZATION;
+
+    /* An IPv4 literal keys as itself - and the length answered is the C length, so a table
+     * measuring the key with char_length agrees with this function. */
+    test_expect_u(test, "an IPv4 literal answers 7 characters", 7, net_socket_address_key_2("1.2.3.4", 7, key, sizeof(key)));
+    test_expect_true(test, "which are the literal itself", char_compare_equal_1(key, "1.2.3.4"));
+
+    test_expect_u(test, "text longer than `size` reads only `size` bytes", 7, net_socket_address_key_2("1.2.3.4xyz", 7, other, sizeof(other)));
+    test_expect_true(test, "and answers the same key", char_compare_equal_1(other, "1.2.3.4"));
+
+    /* The IPv4-mapped spellings unwrap to the plain IPv4 key, both cases. */
+    test_expect_u(test, "an IPv4-mapped IPv6 literal unwraps", 7, net_socket_address_key_2("::ffff:1.2.3.4", 14, other, sizeof(other)));
+    test_expect_true(test, "to the IPv4 key itself", char_compare_equal_1(other, "1.2.3.4"));
+
+    test_expect_u(test, "the uppercase mapped spelling unwraps too", 7, net_socket_address_key_2("::FFFF:1.2.3.4", 14, other, sizeof(other)));
+    test_expect_true(test, "to the same key", char_compare_equal_1(other, "1.2.3.4"));
+
+    /* An IPv6 literal keys as its /64 network in canonical compressed form, host part zeroed. */
+    test_expect_u(test, "an IPv6 literal answers its /64 network", 13, net_socket_address_key_2("2001:db8::1", 11, key, sizeof(key)));
+    test_expect_true(test, "written compressed with the prefix length", char_compare_equal_1(key, "2001:db8::/64"));
+
+    test_expect_u(test, "a sibling inside that /64 answers as well", 13, net_socket_address_key_2("2001:db8:0:0:dead:beef:0:2", 26, other, sizeof(other)));
+    test_expect_true(test, "and is the SAME text key", char_compare_equal_1(other, key));
+
+    test_expect_true(test, "a different /64 is a different key",
+        net_socket_address_key_2("2001:db9::1", 11, other, sizeof(other)) > 0 && !char_compare_equal_1(other, key));
+
+    /* The documented collapse, in the text tier too: "::1" and "::" are both the zero /64. */
+    test_expect_u(test, "\"::1\" answers the zero /64", 5, net_socket_address_key_2("::1", 3, key, sizeof(key)));
+    test_expect_true(test, "spelled \"::/64\"", char_compare_equal_1(key, "::/64"));
+    test_expect_u(test, "\"::\" answers it too", 5, net_socket_address_key_2("::", 2, other, sizeof(other)));
+    test_expect_true(test, "so the two share one key", char_compare_equal_1(other, key));
+
+    /* Every unusable input is a VALUE answer of 0 AND an empty string, so a caller that keys on
+     * the text and ignores the length still cannot read a stale key. */
+    test_expect_u(test, "malformed text answers 0", 0, net_socket_address_key_2("not-an-ip-address", 17, key, sizeof(key)));
+    test_expect_true(test, "and empties the buffer", key[0] == '\0');
+    test_expect_u(test, "a bracketed literal answers 0", 0, net_socket_address_key_2("[::1]", 5, key, sizeof(key)));
+    test_expect_u(test, "a zone-id literal answers 0", 0, net_socket_address_key_2("fe80::1%eth0", 12, key, sizeof(key)));
+    test_expect_u(test, "an empty literal answers 0", 0, net_socket_address_key_2("", 0, key, sizeof(key)));
+    test_expect_u(test, "a null literal answers 0", 0, net_socket_address_key_2(nullptr, 4, key, sizeof(key)));
+    test_expect_u(test, "a formatted \"ip:port\" answers 0", 0, net_socket_address_key_2("1.2.3.4:80", 10, key, sizeof(key)));
+    test_expect_u(test, "a formatted \"[ip]:port\" answers 0", 0, net_socket_address_key_2("[::1]:80", 8, key, sizeof(key)));
+
+    /* An embedded NUL would let inet_pton parse only the "1.2.3.4" prefix and silently key it as
+     * that address - refused instead of matched against a shorter literal than the caller meant. */
+    char const embedded_nul[] = "1.2.3.4\0junk";
+
+    test_expect_u(test, "text carrying an embedded NUL is refused", 0, net_socket_address_key_2(embedded_nul, 12, key, sizeof(key)));
+
+    char small[NET_SOCKET_ADDRESS_KEY_TEXT_SIZE] = DEFAULT_INITIALIZATION;
+
+    memset(small, 'x', sizeof(small));
+    test_expect_u(test, "a buffer below NET_SOCKET_ADDRESS_KEY_TEXT_SIZE answers 0", 0,
+        net_socket_address_key_2("1.2.3.4", 7, small, NET_SOCKET_ADDRESS_KEY_TEXT_SIZE - 1));
+    test_expect_true(test, "and is emptied rather than left as the caller's bytes", small[0] == '\0');
+
+    test_case_end(test);
+}
+
 int main(void) {
     LogConfig const log_config = {
         .level             = LOG_LEVEL_ERROR,
@@ -770,6 +913,8 @@ int main(void) {
     _test_resolve_failure(&test);
     _test_ipv6_loopback_traffic(&test);
     _test_wait_timeout_clamp(&test);
+    _test_address_key_1(&test);
+    _test_address_key_2(&test);
 
     test_suite_end(&test);
 

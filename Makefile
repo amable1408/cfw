@@ -2,7 +2,8 @@
 #
 #   make              build libcfw.a (every include/**/*.c except the test harness)
 #   make test         build every tests/**/test_*.c against libcfw.a and run them
-#   make test-oom     Linux only: the allocation-failure harness (needs -Wl,--wrap)
+#   make test-oom     Linux only: the allocation-failure harnesses - the --wrap kind (needs
+#                     GNU ld) plus the arena-exhaustion kind, which links the unchecked archive
 #   make test-unchecked  every tests/**/test_unchecked.c, built WITHOUT ERROR_CHECK_ENABLED
 #                     against its own archive - the inert-fallback half of a module's
 #                     contract, which no checked build can observe
@@ -66,6 +67,7 @@ TEST_BIN := $(TEST_SRC:.c=$(EXE))
 OOM_SRC  := $(filter %/test_oom.c,$(call rwildcard,tests,*.c))
 OOM_BIN  := $(OOM_SRC:.c=$(EXE))
 OOM_WRAP ?=
+OOM_LIB  ?= libcfw.a
 # The unchecked suites pin what a module does with ERROR_CHECK_ENABLED compiled OUT - the
 # inert fallbacks a checked build can only abort on. They need the library built the same
 # way, so they get their own objects (a separate suffix: an object compiled under other
@@ -115,11 +117,19 @@ test: $(TEST_BIN) check
 	done; \
 	if [ -n "$$failed" ]; then echo "FAILED SUITES:$$failed"; fi; exit $$status
 
-# The allocation-failure sweep wraps calloc/realloc/free at link time (GNU ld only) and forks a
-# child to observe memory_alloc's abort-on-OOM contract, so it is its own target. Each binary
-# below gets exactly the --wrap flags its own test_oom.c defines a __wrap_* body for - a fixed
-# set for every binary left --wrap=realloc demanding a __wrap_realloc that a calloc/free-only
-# harness (e.g. container/str's) never defines, an undefined-reference link failure.
+# The allocation-failure sweep is its own target, and it holds two kinds of harness.
+#
+# The wrap kind wraps calloc/realloc/free at link time (GNU ld only) and forks a child to
+# observe memory_alloc's abort-on-OOM contract. Each such binary gets exactly the --wrap flags
+# its own test_oom.c defines a __wrap_* body for - a fixed set for every binary left
+# --wrap=realloc demanding a __wrap_realloc that a calloc/free-only harness (e.g.
+# container/str's) never defines, an undefined-reference link failure.
+#
+# The exhaustion kind defines no __wrap_* body at all: it hands an API a small arena, runs it
+# out of room, and checks the API degrades instead of corrupting anything. That is only
+# observable with ERROR_CHECK_ENABLED compiled OUT - checked, the arena's own bounds check
+# aborts before the API can degrade - so those binaries link libcfw_unchecked.a and build with
+# CPPFLAGS_UNCHECKED, set per target above.
 $(subst .c,$(EXE),tests/container/hashset/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
 $(subst .c,$(EXE),tests/container/map/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
 $(subst .c,$(EXE),tests/container/slotmap/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
@@ -129,8 +139,8 @@ $(subst .c,$(EXE),tests/env/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wra
 $(subst .c,$(EXE),tests/http/service/body_parser/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
 $(subst .c,$(EXE),tests/http/service/multipart/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
 $(subst .c,$(EXE),tests/memory/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=realloc
-$(OOM_BIN): %$(EXE): %.c $(HARNESS) libcfw.a
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(HARNESS) libcfw.a $(OOM_WRAP) $(LDLIBS)
+$(OOM_BIN): %$(EXE): %.c $(HARNESS) libcfw.a libcfw_unchecked.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(HARNESS) $(OOM_LIB) $(OOM_WRAP) $(LDLIBS)
 
 test-oom: $(OOM_BIN)
 	@status=0; failed=""; \

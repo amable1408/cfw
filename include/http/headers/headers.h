@@ -9,6 +9,8 @@
  *   - Content-Type, Content-Length, and Content-Disposition header builders.
  *   - Security header policy builders (CSP, frame, referrer, permissions, HSTS,
  *     Cross-Origin-Opener/Embedder/Resource-Policy).
+ *   - RFC 9110 token validation, so a header name, a method or a list element that would
+ *     break an emitted block is refused before it is stored rather than in each service.
  *   - Arena and heap return-value support.
  *
  * Usage Example:
@@ -33,6 +35,8 @@
  *     when a starved arena would otherwise silently drop a security header for the process
  *     lifetime; the heap tiers stay by-value since memory_alloc aborts rather than degrading to
  *     EMPTY.
+ *   - http_headers_token_valid_1/_2 answer a bool about DATA and never abort on the value: an
+ *     empty value is a legal value, answered false. Only a null pointer is a programming error.
  *
  * Thread Safety:
  *   - Stateless builders are thread-safe.
@@ -376,5 +380,28 @@ HTTP_Headers_Security http_headers_security_init_2(
  * @param self Security policy.
  */
 void http_headers_security_uninit(HTTP_Headers_Security *const self);
+
+/*==============================================================================
+ * MARK: - Token API
+ *============================================================================*/
+
+/**
+ * @brief Answer whether a NUL-terminated value is an RFC 9110 token.
+ * @param value Candidate header name, method, or list element.
+ * @return true when every byte is a tchar. An EMPTY value is answered false: a token has
+ *         at least one character, and an empty header name would emit a bare ": value".
+ */
+bool http_headers_token_valid_1(char const *const value);
+
+/**
+ * @brief Answer whether a sized value is an RFC 9110 token.
+ * @param value Candidate header name, method, or list element; not required to be
+ *        NUL-terminated.
+ * @param size Byte length of value.
+ * @return See http_headers_token_valid_1. SP, HTAB, ':', ',', '"', '/', '(', ')', CR, LF,
+ *         DEL and every byte at or above 0x80 are refused, which is what makes a stored
+ *         value unable to carry a header break.
+ */
+bool http_headers_token_valid_2(char const *const value, USize const size);
 
 #endif // HTTP_HEADERS_H

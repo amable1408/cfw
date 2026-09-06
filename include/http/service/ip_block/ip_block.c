@@ -9,21 +9,13 @@
  * MARK: - Constants
  *============================================================================*/
 
-// Longest address text a record stores. No real IPv4/IPv6 literal (including a bracketed IPv6
-// with a zone id) comes close; an address at or past this length is refused as UNTRACKED.
-#define _HTTP_SERVICE_IP_BLOCK_KEY_SIZE 64
-
-static_assert(_HTTP_SERVICE_IP_BLOCK_KEY_SIZE == HTTP_SERVICE_IP_BLOCK_ADDRESS_SIZE,
-              "get_record copies a record's key straight into HTTP_Service_IP_Block_Record.address - the two sizes must match");
-
-// Ceiling on tracked IPs. Not yet configurable - see ip_block.h Performance note: measured
-// acceptable at this size, so a hashset backing (or a configurable cap) waits for a real
-// profile that disagrees.
-#define _HTTP_SERVICE_IP_BLOCK_MAX_ENTRIES 4096
 // Longest normalized comparison key: an IPv6 /64 network-prefix (high 8 bytes of the 16-byte
 // address, host part zeroed - see _http_service_ip_block_normalize). A plain IPv4 key uses only
 // the first 4 of these bytes.
 #define _HTTP_SERVICE_IP_BLOCK_NORM_SIZE 8
+
+static_assert(_HTTP_SERVICE_IP_BLOCK_NORM_SIZE == NET_SOCKET_ADDRESS_KEY_SIZE,
+              "the record norm buffer is filled by net_socket_address_key_1 - the two sizes must match");
 
 /*==============================================================================
  * MARK: - Types
@@ -37,7 +29,7 @@ typedef struct {
     /** @brief Address text, NOT necessarily NUL past key_size but always NUL-terminated. Kept
      *         verbatim (never overwritten by normalization) so http_service_ip_block_get_ip_copy
      *         still returns something human-readable for an admin listing. */
-    char key[_HTTP_SERVICE_IP_BLOCK_KEY_SIZE];
+    char key[HTTP_SERVICE_IP_BLOCK_ADDRESS_SIZE];
     /** @brief Byte length of the address text in `key`. */
     USize key_size;
     /** @brief Normalized comparison key - see _http_service_ip_block_normalize. Compared instead
@@ -71,7 +63,7 @@ static bool _http_service_ip_block_expired(ChronoInstant const timestamp, U32 co
  * shift-remove. Prefers the oldest record that is NOT under a live block: dropping a live block
  * to make room would let an attacker flush their own block simply by rotating addresses, which
  * is the exact situation this service exists to handle. A block whose block_seconds have already
- * elapsed counts as unblocked here (report Mid 7) - it lifts on its next read anyway, so leaving
+ * elapsed counts as unblocked here - it lifts on its next read anyway, so leaving
  * it ranked above a live visitor evicted a real client to keep a block that no longer applied.
  * Only when every tracked record is under a LIVE block - the table has filled up entirely with
  * distinct addresses all still serving their time - does this fall back to evicting the OLDEST
@@ -81,7 +73,7 @@ static bool _http_service_ip_block_expired(ChronoInstant const timestamp, U32 co
  * nowhere to record its strike at all. self->count is always > 0 when this runs (called only
  * when the table is already full), so a record to evict always exists.
  *
- * One pass, not two (report Misc 18): the two tiers are a two-level rank - "not live-blocked"
+ * One pass, not two: the two tiers are a two-level rank - "not live-blocked"
  * beats "live-blocked", and older beats newer within a tier - so a single scan carrying the best
  * rank so far answers exactly what the pair of loops did, at half the table reads. */
 static void _http_service_ip_block_evict(HTTP_Service_IP_Block *const self) {
@@ -115,78 +107,30 @@ static void _http_service_ip_block_evict(HTTP_Service_IP_Block *const self) {
 }
 
 /* Parses `ip` (address text, NOT necessarily NUL-terminated at ip_size) into a normalized
- * comparison key via net_socket_address_init_2, writing its length to *norm_size:
- *   - IPv4 literal: the plain 4-byte address.
- *   - IPv4-mapped IPv6 literal ("::ffff:a.b.c.d" - first 10 bytes zero, next 2 bytes 0xff):
- *     unwrapped to the same 4-byte form, so it unifies with a plain IPv4 literal for the same
- *     address rather than being /64-bucketed.
- *   - Any other IPv6 literal: the /64 network-prefix - the high 8 bytes of the 16-byte address,
- *     host part dropped, so an ISP rotating a client within its own /64 keeps hitting one entry.
- *   - Anything that parses as neither (malformed - untrusted network input) or is too long to
- *     even try: *norm_size = 0. Never aborts; the caller then falls back to comparing `ip`
- *     itself, the pre-existing raw-text behaviour, so a bad address string cannot crash the
- *     server or dodge tracking outright. */
+ * comparison key, writing its length to *norm_size. The normalization itself is net's, not this
+ * module's: what an address IS has one definition, and a copy per service would have been two.
+ * The BYTES tier (net_socket_address_key_1) is the right one here because a record carries the
+ * key's length alongside it; a table keyed by C string wants net_socket_address_key_2 instead.
+ * An IPv4 literal keys as its 4 address bytes, an IPv4-mapped IPv6 literal unwraps to the same
+ * 4, any other IPv6 literal keys as its /64 network prefix, and anything else - malformed text,
+ * a bracketed or zone-id literal - answers *norm_size = 0 so the caller falls back to comparing
+ * `ip` itself. Never aborts.
+ *
+ * The oversize guard stays HERE rather than leaning on net's own length refusal: ip_block will
+ * not track a key at or past HTTP_SERVICE_IP_BLOCK_ADDRESS_SIZE at all, applied identically to
+ * record and query, so a record and a query are always normalized under the same rule. */
 static void _http_service_ip_block_normalize(char const *const ip, USize const ip_size, Byte *const norm, U8 *const norm_size) {
     trace_log_push(LOG_METADATA);
 
     *norm_size = 0;
 
-    if (ip_size == 0 || ip_size >= _HTTP_SERVICE_IP_BLOCK_KEY_SIZE) {
+    if (ip_size == 0 || ip_size >= HTTP_SERVICE_IP_BLOCK_ADDRESS_SIZE) {
         trace_log_pop();
 
         return;
     }
 
-    char literal[_HTTP_SERVICE_IP_BLOCK_KEY_SIZE] = DEFAULT_INITIALIZATION;
-    memory_copy_1(literal, ip, ip_size);
-
-    // A colon never appears in an IPv4 literal, so its presence picks the family to try -
-    // net_socket_address_init_2 requires the family to match the literal's own form and does
-    // not auto-detect.
-    Net_Family const   family  = char_find_first_1(literal, ":") != CHAR_NPOS ? NET_FAMILY_IPV6 : NET_FAMILY_IPV4;
-    Net_Socket_Address  address = DEFAULT_INITIALIZATION;
-
-    if (result_is_error(net_socket_address_init_2(family, 0, literal, &address))) {
-        trace_log_pop();
-
-        return;
-    }
-
-    if (family == NET_FAMILY_IPV4) {
-        struct sockaddr_in const *const in4 = (struct sockaddr_in const*) &address.storage;
-
-        memory_copy_1(norm, &in4->sin_addr, sizeof(in4->sin_addr));
-
-        *norm_size = (U8) sizeof(in4->sin_addr);
-
-        trace_log_pop();
-
-        return;
-    }
-
-    struct sockaddr_in6 const *const   in6     = (struct sockaddr_in6 const*) &address.storage;
-    Byte const *const                  bytes   = (Byte const*) &in6->sin6_addr;
-    bool                                mapped  = true;
-
-    for (USize i = 0; i < 10 && mapped; i += 1) {
-        mapped = bytes[i] == 0;
-    }
-
-    mapped = mapped && bytes[10] == 0xff && bytes[11] == 0xff;
-
-    if (mapped) {
-        memory_copy_1(norm, bytes + 12, 4);
-
-        *norm_size = 4;
-
-        trace_log_pop();
-
-        return;
-    }
-
-    memory_copy_1(norm, bytes, 8);
-
-    *norm_size = 8;
+    *norm_size = (U8) net_socket_address_key_1(ip, ip_size, norm, _HTTP_SERVICE_IP_BLOCK_NORM_SIZE);
 
     trace_log_pop();
 }
@@ -237,7 +181,7 @@ static USize _http_service_ip_block_find(HTTP_Service_IP_Block const *const self
 /* Find-or-create, returning the record's index or USIZE_MAX when the address cannot be tracked
  * (oversize key only now - see _http_service_ip_block_evict for why a full table of blocked
  * entries no longer refuses). Called under the lock by every writer, including add_strike_2 -
- * which is what makes add_strike auto-register (report High 3): a strike against an unseen
+ * which is what makes add_strike auto-register: a strike against an unseen
  * address now registers it at 0 strikes instead of silently no-op'ing. */
 static USize _http_service_ip_block_register(HTTP_Service_IP_Block *const self, char const *const ip, USize const ip_size) {
     trace_log_push(LOG_METADATA);
@@ -250,8 +194,8 @@ static USize _http_service_ip_block_register(HTTP_Service_IP_Block *const self, 
         return existing;
     }
 
-    if (ip_size >= _HTTP_SERVICE_IP_BLOCK_KEY_SIZE) {
-        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_service_ip_block: address of %zu bytes exceeds the %d-byte key - not tracked", ip_size, _HTTP_SERVICE_IP_BLOCK_KEY_SIZE);
+    if (ip_size >= HTTP_SERVICE_IP_BLOCK_ADDRESS_SIZE) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_service_ip_block: address of %zu bytes exceeds the %d-byte key - not tracked", ip_size, HTTP_SERVICE_IP_BLOCK_ADDRESS_SIZE);
 
         trace_log_pop();
 
@@ -380,7 +324,7 @@ bool http_service_ip_block_add_strike_2(HTTP_Service_IP_Block *const self, char 
 
     thread_mutex_lock(&self->mutex);
 
-    /* Auto-registers when absent (report High 3): a strike is no longer lost against an
+    /* Auto-registers when absent: a strike is no longer lost against an
      * untracked address, and the caller no longer needs its own add_2-then-blocked_2 pair. */
     USize const index = _http_service_ip_block_register(self, ip, ip_size);
 
@@ -413,7 +357,7 @@ bool http_service_ip_block_add_strike_2(HTTP_Service_IP_Block *const self, char 
      * block_seconds and stays blocked until it goes quiet for the full window. That is the
      * intended shape for an abuser who never stops - a fixed window would let one keep hammering
      * through the lift - and it is stated in ip_block.h so a caller sizing block_seconds knows
-     * it is a quiet period, not a sentence length (report Mid 7). */
+     * it is a quiet period, not a sentence length. */
     record->timestamp = chrono_now();
     record->strikes  += 1;
 
@@ -463,7 +407,7 @@ bool http_service_ip_block_alloc_init_2(HTTP_Service_IP_Block *const self, U16 c
     *self = (HTTP_Service_IP_Block){
         .allocator      = allocator,
         .block_seconds  = block_seconds,
-        .capacity       = _HTTP_SERVICE_IP_BLOCK_MAX_ENTRIES,
+        .capacity       = HTTP_SERVICE_IP_BLOCK_CAPACITY,
         .count          = 0,
         .expiration     = expiration,
         .limit          = limit,
@@ -594,20 +538,19 @@ bool http_service_ip_block_blocked_2(HTTP_Service_IP_Block *const self, char con
     if (index != USIZE_MAX) {
         _HTTP_Service_IP_Block_Record *const record = &((_HTTP_Service_IP_Block_Record*) self->records)[index];
 
-        /* Lazy expiry (report Critical 2): a block past `block_seconds` lifts on this read
-         * rather than needing a background sweep. The timestamp is left as-is (report Misc 8),
-         * matching add_strike's own lift (:396-399): refreshing it to now would make a
-         * just-lifted, otherwise-idle record rank NEWEST for eviction and outlive records
-         * belonging to real, currently-active visitors. */
+        /* Lazy expiry: a block past `block_seconds` lifts on this read rather than needing a
+         * background sweep. The timestamp is left as-is, matching add_strike's own lift:
+         * refreshing it to now would make a just-lifted, otherwise-idle record rank NEWEST for
+         * eviction and outlive records belonging to real, currently-active visitors. */
         if (record->blocked && _http_service_ip_block_expired(record->timestamp, self->block_seconds)) {
             record->blocked = false;
             record->strikes = 0;
         }
 
-        /* Strike-count expiration applies here too (report Misc 9), mirroring add_strike's own
-         * check (:403-405) - without it, get_strikes on a quiet record kept reporting the stale
-         * pre-expiry count until its NEXT strike, which is dishonest for an admin listing read
-         * through blocked_2/get_strikes rather than a fresh strike. */
+        /* Strike-count expiration applies here too, mirroring add_strike's own check - without
+         * it, get_strikes on a quiet record kept reporting the stale pre-expiry count until its
+         * NEXT strike, which is dishonest for an admin listing read through
+         * blocked_2/get_strikes rather than a fresh strike. */
         if (self->expiration > 0 && _http_service_ip_block_expired(record->timestamp, self->expiration)) {
             record->strikes = 0;
         }
@@ -767,9 +710,8 @@ bool http_service_ip_block_get_record(HTTP_Service_IP_Block *const self, USize c
         memory_set(out->address, sizeof(out->address), 0);
         memory_copy_1(out->address, record->key, record->key_size);
 
-        /* Same expiry rule get_blocked uses (report Misc 10): a lapsed block reads as unblocked
-         * here too, so a listing built from this snapshot cannot contradict the service's own
-         * refusals. */
+        /* Same expiry rule get_blocked uses: a lapsed block reads as unblocked here too, so a
+         * listing built from this snapshot cannot contradict the service's own refusals. */
         out->blocked = record->blocked && !_http_service_ip_block_expired(record->timestamp, self->block_seconds);
         out->strikes = record->strikes;
 
@@ -835,7 +777,7 @@ bool http_service_ip_block_init_2(HTTP_Service_IP_Block *const self, U16 const l
         .allocator      = nullptr,
 #endif // ARENA_IMPLEMENTATION
         .block_seconds  = block_seconds,
-        .capacity       = _HTTP_SERVICE_IP_BLOCK_MAX_ENTRIES,
+        .capacity       = HTTP_SERVICE_IP_BLOCK_CAPACITY,
         .count          = 0,
         .expiration     = expiration,
         .limit          = limit,
@@ -844,7 +786,7 @@ bool http_service_ip_block_init_2(HTTP_Service_IP_Block *const self, U16 const l
 
     /* try_borrow, not borrow: allocator_borrow ENDS THE PROCESS on a heap that cannot meet the
      * request, which would make the refusal below dead code, matching alloc_init_2's rationale
-     * (:469-472) for the arena form. */
+     * for the arena form. */
 #ifdef ARENA_IMPLEMENTATION
     self->records = allocator_try_borrow(sizeof(_HTTP_Service_IP_Block_Record) * self->capacity, nullptr);
 #else

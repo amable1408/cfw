@@ -43,7 +43,7 @@ file(GLOB_RECURSE TEST_SRC CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/tests/*/test_*
 foreach(src ${TEST_SRC})
     get_filename_component(name "${src}" NAME_WE)
     if(name STREQUAL "test_oom")
-        continue()   # --wrap harness: `make test-oom` under GNU ld
+        continue()   # --wrap / arena-exhaustion harness: `make test-oom` under GNU ld
     endif()
     if(name STREQUAL "test_unchecked")
         continue()   # built WITHOUT ERROR_CHECK_ENABLED against its own archive: `make test-unchecked`

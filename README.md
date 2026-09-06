@@ -59,7 +59,7 @@ errors that abort in checked builds - is documented in its header's `Error Handl
 | `env` | 1 .c / 1 .h | tests/env/ | Environment variable management (dotenv-style) for the C Libraries Framework |
 | `error` | 1 .c / 1 .h | tests/error/ | Centralized error checking utilities for the C Libraries Framework |
 | `file` | 1 .c / 1 .h | tests/file/ | Canonical file I/O interface for reading, writing, and managing files |
-| `http/client` | 1 .c / 1 .h | tests/http/client/ | HTTP client wrapper (libcurl-based) for the C Libraries Framework |
+| `http/client` | 1 .c / 1 .h | tests/http/client/ |  |
 | `http/cookie` | 1 .c / 1 .h | tests/http/cookie/ | HTTP cookie helpers for the C Libraries Framework |
 | `http/headers` | 1 .c / 1 .h | tests/http/headers/ | HTTP header helpers for the C Libraries Framework |
 | `http/query` | 1 .c / 1 .h | tests/http/query/ |  |
@@ -103,7 +103,8 @@ pacman -S mingw-w64-ucrt-x86_64-openssl mingw-w64-ucrt-x86_64-curl mingw-w64-ucr
 ```sh
 make            # libcfw.a
 make test       # every tests/**/test_*.c, built against libcfw.a and run
-make test-oom   # Linux: the allocation-failure harness (GNU ld --wrap)
+make test-oom   # Linux: the allocation-failure harnesses - GNU ld --wrap, plus the
+                # arena-exhaustion ones, which link the unchecked archive
 make test-unchecked   # every tests/**/test_unchecked.c, built WITHOUT ERROR_CHECK_ENABLED
                       # against its own archive: the inert-fallback half of a contract
 make check      # the family drift gates under tools/ (python3); `make test` runs it first

@@ -65,7 +65,7 @@
  * MARK: - Anti-Vacuity Counters
  *============================================================================*/
 /** Closed-form number of case functions below; the final case asserts every one ran. */
-#define _EXPECTED_CASE_COUNT 59
+#define _EXPECTED_CASE_COUNT 60
 
 /** Incremented at the top of every case function; a case that silently never runs
  * (or a dispatcher edit that drops one) fails the closed-form check. */
@@ -1495,6 +1495,40 @@ static void _test_add_2_aliased_insert(Test *const test) {
     test_case_end(test);
 }
 
+/* Promoted out of eight http services, each of which hand-rolled the same ifdef-wrapped
+ * "arena if I have one, heap if I do not" branch around string_alloc_init_1/string_init_1. */
+static void _test_init_optional(Test *const test) {
+    _case_entered_count += 1;
+
+    test_case_begin(test, "string_init_optional: a NULL allocator is the HEAP case, not a refusal - and a non-null one is adopted");
+
+    Arena   arena   = arena_init_1(4096, ARENA_TYPE_LINEAR);
+    String  backed  = string_init_optional(&arena);
+
+    test_expect_true(test, "an arena-backed empty String carries the arena", backed.allocator == &arena);
+    test_expect_true(test, "and is EMPTY, exactly as string_alloc_init_1 is", backed.data == nullptr && string_get_size(&backed) == 0);
+
+    string_add_last_1(&backed, "x");
+
+    test_expect_true(test, "so the first append borrows from the arena", backed.allocator == &arena && string_get_size(&backed) == 1);
+
+    string_uninit(&backed);
+
+    String heap = string_init_optional(nullptr);
+
+    test_expect_null(test, "a null allocator answers the heap String, never an abort", (void*) heap.allocator);
+    test_expect_true(test, "which is EMPTY, exactly as string_init_1 is", heap.data == nullptr && string_get_size(&heap) == 0);
+
+    string_add_last_1(&heap, "y");
+
+    test_expect_true(test, "and grows on the heap", heap.allocator == nullptr && string_get_size(&heap) == 1);
+
+    string_uninit(&heap);
+    arena_uninit(&arena, ARENA_TYPE_LINEAR);
+
+    test_case_end(test);
+}
+
 static void _test_wrap_empty_arena_carries_allocator(Test *const test) {
     _case_entered_count += 1;
 
@@ -1907,6 +1941,7 @@ int main(void) {
 
     test_suite_begin(&test, "string_round_3");
     _test_add_2_aliased_insert(&test);
+    _test_init_optional(&test);
     _test_wrap_empty_arena_carries_allocator(&test);
     _test_move_3_empty_str(&test);
     _test_join_empty_parts_array(&test);

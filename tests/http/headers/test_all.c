@@ -318,6 +318,49 @@ static void _test_security_control_byte_refusal(Test *const test) {
     test_case_end(test);
 }
 
+/* Promoted out of cors.c and traceparent.c, which held byte-identical private copies. Every
+ * tchar RFC 9110 lists is walked, not a sample, so a dropped character cannot pass by being
+ * the one the test never tried. */
+static void _test_token_valid(Test *const test) {
+    test_case_begin(test, "token: every tchar is accepted and every separator refused");
+
+    char const *const tchars = "!#$%&'*+-.^_`|~0123456789"
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+    bool    every_tchar = true;
+    char    one[2]      = DEFAULT_INITIALIZATION;
+
+    for (USize i = 0; i < char_length(tchars); i += 1) {
+        one[0] = tchars[i];
+
+        if (!http_headers_token_valid_1(one)) {
+            every_tchar = false;
+        }
+    }
+
+    test_expect_true(test, "every tchar is a one-character token", every_tchar);
+    test_expect_true(test, "and a whole name is one too", http_headers_token_valid_1("X-Request-Id"));
+
+    /* An empty value is a legal VALUE, answered false rather than aborting: it arrives from
+     * a configuration file or off the wire, and an empty name emits a bare ": value". */
+    test_expect_false(test, "the empty value is refused, not aborted", http_headers_token_valid_1(""));
+    test_expect_false(test, "and so is an explicitly sized empty one", http_headers_token_valid_2("x", 0));
+
+    test_expect_false(test, "a space is refused", http_headers_token_valid_1("X Request"));
+    test_expect_false(test, "a colon is refused", http_headers_token_valid_1("X:Request"));
+    test_expect_false(test, "a comma is refused", http_headers_token_valid_1("X,Y"));
+    test_expect_false(test, "a CR is refused", http_headers_token_valid_2("X\rY", 3));
+    test_expect_false(test, "an LF is refused", http_headers_token_valid_2("X\nY", 3));
+    test_expect_false(test, "DEL is refused", http_headers_token_valid_2("X\x7F", 2));
+    test_expect_false(test, "and a byte at or above 0x80 is refused", http_headers_token_valid_2("X\x80", 2));
+
+    /* Sized, not NUL-terminated: the _2 tier exists for a Str or a request slice. */
+    test_expect_true(test, "the sized tier reads exactly its span", http_headers_token_valid_2("GET /path", 3));
+    test_expect_false(test, "and refuses as soon as the span reaches a separator", http_headers_token_valid_2("GET /path", 4));
+
+    test_case_end(test);
+}
+
 static void _test_security_uninit(Test *const test) {
     test_case_begin(test, "security: uninit resets every field");
 
@@ -414,6 +457,7 @@ int main(void) {
     _test_security_empty_value(&test);
     _test_security_control_byte_refusal(&test);
     _test_security_uninit(&test);
+    _test_token_valid(&test);
 #ifdef ARENA_IMPLEMENTATION
     _test_cache_arena(&test);
     _test_content_arena(&test);
