@@ -33,8 +33,8 @@
 #define _FIXTURE_DRAIN_LARGE_TIMEOUT_MS 15000
 #define _FIXTURE_IDLE_SILENT_TIMEOUT_MS 3000
 #define _FIXTURE_IO_TIMEOUT_MS 5000
-#define _FIXTURE_PING_FLOOD_DRAIN_WINDOW_MS 1000
-#define _FIXTURE_PING_FLOOD_POLL_TIMEOUT_MS 50
+#define _FIXTURE_REPLY_DRAIN_POLL_MS 50
+#define _FIXTURE_REPLY_DRAIN_WINDOW_MS 1000
 
 /*==============================================================================
  * MARK: - Byte-level helpers
@@ -518,6 +518,39 @@ static void _fixture_run_oversized(Net_Socket const conn, U8 const *const payloa
     _fixture_send_frame(conn, _FIXTURE_OPCODE_BINARY, true, payload, payload_size);
 }
 
+/* Drains and discards inbound bytes for up to `window_ms` (polling in `poll_timeout_ms` slices),
+ * called by the thread's generic teardown right before it closes the connection - so a client
+ * reply already in flight (e.g. the PONG libcurl auto-sends back for every PING) is read off the
+ * wire first. Closing a socket while such a reply is still unread in its receive buffer can
+ * trigger a TCP RST instead of a graceful FIN - which can land mid-read on the client and turn an
+ * otherwise healthy recv into a spurious error. This is what closed the race behind an
+ * intermittent "PING mid-message" failure: the PING script used to send its frames and return
+ * with no drain at all. The loop ends early on the peer's close or on a hard error; it is NOT cut
+ * short on silence, because a silent client may still be inside a recv budget whose TIMEOUT a
+ * test pins (an early FIN would turn that into CLOSED). The teardown skips the drain when the
+ * script already read the client's CLOSE: RFC 6455 forbids anything after it, so nothing can be
+ * in flight - and every other test deletes its client before joining, so the drain ends on EOF. */
+static void _fixture_drain_replies(Net_Socket const conn, U32 const poll_timeout_ms, USize const window_ms) {
+    net_socket_set_timeout(conn, poll_timeout_ms);
+
+    ChronoInstant const drain_start = chrono_now();
+
+    while (chrono_duration_milliseconds(chrono_elapsed(drain_start)) < window_ms) {
+        U8 scratch[64] = DEFAULT_INITIALIZATION;
+        USize received = 0;
+        Result const r = net_socket_recv_1(conn, scratch, sizeof(scratch), &received);
+
+        if (result_is_success(r)) {
+            if (received == 0) {
+                break; // peer closed
+            }
+        }
+        else if (!net_result_is_timed_out(r) && !net_result_is_would_block(r)) {
+            break; // hard recv error
+        }
+    }
+}
+
 static void _fixture_run_ping_flood(Net_Socket const conn, USize const ping_count) {
     for (USize index = 0; index < ping_count; index += 1) {
         char payload[16] = DEFAULT_INITIALIZATION;
@@ -529,23 +562,8 @@ static void _fixture_run_ping_flood(Net_Socket const conn, USize const ping_coun
         _fixture_send_frame(conn, _FIXTURE_OPCODE_PING, true, payload, payload_size);
     }
 
-    /* Then nothing further from THIS side - but libcurl auto-replies PONG to every PING, so the
-     * connection must stay open and draining long enough for all of those to land, or the
-     * client's next send (its own PONG) hits a socket this side already closed. Drain for a
-     * bounded window rather than a single recv call. */
-    net_socket_set_timeout(conn, _FIXTURE_PING_FLOOD_POLL_TIMEOUT_MS);
-
-    ChronoInstant const drain_start = chrono_now();
-
-    while (chrono_duration_milliseconds(chrono_elapsed(drain_start)) < _FIXTURE_PING_FLOOD_DRAIN_WINDOW_MS) {
-        U8 scratch[64] = DEFAULT_INITIALIZATION;
-        USize received = 0;
-        Result const r = net_socket_recv_1(conn, scratch, sizeof(scratch), &received);
-
-        if (result_is_success(r) && received == 0) {
-            break; // peer closed
-        }
-    }
+    /* Then nothing further from THIS side - the generic teardown in _fixture_thread_main drains
+     * libcurl's auto-PONG replies before closing. */
 }
 
 static void _fixture_run_ping_mid(Net_Socket const conn) {
@@ -556,6 +574,9 @@ static void _fixture_run_ping_mid(Net_Socket const conn) {
     _fixture_send_frame(conn, _FIXTURE_OPCODE_TEXT, false, first_half, char_length(first_half));
     _fixture_send_frame(conn, _FIXTURE_OPCODE_PING, true, ping_payload, char_length(ping_payload));
     _fixture_send_frame(conn, _FIXTURE_OPCODE_CONT, true, second_half, char_length(second_half));
+
+    /* The injected PING gets libcurl's automatic PONG reply same as the flood script above; the
+     * generic teardown in _fixture_thread_main drains it before closing. */
 }
 
 /*==============================================================================
@@ -595,6 +616,10 @@ static void* _fixture_thread_main(void *const data) {
             case FIXTURE_SCRIPT_DRAIN_LARGE:       { _fixture_run_drain_large(conn, self);                break; }
             case FIXTURE_SCRIPT_IDLE_SILENT:       { _fixture_run_idle_silent(conn, self->pre_read_delay_ms); break; }
         }
+    }
+
+    if (!self->saw_client_close) {
+        _fixture_drain_replies(conn, _FIXTURE_REPLY_DRAIN_POLL_MS, _FIXTURE_REPLY_DRAIN_WINDOW_MS);
     }
 
     net_socket_close(conn);

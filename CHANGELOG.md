@@ -20,6 +20,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - `websocket/client`
 - `http/service/body_parser`
 - `http/query`
+- sync: websocket/client
 
 ## 0.2.0 - release
 

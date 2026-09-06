@@ -58,7 +58,11 @@
  *   any thread concurrently with other curl activity. The OWNING PROGRAM calls
  *   curl_global_init(CURL_GLOBAL_DEFAULT) exactly once, before the first WS_Client (or any other
  *   curl handle) is created, from a single thread with no other curl calls in flight; it calls
- *   curl_global_cleanup once at shutdown, after every curl handle in the process is gone.
+ *   curl_global_cleanup once at shutdown, after every curl handle in the process is gone. A
+ *   program that also uses http/client may instead let THAT module's own pthread_once init run
+ *   first: libcurl >= 7.84 makes curl_global_init reference-counted and thread-safe when
+ *   CURL_VERSION_THREADSAFE is set (true for this tree's linked 8.x builds), so either module's
+ *   init running before the first WS_Client is created satisfies this contract.
  *
  * Timeouts (0 = poll once, USIZE_MAX = forever):
  *   Every receive/send budget in this module shares one convention: 0 means "check once, do not
