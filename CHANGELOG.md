@@ -31,6 +31,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - sync: http/server
 - `http/service/static`
 - `http/service/ip_block`
+- `http/service/security`
 
 ## 0.2.0 - release
 
