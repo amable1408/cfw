@@ -44,6 +44,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - `http/service/session`
 - `http/service/rate_limit`
 - `http/service/compression`
+- `http/service/cors`
 
 ## 0.2.0 - release
 
