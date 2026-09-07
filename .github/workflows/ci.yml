@@ -28,6 +28,16 @@ jobs:
       - name: Unchecked-build suites (ERROR_CHECK_ENABLED compiled out)
         run: make test-unchecked
       - name: Sanitizer build (ASan/UBSan)
+        # allocator_may_return_null=1 makes ASan answer an over-large request with NULL, the way
+        # calloc does, instead of aborting the process. CFW's try_ allocators are written against
+        # that contract - memory_try_alloc returns NULL and the caller refuses - and several
+        # suites PIN it, notably http/service/rate_limit, which asks for a capacity that cannot be
+        # satisfied to prove init refuses rather than running with no table. Under ASan's default
+        # that pin kills the run before it can assert, so the sanitizer would be testing ASan's
+        # allocation policy rather than CFW's refusal path. Genuine buffer overflows, use-after-free
+        # and UB are unaffected: this knob only governs what an impossible SIZE does.
+        env:
+          ASAN_OPTIONS: allocator_may_return_null=1
         run: |
           make clean
           make test CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wall -std=c23"

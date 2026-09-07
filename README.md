@@ -6,7 +6,7 @@ A modular **C23 framework**: self-contained modules, one translation unit each, 
 per module, and a test suite per module. This repository is the **audited export** of CFW - it
 holds only the modules that have cleared every gate below, together with everything they include.
 
-**59 modules** (243 files) at HEAD; the last tagged release is **0.2.0**. A
+**60 modules** (245 files) at HEAD; the last tagged release is **0.2.0**. A
 module lands in its own commit as soon as it clears the gate; a version is tagged when a family
 is complete. See the table below for exactly which modules are here.
 
@@ -70,6 +70,7 @@ errors that abort in checked builds - is documented in its header's `Error Handl
 | `http/service/captcha` | 1 .c / 1 .h | tests/http/service/captcha/ | HTTP CAPTCHA verification service for the C Libraries Framework |
 | `http/service/compression` | 1 .c / 1 .h | tests/http/service/compression/ | HTTP response compression service for the C Libraries Framework |
 | `http/service/cors` | 1 .c / 1 .h | tests/http/service/cors/ | HTTP CORS service for the C Libraries Framework |
+| `http/service/csrf` | 1 .c / 1 .h | tests/http/service/csrf/ | HTTP CSRF service for the C Libraries Framework |
 | `http/service/ip_block` | 1 .c / 1 .h | tests/http/service/ip_block/ | HTTP IP blocking service for the C Libraries Framework |
 | `http/service/multipart` | 2 .c / 2 .h | tests/http/service/multipart/ | Dynamic array list of HTTP_Service_Multipart_Node values for the C Libraries Framework |
 | `http/service/permission` | 1 .c / 1 .h | tests/http/service/permission/ | HTTP permission service for the C Libraries Framework |
