@@ -40,6 +40,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - `http/service/captcha`
 - `http/service/traceparent`
 - `http/service/auth`
+- `encoding/quoted_printable`
 
 ## 0.2.0 - release
 

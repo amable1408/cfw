@@ -6,7 +6,7 @@ A modular **C23 framework**: self-contained modules, one translation unit each, 
 per module, and a test suite per module. This repository is the **audited export** of CFW - it
 holds only the modules that have cleared every gate below, together with everything they include.
 
-**54 modules** (233 files) at HEAD; the last tagged release is **0.2.0**. A
+**55 modules** (235 files) at HEAD; the last tagged release is **0.2.0**. A
 module lands in its own commit as soon as it clears the gate; a version is tagged when a family
 is complete. See the table below for exactly which modules are here.
 
@@ -56,6 +56,7 @@ errors that abort in checked builds - is documented in its header's `Error Handl
 | `dir` | 1 .c / 1 .h | tests/dir/ | Directory operations for the C Libraries Framework |
 | `encoding/base64` | 1 .c / 1 .h | tests/encoding/base64/ |  |
 | `encoding/hex` | 1 .c / 1 .h | tests/encoding/hex/ |  |
+| `encoding/quoted_printable` | 1 .c / 1 .h | tests/encoding/quoted_printable/ |  |
 | `env` | 1 .c / 1 .h | tests/env/ | Environment variable management (dotenv-style) for the C Libraries Framework |
 | `error` | 1 .c / 1 .h | tests/error/ | Centralized error checking utilities for the C Libraries Framework |
 | `file` | 1 .c / 1 .h | tests/file/ | Canonical file I/O interface for reading, writing, and managing files |
