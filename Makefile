@@ -16,6 +16,8 @@
 #   OpenSSL 3.0 or newer (libcrypto) Debian: apt install libssl-dev             MSYS2: pacman -S mingw-w64-ucrt-x86_64-openssl
 #   libcurl 8.13 or newer (http/client needs 7.85; websocket/client 8.13) Debian: apt install libcurl4-openssl-dev   MSYS2: pacman -S mingw-w64-ucrt-x86_64-curl
 #   libwebsockets 4.3.5 or newer (Debian 13 packages 4.3.5; MSYS2 4.5.x) Debian: apt install libwebsockets-dev      MSYS2: pacman -S mingw-w64-ucrt-x86_64-libwebsockets
+#   zlib 1.3.x             Debian: apt install zlib1g-dev             MSYS2: pacman -S mingw-w64-ucrt-x86_64-zlib
+#   brotli 1.0 or newer (Debian 13 packages 1.1.0; MSYS2 1.1.x) Debian: apt install libbrotli-dev          MSYS2: pacman -S mingw-w64-ucrt-x86_64-brotli
 #   cglm 0.9.6             Debian: apt install libcglm-dev (Debian 13; Ubuntu 24.04's 0.9.2 is too old) MSYS2: pacman -S mingw-w64-ucrt-x86_64-cglm
 #   PCRE2 (8-bit)          Debian: apt install libpcre2-dev           MSYS2: pacman -S mingw-w64-ucrt-x86_64-pcre2
 # Override CC/CFLAGS as usual (e.g. `make CC=clang`). On Windows run under MSYS2 or Git Bash:
@@ -36,7 +38,7 @@ CPPFLAGS := -Iinclude -D_GNU_SOURCE -DARENA_IMPLEMENTATION -DERROR_CHECK_ENABLED
 # The per-module system libraries on the line below are computed from the actual export set -
 # see SYSTEM_DEPS in the generator - so a module this build doesn't carry never contributes a
 # dead flag, and one it does carry can never be silently missing.
-LDLIBS   := -lcrypto -lcurl -lwebsockets -lcglm -lpcre2-8 -lm
+LDLIBS   := -lcrypto -lcurl -lwebsockets -lz -lbrotlienc -lbrotlidec -lbrotlicommon -lcglm -lpcre2-8 -lm
 ifeq ($(OS),Windows_NT)
     # CFW's windows.h asserts the Windows 10 API baseline it was audited against.
     CPPFLAGS += -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00

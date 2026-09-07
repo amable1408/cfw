@@ -1,6 +1,6 @@
 /*
  * static.h - HTTP static file service for the C Libraries Framework
- * @version 0.3.1
+ * @version 0.3.2
  *
  * Maps HTTP request paths to static assets on disk, resolving their MIME types,
  * validating path security, and serving the file data over HTTP.
@@ -30,8 +30,7 @@
  *   - Public functions validate non-null pointers.
  *   - Missing files or directory traversal attempts fail gracefully.
  *   - An over-long root_dir/route_prefix/default_file is truncated to fit (never a buffer
- *     overrun) but now logs LOG_LEVEL_WARN at construction time instead of failing silently -
- *     see http_service_static_init_1/_2.
+ *     overrun) and logs LOG_LEVEL_WARN at construction time - see http_service_static_init_1/_2.
  *
  * Symlinks:
  *   - Followed by default, like a plain fopen would. Set self.refuse_symlinks = true after
@@ -47,8 +46,8 @@
  *
  * Range requests:
  *   - Capped at 4 MiB per response (_HTTP_SERVICE_STATIC_RANGE_CHUNK_MAX in static.c), so a
- *     100 MB file needs ~25 round trips. Whether libwebsockets - a system dependency since
- *     decision 2071, not vendored - was built with LWS_WITH_RANGES cannot be assumed; a build
+ *     100 MB file needs ~25 round trips. Whether libwebsockets - a system dependency, not
+ *     vendored - was built with LWS_WITH_RANGES cannot be assumed; a build
  *     that has it would let this delete the hand-rolled Range/416 path here and stream straight
  *     from disk instead. Not done in this pass; the hand-rolled path runs unconditionally.
  *   - Multi-range requests (a comma in the Range value) are not split into a multipart/byteranges
@@ -101,8 +100,8 @@
  *     buffer per request; the full-file path streams through http_server_response_send_file with
  *     no module-side buffering.
  *   - A full serve costs five stat-family calls: file_exists_1 in path resolution, file_size_1
- *     and file_modified_1 for the validators, then (decision 2117) send_file's own file_exists_1
- *     re-checking what resolution already confirmed, and libwebsockets' own fstat inside
+ *     and file_modified_1 for the validators, then send_file's own file_exists_1 re-checking
+ *     what resolution already confirmed, and libwebsockets' own fstat inside
  *     send_file. The re-check is the price of send_file's own 404 contract - it cannot tell
  *     "missing" from "streamed" without it (see http_server_response_send_file). They fold into
  *     one the day file/ grows a single stat primitive; measured as not worth a private syscall
@@ -114,7 +113,7 @@
  *     body, on the full-file, 206 and 304 paths alike.
  *
  * Dependencies:
- *   - http_server, char, datetime, file, dir, http/headers.
+ *   - arena, char, datetime, dir, file, http/headers, http/service/compression, http_server.
  *
  * See static.c for implementation details.
  */
@@ -122,10 +121,7 @@
 #ifndef HTTP_SERVICE_STATIC_H
 #define HTTP_SERVICE_STATIC_H
 
-#include <datetime/datetime.h>
-#include <dir/dir.h>
-#include <file/file.h>
-#include <http/headers/headers.h>
+#include <arena/arena.h>
 #include <http/server/http_server.h>
 #include <types.h>
 
@@ -208,8 +204,8 @@ HTTP_Service_Static http_service_static_alloc_init_2(
  * @param route_prefix URL route prefix.
  * @return Initialized service.
  * @note An over-long root_dir/route_prefix is truncated to fit its fixed buffer AND logs
- *       LOG_LEVEL_WARN - previously this truncation was completely silent, so a deployment
- *       could serve from (or route through) a truncated, nonexistent path with no diagnostic.
+ *       LOG_LEVEL_WARN, so a deployment serving from (or routing through) a truncated,
+ *       nonexistent path gets a diagnostic rather than silence.
  */
 HTTP_Service_Static http_service_static_init_1(char const *const root_dir, char const *const route_prefix);
 

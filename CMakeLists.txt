@@ -18,6 +18,11 @@ endif()
 find_package(OpenSSL 3.0 REQUIRED)
 find_package(CURL 8.13 REQUIRED)
 find_package(libwebsockets 4.3 CONFIG REQUIRED)
+find_package(ZLIB REQUIRED)
+find_library(BROTLIENC_LIBRARY NAMES brotlienc REQUIRED)
+find_library(BROTLIDEC_LIBRARY NAMES brotlidec REQUIRED)
+find_library(BROTLICOMMON_LIBRARY NAMES brotlicommon REQUIRED)
+find_path(BROTLI_INCLUDE_DIR NAMES brotli/encode.h REQUIRED)
 find_library(CGLM_LIBRARY NAMES cglm REQUIRED)
 find_path(CGLM_INCLUDE_DIR NAMES cglm/cglm.h REQUIRED)
 find_library(PCRE2_LIBRARY NAMES pcre2-8 REQUIRED)
@@ -25,12 +30,12 @@ find_path(PCRE2_INCLUDE_DIR NAMES pcre2.h REQUIRED)
 
 add_compile_definitions(_GNU_SOURCE ARENA_IMPLEMENTATION ERROR_CHECK_ENABLED LOG_THREAD_IMPLEMENTATION
                         MEMORY_HOOKS_IMPLEMENTATION MEMORY_NON_DANGLING_POINTER TRACELOG_ENABLED)
-include_directories("${CMAKE_SOURCE_DIR}/include" "${OPENSSL_INCLUDE_DIR}" "${CURL_INCLUDE_DIRS}" "${LIBWEBSOCKETS_INCLUDE_DIRS}" "${CGLM_INCLUDE_DIR}" "${PCRE2_INCLUDE_DIR}")
+include_directories("${CMAKE_SOURCE_DIR}/include" "${OPENSSL_INCLUDE_DIR}" "${CURL_INCLUDE_DIRS}" "${LIBWEBSOCKETS_INCLUDE_DIRS}" "${ZLIB_INCLUDE_DIRS}" "${BROTLI_INCLUDE_DIR}" "${CGLM_INCLUDE_DIR}" "${PCRE2_INCLUDE_DIR}")
 
 file(GLOB_RECURSE CFW_SRC CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/include/*.c")
 list(FILTER CFW_SRC EXCLUDE REGEX "/include/test/")
 add_library(cfw STATIC ${CFW_SRC})
-target_link_libraries(cfw PUBLIC OpenSSL::Crypto CURL::libcurl websockets_shared ${CGLM_LIBRARY} ${PCRE2_LIBRARY} m)
+target_link_libraries(cfw PUBLIC OpenSSL::Crypto CURL::libcurl websockets_shared ZLIB::ZLIB ${BROTLIENC_LIBRARY} ${BROTLIDEC_LIBRARY} ${BROTLICOMMON_LIBRARY} ${CGLM_LIBRARY} ${PCRE2_LIBRARY} m)
 if(WIN32)
     add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00)   # CFW's windows.h asserts this baseline
     target_link_libraries(cfw PUBLIC ws2_32)                     # Winsock, wrapped by platform/windows

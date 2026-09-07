@@ -4,6 +4,18 @@
 
 #include <http/service/static/static.h>
 
+/* Implementation dependencies: static.h's API names none of them. Keeping compression OUT of the
+ * header is not cosmetic - there it dragged an unpublished module into published static's
+ * dependency closure and broke the public export. file arrives only through http_server.h, whose
+ * API names no File type, an ACCIDENTAL chain.
+ * See style_guidelines.md, "Avoid Redundant Chained Includes". */
+#include <char/char.h>
+#include <datetime/datetime.h>
+#include <dir/dir.h>
+#include <file/file.h>
+#include <http/headers/headers.h>
+#include <http/service/compression/compression.h>
+
 /*==============================================================================
  * MARK: - Types
  *============================================================================*/
@@ -13,7 +25,7 @@ typedef struct {
     char const  *extension;
     USize       extension_size;
     char const  *mimetype;
-    /* Whether to append "; charset=utf-8" - true for every text-family entry (report Mid 9). Kept as an
+    /* Whether to append "; charset=utf-8" - true for every text-family entry. Kept as an
      * explicit flag rather than a runtime "starts with text/" check: cheaper, and it leaves each
      * row's answer visible in the table. The JSON-family rows (application/json,
      * application/manifest+json) are textual but say FALSE deliberately - RFC 8259 fixes their
@@ -44,33 +56,23 @@ typedef struct {
  * MARK: - Constants
  *============================================================================*/
 
+/* Switch for the compression seam _http_service_static_send passes buffer sends through (not
+ * the full-file, 206, or 304 paths - see that function's comment). Off until static grows
+ * per-instance compression configuration. */
+static bool const _HTTP_SERVICE_STATIC_COMPRESSION_ENABLED = false;
 /* Buffer size for the rendered "<mimetype>; charset=utf-8" Content-Type value. The longest
  * mimetype in the table below is well under half of this. */
 #define _HTTP_SERVICE_STATIC_CONTENT_TYPE_MAX 128
-/* Largest window returned for one Range response; caps memory for open-ended ranges. See
- * static.h's Range requests note for the LWS_WITH_RANGES trade-off this cap avoids. */
-#define _HTTP_SERVICE_STATIC_RANGE_CHUNK_MAX (4 * 1024 * 1024)
-/* Maximum digits accepted per Range number; the I64/ISize digit count keeps
- * accumulation below 2^64 (no wrap) and stays cross-checked by types.h. */
-#define _HTTP_SERVICE_STATIC_RANGE_DIGITS_MAX ISIZE_DIGITS_MAX
-/* Buffer size for the Range request header and the Content-Range response header. Also used for
- * If-None-Match/If-Range: a weak ETag here is short (size+mtime in hex), but a client may quote
- * a longer value than we generated - this stays generous rather than truncating a real one into
- * a false mismatch. NOTE (Misc 32): lws_hdr_copy returns -1 (not clamped) for a header longer
- * than the buffer, and every call site below treats that exactly like "header absent" - a client
- * sending an oversize conditional/Range header silently gets the unconditional response rather
- * than a 400. Documented, not changed: the safe direction for a value we cannot fully read. */
-#define _HTTP_SERVICE_STATIC_RANGE_HEADER_MAX 256
 
 /*
- * Extension-to-MIME map, matched by file-name suffix, CASE-INSENSITIVELY (report Mid 9 - a
- * camera's .JPG/.PNG uploads used to fall through to octet-stream, and the security service's
- * nosniff header then blocks a .JS asset served that way). Anything not listed falls back to
+ * Extension-to-MIME map, matched by file-name suffix, CASE-INSENSITIVELY - a camera's
+ * .JPG/.PNG uploads otherwise fall through to octet-stream, and the security service's
+ * nosniff header then blocks a .JS asset served that way. Anything not listed falls back to
  * lws_get_mimetype and then application/octet-stream. Ordered by category for readability.
  * Video/audio types matter for streaming: browsers (notably Safari/iOS) reject media served as
  * application/octet-stream.
  *
- * .ts is video/mp2t (MPEG transport stream) here, NOT TypeScript source (report Misc 30) - this
+ * .ts is video/mp2t (MPEG transport stream) here, NOT TypeScript source - this
  * table serves compiled web output, and a project that also serves raw .ts sources over this
  * same route needs its own mapping ahead of this table.
  */
@@ -124,11 +126,26 @@ static _HTTP_Service_Static_Mime const _HTTP_SERVICE_STATIC_MIME_TABLE[] = {
     { ".gz",            CHAR_STATIC_SIZE(".gz"),            "application/gzip",             false }
 };
 
+/* Largest window returned for one Range response; caps memory for open-ended ranges. See
+ * static.h's Range requests note for the LWS_WITH_RANGES trade-off this cap avoids. */
+#define _HTTP_SERVICE_STATIC_RANGE_CHUNK_MAX (4 * 1024 * 1024)
+/* Maximum digits accepted per Range number; the I64/ISize digit count keeps
+ * accumulation below 2^64 (no wrap) and stays cross-checked by types.h. */
+#define _HTTP_SERVICE_STATIC_RANGE_DIGITS_MAX ISIZE_DIGITS_MAX
+/* Buffer size for the Range request header and the Content-Range response header. Also used for
+ * If-None-Match/If-Range: a weak ETag here is short (size+mtime in hex), but a client may quote
+ * a longer value than we generated - this stays generous rather than truncating a real one into
+ * a false mismatch. NOTE: lws_hdr_copy returns -1 (not clamped) for a header longer
+ * than the buffer, and every call site below treats that exactly like "header absent" - a client
+ * sending an oversize conditional/Range header silently gets the unconditional response rather
+ * than a 400. Documented, not changed: the safe direction for a value we cannot fully read. */
+#define _HTTP_SERVICE_STATIC_RANGE_HEADER_MAX 256
+
 /*==============================================================================
  * MARK: - Helpers
  *============================================================================*/
 
-/* Case-insensitive byte-span equality for extension matching (report Mid 9). */
+/* Case-insensitive byte-span equality for extension matching. */
 static bool _http_service_static_extension_equal(char const *const a, char const *const b, USize const size) {
     trace_log_push(LOG_METADATA);
 
@@ -223,7 +240,7 @@ static USize _http_service_static_range_digits(char const **const cursor, USize 
  * the caller should IGNORE Range and fall back to a full 200 (RFC 9110 permits a server to
  * ignore Range at any time). Also returns false, but with *out_unsatisfiable set true, for a
  * syntactically valid range that names no existing byte - "-0" (a zero-byte suffix, folded in
- * per report Mid 8) or a start at/past EOF - in which case the caller must answer 416 rather
+ * here) or a start at/past EOF - in which case the caller must answer 416 rather
  * than silently falling back to a full response.
  */
 static bool _http_service_static_range_parse(char const *const range, USize const file_size, USize *const out_start, USize *const out_end, bool *const out_unsatisfiable) {
@@ -267,7 +284,8 @@ static bool _http_service_static_range_parse(char const *const range, USize cons
             end     = file_size - 1;
             result  = true;
         }
-    } else if (_http_service_static_range_digits(&cursor, &start) > 0 && *cursor == '-') {
+    }
+    else if (_http_service_static_range_digits(&cursor, &start) > 0 && *cursor == '-') {
         cursor += 1;
 
         bool parsed = false;
@@ -275,7 +293,8 @@ static bool _http_service_static_range_parse(char const *const range, USize cons
         if (*cursor == '\0') {
             end     = file_size - 1;
             parsed  = true;
-        } else if (_http_service_static_range_digits(&cursor, &end) > 0 && *cursor == '\0') {
+        }
+        else if (_http_service_static_range_digits(&cursor, &end) > 0 && *cursor == '\0') {
             parsed  = true;
         }
 
@@ -326,9 +345,8 @@ static USize _http_service_static_etag(USize const file_size, I64 const mtime, c
  * generic datetime_format has no weekday token, so this reads day_week/month/date/etc directly
  * off the struct rather than going through it - self-contained, no locale dependency. This is
  * the RENDERING half; the parsing half an If-Modified-Since needs is datetime_from_http_try,
- * which did not exist when this comment claimed parsing was "not implemented" and now backs the
- * 304 in _http_service_static_serve_conditional (serve_2 only - serve_1 never reads the header
- * at all, see static.h). */
+ * which backs the 304 in _http_service_static_serve_conditional (serve_2 only - serve_1 never
+ * reads the header at all, see static.h). */
 static USize _http_service_static_http_date(I64 const epoch_seconds, char *const buffer, USize const capacity) {
     trace_log_push(LOG_METADATA);
 
@@ -347,9 +365,8 @@ static USize _http_service_static_http_date(I64 const epoch_seconds, char *const
 
 /*
  * Whether ANY path component from self->root_dir down through the resolved file_name is a
- * symlink/junction, for the opt-in self->refuse_symlinks check (report Mid 12, walk widened per
- * memsec MED). Previously this checked only the FINAL component, so a symlinked ANCESTOR
- * directory (e.g. root_dir/linked_dir/real_leaf.txt) served straight through the check. dir/dir.h
+ * symlink/junction, for the opt-in self->refuse_symlinks check - catching a symlinked ANCESTOR
+ * directory (e.g. root_dir/linked_dir/real_leaf.txt), not just the final component. dir/dir.h
  * exposes is_link only per directory entry (dir_list_entries), not per single path, so this lists
  * each directory ONCE PER COMPONENT below the root and scans for the matching name - O(depth)
  * directory listings per request, which is exactly why the caller-facing flag defaults to off.
@@ -535,10 +552,10 @@ static void _http_service_static_headers_append(char *const buffer, USize const 
  *
  * http_headers_cache_max_age_into renders a whole "Cache-Control: ...\r\n" LINE, which is what
  * the raw extra-headers block on the full-file path wants; header_add wants the value alone, so
- * the prefix and the trailing CRLF are trimmed here. Shared by the 206 and 304 paths, which both
- * used to differ from the 200 by silently carrying no freshness at all (report Mid 5: a 304 that
- * omits Cache-Control does not renew the stored entry's freshness, so a client revalidates on
- * every load once the original max-age has lapsed).
+ * the prefix and the trailing CRLF are trimmed here. Shared by the 206 and 304 paths so neither
+ * goes out lacking the freshness the 200 carries: a 304 that omits Cache-Control does not renew
+ * the stored entry's freshness, so a client revalidates on every load once the original max-age
+ * has lapsed.
  */
 static void _http_service_static_cache_control_add(HTTP_Server_Response *const response, U32 const max_age) {
     trace_log_push(LOG_METADATA);
@@ -584,12 +601,11 @@ static void _http_service_static_cache_control_add(HTTP_Server_Response *const r
  * Render the Content-Type VALUE a reply should carry: the mimetype, plus "; charset=utf-8" for
  * the text-family entries the MIME table flags.
  *
- * Report High 1: the charset used to be appended as a second "Content-Type:" line in the raw
- * extra-headers block, on top of the one libwebsockets emits from send_file's content_type
- * argument, so every text-family 200 and HEAD went out with TWO Content-Type headers. It is
- * a singleton field (RFC 9110 S5.5) - which of the two a client honors is implementation-defined
- * and an intermediary may reject the reply outright. Rendering the full value here and handing
- * it to the sender as THE content type leaves exactly one on the wire.
+ * Content-Type is a singleton field (RFC 9110 S5.5): appending charset as a second
+ * "Content-Type:" line in the raw extra-headers block, alongside the one libwebsockets emits from
+ * send_file's content_type argument, would send two - which of the two a client honors is
+ * implementation-defined and an intermediary may reject the reply outright. Rendering the full
+ * value here and handing it to the sender as THE content type leaves exactly one on the wire.
  */
 static void _http_service_static_content_type(char const *const mimetype, bool const charset, char *const buffer, USize const capacity) {
     trace_log_push(LOG_METADATA);
@@ -603,23 +619,63 @@ static void _http_service_static_content_type(char const *const mimetype, bool c
 }
 
 /*
+ * Every buffer send this file makes goes through the compression seam, and the seam is switched
+ * OFF (_HTTP_SERVICE_STATIC_COMPRESSION_ENABLED). With the flag false this is exactly
+ * http_server_response_send_2 - same bytes, same headers, same suite counts. This is an anchor
+ * for BUFFER sends only (this function): a 200 goes out through http_server_response_send_file,
+ * which never calls this function; compression.c refuses to touch a 206 (a Content-Range byte
+ * window promised against the wrong content-length otherwise); and a 304 has no body to compress.
+ * Turning compression on for those paths needs either routing the full file through this seam
+ * instead of send_file, or precompressed sidecars served alongside the original - neither is done
+ * here. The seam stays off until static grows real per-instance compression configuration: a
+ * service built per call would re-add its MIME defaults on every response, and static.h cannot
+ * gain a compression field without a public API change.
+ *
+ * `request` may be null (serve_1 has none), in which case there is no Accept-Encoding to read
+ * and the body goes out as identity whatever the flag says.
+ */
+static void _http_service_static_send(HTTP_Server_Request *const request, HTTP_Server_Response *const response, Byte const *const data,
+    USize const data_size, char const *const content_type, U16 const status_code) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "response", (void*) response);
+    error_check_null(LOG_METADATA, "content_type", (void*) content_type);
+
+    if (_HTTP_SERVICE_STATIC_COMPRESSION_ENABLED && request != nullptr) {
+        HTTP_Service_Compression compression = DEFAULT_INITIALIZATION;
+
+        if (http_service_compression_init_1(&compression)) {
+            http_service_compression_send(&compression, request, response, data, data_size, content_type, status_code);
+            http_service_compression_uninit(&compression);
+
+            trace_log_pop();
+
+            return;
+        }
+    }
+
+    http_server_response_send_2(response, data, data_size, content_type, status_code);
+
+    trace_log_pop();
+}
+
+/*
  * Read the [start, end] window (capped to _HTTP_SERVICE_STATIC_RANGE_CHUNK_MAX)
  * from file_name and send it as 206 Partial Content with Content-Range and
- * Accept-Ranges headers, honoring max_age (report Mid 8: previously the 206 path
- * never set Cache-Control at all). An unsatisfiable range answers 416 with
+ * Accept-Ranges headers, honoring max_age. An unsatisfiable range answers 416 with
  * Content-Range: bytes * /file_size here rather than falling back to a full body.
  * Returns true when a response was already sent (206 or 416) - the caller must not
  * fall back in that case. Returns false only for a malformed/multi-range value or
  * an unreadable file, so the caller can fall back to a full response.
  *
- * content_type is the full rendered value (charset included, report High 1), and etag /
+ * content_type is the full rendered value (charset included), and etag /
  * last_modified are the caller's already-computed validators, empty when the file could not be
- * stat'ed. Report Mid 4: a 206 used to carry neither, so Safari - whose opening probe is a
- * one-byte `bytes=0-1` - never learned the validator and sent no If-Range on the continuation
- * ranges that follow. RFC 9110 S15.3.7 asks a 206 to carry the same validators as the 200.
+ * stat'ed - carried so a 206 answers with the same validators the 200 for the same file would,
+ * which is what lets Safari's opening one-byte probe (`bytes=0-1`) learn the ETag and send
+ * If-Range on the continuation ranges that follow (RFC 9110 S15.3.7).
  */
-static bool _http_service_static_serve_range(char const *const file_name, char const *const content_type, char const *const range, U32 const max_age,
-    char const *const etag, char const *const last_modified, HTTP_Server_Response *const response) {
+static bool _http_service_static_serve_range(HTTP_Server_Request *const request, char const *const file_name, char const *const content_type,
+    char const *const range, U32 const max_age, char const *const etag, char const *const last_modified, HTTP_Server_Response *const response) {
     trace_log_push(LOG_METADATA);
 
     error_check_null(LOG_METADATA, "file_name", (void*) file_name);
@@ -654,7 +710,7 @@ static bool _http_service_static_serve_range(char const *const file_name, char c
 
             snprintf(content_range, sizeof(content_range), "bytes */%llu", (unsigned long long) file_size);
 
-            /* Accept-Ranges on the 416 too (report Misc 19): harmless, and it tells a client
+            /* Accept-Ranges on the 416 too: harmless, and it tells a client
              * whose range was out of bounds that a corrected one is still worth sending. */
             http_server_response_header_add(response, "Accept-Ranges", "bytes");
             http_server_response_header_add(response, "Content-Range", content_range);
@@ -710,7 +766,7 @@ static bool _http_service_static_serve_range(char const *const file_name, char c
     http_server_response_header_add(response, "Accept-Ranges", "bytes");
     http_server_response_header_add(response, "Content-Range", content_range);
 
-    /* The same validators the 200 carries (report Mid 4). Empty when the file could not be
+    /* The same validators the 200 carries. Empty when the file could not be
      * stat'ed, in which case the 206 goes out without them exactly as the 200 does. */
     if (etag[0] != '\0') {
         http_server_response_header_add(response, "ETag", etag);
@@ -722,7 +778,7 @@ static bool _http_service_static_serve_range(char const *const file_name, char c
 
     _http_service_static_cache_control_add(response, max_age);
 
-    http_server_response_send_2(response, buffer, size, content_type, HTTP_SERVER_STATUS_CODE_PARTIAL_CONTENT);
+    _http_service_static_send(request, response, buffer, size, content_type, HTTP_SERVER_STATUS_CODE_PARTIAL_CONTENT);
 
     memory_delete((void**) &buffer);
 
@@ -776,8 +832,7 @@ static bool _http_service_static_resolve(HTTP_Service_Static const *const self, 
     }
 
     /* GET .../sub/ (a trailing slash on a non-root relative path) serves sub/index.html the same
-     * way the prefix root does (report Mid 12) - previously only rel_path_size == 0 got this
-     * treatment, so a subdirectory index needed an exact file name in the URL. */
+     * way the prefix root does, so a subdirectory index needs no exact file name in the URL. */
     bool const directory_request = rel_path_size == 0 || rel_path[rel_path_size - 1] == '/';
 
     USize file_name_size = 0;
@@ -857,9 +912,9 @@ static bool _http_service_static_resolve(HTTP_Service_Static const *const self, 
 #endif // _WIN32
 
     if (!file_exists_1(file_name)) {
-        /* SPA fallback restricted to extension-less paths (report Low 20) - a missing .js/.css
-         * used to fall back to index.html 200 with a text/html body, which browsers then refuse
-         * to run/apply and report as a MIME-type console error. A request with a dot in its
+        /* SPA fallback restricted to extension-less paths: falling back to index.html 200 with a
+         * text/html body for a missing .js/.css asset makes browsers refuse to run/apply it and
+         * report a MIME-type console error. A request with a dot in its
          * final segment is asking for a specific asset, not a client-side route - a dot in an
          * EARLIER segment ("/app/v1.2/users") is not an extension and must not disqualify the
          * fallback, so the search starts after the last '/', mirroring the basename scan above. */
@@ -888,11 +943,11 @@ static bool _http_service_static_resolve(HTTP_Service_Static const *const self, 
             char_copy_3(file_name + file_name_size, file_name_capacity - file_name_size, self->fallback_file, self->fallback_file_size);
             file_name_size += self->fallback_file_size;
 
-            /* Stale note this replaces: char_copy_3 now DOES terminate at data_size (char_copy_2
-             * is the one that doesn't), so the call above already wrote this terminator - kept
-             * explicit here anyway, right before the file_exists_1 check below, so the intent
-             * ("file_name_size marks the real end of the fallback path, shorter than the
-             * requested path that just failed") stays visible without following the call chain. */
+            /* char_copy_3 already writes this terminator (it terminates at data_size; char_copy_2
+             * is the one that doesn't) - kept explicit here anyway, right before the
+             * file_exists_1 check below, so the intent ("file_name_size marks the real end of the
+             * fallback path, shorter than the requested path that just failed") stays visible
+             * without following the call chain. */
             file_name[file_name_size] = '\0';
 
             if (!file_exists_1(file_name)) {
@@ -908,7 +963,7 @@ static bool _http_service_static_resolve(HTTP_Service_Static const *const self, 
         }
     }
 
-    /* Opt-in (report Mid 12): off by default, so zero cost unless a caller explicitly asks. */
+    /* Opt-in: off by default, so zero cost unless a caller explicitly asks. */
     if (self->refuse_symlinks && _http_service_static_is_symlink(self, file_name)) {
         trace_log_pop();
 
@@ -931,6 +986,7 @@ static bool _http_service_static_resolve(HTTP_Service_Static const *const self, 
  */
 static bool _http_service_static_serve_conditional(
     HTTP_Service_Static const *const self,
+    HTTP_Server_Request *const request,
     HTTP_Server_Response *const response,
     char const *const file_name,
     char const *const mimetype,
@@ -944,10 +1000,9 @@ static bool _http_service_static_serve_conditional(
     error_check_null(LOG_METADATA, "mimetype", (void*) mimetype);
     error_check_null(LOG_METADATA, "headers", (void*) headers);
 
-    /* Conditional GET (report High 4): Last-Modified + a weak ETag from size+mtime, a 304 on a
-     * matching If-None-Match, and (new) a 304 on an If-Modified-Since that the file has not
-     * changed since - now possible thanks to datetime_from_http_try, an RFC 7231 IMF-fixdate
-     * parser that did not exist when static.h's older "not implemented" note was written. */
+    /* Conditional GET: Last-Modified + a weak ETag from size+mtime, a 304 on a
+     * matching If-None-Match, and a 304 on an If-Modified-Since that the file has not
+     * changed since - via datetime_from_http_try, an RFC 7231 IMF-fixdate parser. */
     USize   file_size   = 0;
     I64     mtime       = 0;
     bool    const have_stat = file_size_1(file_name, &file_size) && file_modified_1(file_name, &mtime);
@@ -957,7 +1012,7 @@ static bool _http_service_static_serve_conditional(
     char    last_modified[40]   = DEFAULT_INITIALIZATION;
 
     /* Rendered ONCE, and handed to whichever of the three senders below answers, so exactly one
-     * Content-Type reaches the wire whatever the status code is (report High 1). */
+     * Content-Type reaches the wire whatever the status code is. */
     char content_type[_HTTP_SERVICE_STATIC_CONTENT_TYPE_MAX] = DEFAULT_INITIALIZATION;
 
     _http_service_static_content_type(mimetype, charset, content_type, sizeof(content_type));
@@ -989,7 +1044,7 @@ static bool _http_service_static_serve_conditional(
             http_server_response_header_add(response, "ETag", etag);
             http_server_response_header_add(response, "Last-Modified", last_modified);
 
-            /* Report Mid 5: the 304 refreshes the stored entry's headers (RFC 9110 S15.4.5,
+            /* The 304 refreshes the stored entry's headers (RFC 9110 S15.4.5,
              * RFC 9111 S4.3.4), so it has to repeat the freshness the 200 carried - without it
              * the entry stays stale and the client revalidates on every single load. */
             _http_service_static_cache_control_add(response, self->max_age);
@@ -998,7 +1053,7 @@ static bool _http_service_static_serve_conditional(
              * for a 304 whose representation is the client's cached copy of THIS file. send_2
              * writes no Content-Length and no body for a 304 (RFC 9110 S8.6), so this is the
              * same empty reply with the honest Content-Type. */
-            http_server_response_send_2(response, nullptr, 0, content_type, HTTP_SERVER_STATUS_CODE_NOT_MODIFIED);
+            _http_service_static_send(request, response, nullptr, 0, content_type, HTTP_SERVER_STATUS_CODE_NOT_MODIFIED);
 
             trace_log_pop();
 
@@ -1008,11 +1063,10 @@ static bool _http_service_static_serve_conditional(
 
     /*
      * Serve a single byte range as 206 Partial Content when the client requests one AND
-     * If-Range (if present) still matches the current ETag (report Low 19 - previously any
-     * If-Range value was ignored outright, which is compliant but wasted the round trip; now
-     * that a validator exists there is no reason not to honor it). libwebsockets is a system
-     * dependency since decision 2071, not vendored, and whether it was built with
-     * LWS_WITH_RANGES cannot be assumed, so this hand-rolled path runs unconditionally.
+     * If-Range (if present) still matches the current ETag, so a range is never served against a
+     * stale cached copy. libwebsockets is a system dependency, not vendored, and whether it was
+     * built with LWS_WITH_RANGES cannot be assumed, so this hand-rolled path runs
+     * unconditionally.
      */
     if (headers->range_size > 0) {
         bool range_valid = true;
@@ -1021,7 +1075,7 @@ static bool _http_service_static_serve_conditional(
             range_valid = have_stat && etag_size > 0 && char_compare_equal_2(headers->if_range, headers->if_range_size, etag, etag_size);
         }
 
-        if (range_valid && _http_service_static_serve_range(file_name, content_type, headers->range, self->max_age, etag, last_modified, response)) {
+        if (range_valid && _http_service_static_serve_range(request, file_name, content_type, headers->range, self->max_age, etag, last_modified, response)) {
             trace_log_pop();
 
             return true;
@@ -1045,12 +1099,12 @@ static bool _http_service_static_serve_conditional(
     }
 
     /* No "Content-Type:" line in this block: the charset travels in content_type, which
-     * libwebsockets emits as the reply's ONE Content-Type header (report High 1). */
+     * libwebsockets emits as the reply's ONE Content-Type header. */
 
     /* http_server_response_send_file merges in anything already queued on `response` via
-     * http_server_response_header_add (Cache-Control, Set-Cookie, ...) itself, and it sets
-     * write_success/file_served on `response` internally - the manual bookkeeping this used to
-     * need around lws_serve_http_file is gone along with that raw call. */
+     * http_server_response_header_add (Cache-Control, Set-Cookie, ...) itself, and sets
+     * write_success/file_served on `response` internally, so no manual bookkeeping around a raw
+     * lws_serve_http_file call is needed here. */
     bool const served = http_server_response_send_file(response, file_name, content_type, extra_headers_size > 0 ? extra_headers : nullptr, extra_headers_size);
 
     trace_log_pop();
@@ -1204,11 +1258,10 @@ bool http_service_static_serve_1(HTTP_Service_Static const *const self, HTTP_Ser
     /*
      * This entry point receives no HTTP_Server_Request, so it cannot use
      * http_server_request_header_copy (serve_2's clean path, below). It reads lws's recognized
-     * header tokens directly off the response's underlying wsi instead - exactly what this
-     * function did before this rewrite - so serve_1's one remaining caller (the unchecked test
-     * suite; main.c migrated to serve_2) keeps full conditional-GET/Range support with no
-     * signature change (see static.h). This is the one place static.c still touches a raw
-     * wsi/lws_hdr_copy, and it is
+     * header tokens directly off the response's underlying wsi instead, so serve_1's one
+     * remaining caller (the unchecked test suite; main.c migrated to serve_2) keeps full
+     * conditional-GET/Range support with no signature change (see static.h). This is the one
+     * place static.c still touches a raw wsi/lws_hdr_copy, and it is
      * kept deliberately, not left over: http_server_response_get_client has no clean replacement
      * for a caller with no request. If-Modified-Since is intentionally left unread here - it is a
      * new capability added alongside serve_2's clean header API, not a preexisting one, so not
@@ -1242,7 +1295,9 @@ bool http_service_static_serve_1(HTTP_Service_Static const *const self, HTTP_Ser
         headers.if_range_size  = (USize) if_range_size;
     }
 
-    bool const served = _http_service_static_serve_conditional(self, response, file_name, mimetype, charset, &headers);
+    /* nullptr: this entry point has no HTTP_Server_Request, so the compression seam has no
+     * Accept-Encoding to read and every body it sends stays identity. */
+    bool const served = _http_service_static_serve_conditional(self, nullptr, response, file_name, mimetype, charset, &headers);
 
     trace_log_pop();
 
@@ -1300,7 +1355,7 @@ bool http_service_static_serve_2(HTTP_Service_Static const *const self, HTTP_Ser
         headers.if_range_size = char_length(if_range);
     }
 
-    bool const served = _http_service_static_serve_conditional(self, response, file_name, mimetype, charset, &headers);
+    bool const served = _http_service_static_serve_conditional(self, request, response, file_name, mimetype, charset, &headers);
 
     trace_log_pop();
 
