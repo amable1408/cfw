@@ -38,6 +38,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - `http/service/permission`
 - sync: http/client
 - `http/service/captcha`
+- `http/service/traceparent`
 
 ## 0.2.0 - release
 

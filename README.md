@@ -6,7 +6,7 @@ A modular **C23 framework**: self-contained modules, one translation unit each, 
 per module, and a test suite per module. This repository is the **audited export** of CFW - it
 holds only the modules that have cleared every gate below, together with everything they include.
 
-**52 modules** (229 files) at HEAD; the last tagged release is **0.2.0**. A
+**53 modules** (231 files) at HEAD; the last tagged release is **0.2.0**. A
 module lands in its own commit as soon as it clears the gate; a version is tagged when a family
 is complete. See the table below for exactly which modules are here.
 
@@ -72,6 +72,7 @@ errors that abort in checked builds - is documented in its header's `Error Handl
 | `http/service/security` | 1 .c / 1 .h | tests/http/service/security/ | HTTP security headers service for the C Libraries Framework |
 | `http/service/static` | 1 .c / 1 .h | tests/http/service/static/ | HTTP static file service for the C Libraries Framework |
 | `http/service/trace` | 1 .c / 1 .h | tests/http/service/trace/ | HTTP request/response access trace service for the C Libraries Framework |
+| `http/service/traceparent` | 1 .c / 1 .h | tests/http/service/traceparent/ | HTTP traceparent service for the C Libraries Framework |
 | `json` | 1 .c / 1 .h + vendored yyjson 0.12.0 | tests/json/ | JSON parser and writer for the C Libraries Framework |
 | `log` | 1 .c / 1 .h | tests/log/ | Centralized logging and debug tracing for the C Libraries Framework |
 | `math` | 36 .c / 39 .h | tests/math/ | 2D axis-aligned bounding box operations for the CFW math module |
