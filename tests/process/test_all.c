@@ -30,6 +30,12 @@
 /** Bytes pushed through the child in the deadlock case; far past any pipe buffer. */
 #define _TEST_LARGE_SIZE (256 * 1024)
 
+/** Bytes a paced flooder writes per pause; one read chunk, so the parent never falls behind. */
+#define _TEST_PACED_CHUNK 4096
+
+/** Milliseconds a paced flooder sleeps between chunks, capping it at _TEST_PACED_CHUNK per ms. */
+#define _TEST_PACED_PAUSE_MS 1
+
 /*==============================================================================
  * MARK: - File Scope
  *============================================================================*/
@@ -340,8 +346,13 @@ static I32 _child_signal_state(void) {
 #endif // OS_WINDOWS
 
 /**
- * @brief Write forever, so the stdout pipe is never empty and the parent's deadline check must
- *        run even while there is always something to drain.
+ * @brief Write forever as fast as the machine allows, so the stdout pipe is never empty.
+ *
+ * The UNPACED flooder, for the cases that want an output limit reached as quickly as possible -
+ * a survivor's flood that must be proved absent from the capture. A case whose deadline has to
+ * expire BEFORE a limit is reached must spawn _child_flood_paced instead, since how much this one
+ * moves in a given window is a property of the machine and nothing a test may assume.
+ *
  * @return Exit code for the child, which a passing test never observes.
  */
 static I32 _child_flood(void) {
@@ -355,6 +366,43 @@ static I32 _child_flood(void) {
 
     while (fwrite(block, 1, sizeof(block), stdout) == sizeof(block)) {
         fflush(stdout);
+    }
+
+    return 0;
+}
+
+/**
+ * @brief Write forever like _child_flood, but at a rate bounded by construction rather than by
+ *        the machine: one chunk per sleep, so the pipe keeps having more coming while the total
+ *        stays far below any output limit these tests set.
+ *
+ * A sleep is a FLOOR - the operating system may hand the thread back late, never early - so this
+ * child cannot emit more than _TEST_PACED_CHUNK bytes per _TEST_PACED_PAUSE_MS milliseconds, i.e.
+ * at most four mebibytes a second, on any hardware. Cases that need a deadline to expire before a
+ * 64 MiB limit is reached spawn this child instead of _child_flood, whose whole purpose is to
+ * overrun a limit as fast as the machine can and which stays unpaced for the cases that want that.
+ *
+ * @return Exit code for the child, which a passing test never observes.
+ */
+static I32 _child_flood_paced(void) {
+#ifdef OS_WINDOWS
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif // OS_WINDOWS
+
+    char block[_TEST_PACED_CHUNK] = DEFAULT_INITIALIZATION;
+
+    memory_set(block, sizeof(block), (U8) 'p');
+
+    while (fwrite(block, 1, sizeof(block), stdout) == sizeof(block)) {
+        fflush(stdout);
+
+#ifdef OS_WINDOWS
+        Sleep(_TEST_PACED_PAUSE_MS);
+#else
+        struct timespec const pause = { .tv_sec = 0, .tv_nsec = _TEST_PACED_PAUSE_MS * 1000000L };
+
+        nanosleep(&pause, nullptr);
+#endif // OS_WINDOWS
     }
 
     return 0;
@@ -384,7 +432,7 @@ static I32 _child_crash_flooding(char **argv) {
 #ifdef OS_WINDOWS
     char command[1024] = DEFAULT_INITIALIZATION;
 
-    snprintf(command, sizeof(command), "\"%s\" --child-flood", argv[0]);
+    snprintf(command, sizeof(command), "\"%s\" --child-flood-paced", argv[0]);
 
     STARTUPINFOA startup = DEFAULT_INITIALIZATION;
 
@@ -397,8 +445,10 @@ static I32 _child_crash_flooding(char **argv) {
         CloseHandle(info.hProcess);
     }
 
-    /* Die with the pipe already FULL: the run must be mid-flood when the child goes, so that
-     * the deadline (or the limit) it leaves behind is what the classification has to see past. */
+    /* Die with the flood still RUNNING: the run must be mid-flood when the child goes, so that
+     * the deadline it leaves behind is what the classification has to see past. The grandchild is
+     * the PACED flooder, so the write end is held open and still producing, but at a rate that
+     * cannot reach the case's output limit - the limit must never be able to win this race. */
     Sleep(100);
 
     /* Without this the UCRT hands the abort to Windows Error Reporting first, which can hold the
@@ -409,22 +459,24 @@ static I32 _child_crash_flooding(char **argv) {
     (void) argv;
 
     if (fork() == 0) {
-        _child_flood();
+        _child_flood_paced();
 
         _exit(0);
     }
 
-    /* Die with the pipe already FULL: the run must be mid-flood when the child goes, so that
-     * the deadline (or the limit) it leaves behind is what the classification has to see past. */
+    /* Die with the flood still RUNNING: the run must be mid-flood when the child goes, so that
+     * the deadline it leaves behind is what the classification has to see past. The grandchild is
+     * the PACED flooder, so the write end is held open and still producing, but at a rate that
+     * cannot reach the case's output limit - the limit must never be able to win this race. */
     struct timespec const head_start = { .tv_sec = 0, .tv_nsec = 100000000L };
 
     nanosleep(&head_start, nullptr);
 
     /* SIGTERM rather than abort(): SIGABRT's default action dumps core, and a piped core_pattern
      * (systemd-coredump, apport) ignores RLIMIT_CORE and can hold the dying child for hundreds of
-     * milliseconds - long enough for the flood to hit the limit first. A plain terminating signal
-     * is immediate, and the classification under test is the same: a death the module did not
-     * cause. */
+     * milliseconds - long enough for the 500 ms deadline to expire first, which would report a
+     * timeout in place of the death. A plain terminating signal is immediate, and the
+     * classification under test is the same: a death the module did not cause. */
     kill(getpid(), SIGTERM);
 #endif // OS_WINDOWS
 
@@ -848,14 +900,19 @@ static void _test_daemonizing_child(Test *const test) {
     test_case_end(test);
 }
 
-/* 19. The deadline is honoured while the pipe is never empty - a child that floods stdout used
+/* 19. The deadline is honoured while the pipe keeps refilling - a child that floods stdout used
  *     to keep the Windows loop reading and peeking past its own timeout, until output_limit. */
 static void _test_timeout_under_output_pressure(Test *const test) {
     test_case_begin(test, "timeout under output pressure: a child that floods stdout is killed at the deadline, not at the output limit");
 
-    /* The limit sits far above what a fast pipe moves in 100 ms (Linux drains ~16 MiB in 50 ms),
-     * so the deadline is the first thing that can end this run - which is the point. */
-    char const *const argv[] = { _program, "--child-flood", nullptr };
+    /* The child is the PACED flooder, and that is what GUARANTEES the ordering: it writes one
+     * 4 KiB chunk per 1 ms sleep, and a sleep is a floor no scheduler returns from early, so no
+     * machine can push more than ~4 MiB a second into this pipe. A 100 ms deadline therefore
+     * admits a few hundred kilobytes at most - the 64 MiB limit is unreachable inside the window
+     * on any hardware, by construction, rather than by a bet on how fast a pipe happens to be.
+     * The limit still ends a run that IGNORES the deadline, because the flood never stops, so
+     * this case keeps every bit of its grip on the defect it was written for. */
+    char const *const argv[] = { _program, "--child-flood-paced", nullptr };
     ProcessSpec const spec = { .argv = argv, .output_limit = 64U * 1024U * 1024U, .timeout_milliseconds = 100 };
     ProcessOutcome outcome = DEFAULT_INITIALIZATION;
     U64 const started = _test_now_milliseconds();
@@ -1055,6 +1112,12 @@ static void _test_descriptor_isolation(Test *const test) {
 static void _test_own_death_not_mistaken_for_kill(Test *const test) {
     test_case_begin(test, "own death: a child that dies of its own signal while its grandchild floods stdout is reported as that death, never TIMED_OUT or KILLED");
 
+    /* The grandchild is the PACED flooder, and that is what GUARANTEES the ordering: bounded to
+     * one 4 KiB chunk per 1 ms sleep, it can put at most ~2 MiB into the pipe inside the 500 ms
+     * this case allows, so the 64 MiB limit cannot be reached before the child dies of its own
+     * SIGTERM at ~100 ms - on any hardware, by construction rather than by a bet on pipe speed.
+     * An unbounded flooder made the outcome a race the faster machine lost, reporting the
+     * module's own SIGKILL at the limit in place of the death the case exists to pin. */
     char const *const argv[] = { _program, "--child-crash-flooding", nullptr };
     ProcessSpec const spec = { .argv = argv, .stderr_mode = PROCESS_STDERR_DISCARD, .output_limit = 64U * 1024U * 1024U, .timeout_milliseconds = 500 };
     ProcessOutcome outcome = DEFAULT_INITIALIZATION;
@@ -1485,6 +1548,10 @@ int main(int argc, char **argv) {
 
         if (strcmp(argv[1], "--child-flood") == 0) {
             return _child_flood();
+        }
+
+        if (strcmp(argv[1], "--child-flood-paced") == 0) {
+            return _child_flood_paced();
         }
 
         if (strcmp(argv[1], "--child-flood-delayed") == 0) {
