@@ -37,6 +37,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - sync: http/cookie, http/query
 - `http/service/permission`
 - sync: http/client
+- `http/service/captcha`
 
 ## 0.2.0 - release
 

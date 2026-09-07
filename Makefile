@@ -167,7 +167,11 @@ libcfw_unchecked.a: $(LIB_OBJ_UNCHECKED)
 $(UNCHECKED_BIN): %$(EXE): %.c $(HARNESS) libcfw_unchecked.a
 	$(CC) $(CFLAGS) $(CPPFLAGS_UNCHECKED) -I$(dir $<) $(SUITE_EXTRA_INC) -o $@ $< $(filter-out $(dir $<)test_%,$(wildcard $(dir $<)*.c)) $(SUITE_EXTRA_SRC) $(HARNESS) libcfw_unchecked.a $(LDLIBS)
 
-# (no suite in this export borrows another suite's fixture)
+# tests/http/service/captcha borrows tests/http/client rather than carrying a second copy of it; the per-suite
+# wildcard in the recipes above only ever sees a suite's OWN directory.
+tests/http/service/captcha/test_all$(EXE) tests/http/service/captcha/test_unchecked$(EXE): SUITE_EXTRA_INC := -Itests/http/client
+tests/http/service/captcha/test_all$(EXE) tests/http/service/captcha/test_unchecked$(EXE): SUITE_EXTRA_SRC := tests/http/client/fixture.c
+tests/http/service/captcha/test_all$(EXE) tests/http/service/captcha/test_unchecked$(EXE): tests/http/client/fixture.c tests/http/client/fixture.h
 
 test-unchecked: $(UNCHECKED_BIN)
 	@status=0; failed=""; \

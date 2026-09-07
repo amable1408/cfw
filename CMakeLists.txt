@@ -61,7 +61,10 @@ foreach(src ${TEST_SRC})
     # The glob above only ever sees the suite's own directory, so the borrowed sources and
     # include directory are named here, generated from the export's own borrowing map.
     set(borrowed_includes "")
-    # (no suite in this export borrows another suite's fixture)
+    if(suite STREQUAL "http/service/captcha")
+        list(APPEND helpers "${CMAKE_SOURCE_DIR}/tests/http/client/fixture.c")
+        list(APPEND borrowed_includes "${CMAKE_SOURCE_DIR}/tests/http/client")
+    endif()
     add_executable(${target} "${src}" ${helpers} "${CMAKE_SOURCE_DIR}/include/test/test.c")
     target_include_directories(${target} PRIVATE "${suite_dir}")
     target_include_directories(${target} PRIVATE "${CMAKE_SOURCE_DIR}/tests/${suite}")
