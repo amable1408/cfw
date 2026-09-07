@@ -274,7 +274,14 @@ static USize _http_client_header_callback(char *const contents, USize const size
      * far. */
     struct curl_slist *const appended = curl_slist_append(self->response_headers, string_get_data(&line));
 
-    if (!memory_empty((void*) appended)) {
+    if (memory_empty((void*) appended)) {
+        /* The transfer still succeeds, and `header_capped` deliberately stays false - that flag
+         * means "the budget was exceeded" and selects its own error string. Without this line a
+         * dropped Set-Cookie or Location would be indistinguishable from one the server never
+         * sent, since response_header_find simply misses it. */
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_client: curl_slist_append failed, one response header line was dropped");
+    }
+    else {
         self->response_headers = appended;
 
         self->response_header_bytes += line_size;
@@ -318,33 +325,27 @@ static String _http_client_escape(HTTP_Client const *const self, char const *con
     error_check_null(LOG_METADATA, "self", (void*) self);
     error_check_null(LOG_METADATA, "data", (void*) data);
 
-    /* curl_easy_escape takes a signed I32 length; a data_size beyond INT_MAX
-     * would narrow into garbage (or negative) rather than abort or truncate
-     * predictably, so refuse it explicitly and answer an empty String. */
-    if (data_size > (USize) INT_MAX) {
-        String const string = string_init_1();
+    /* Delegates to http/query rather than curl_easy_escape: byte-for-byte the
+     * same output (RFC 3986 unreserved set, uppercase hex - pinned over every
+     * byte 0x00-0xFF in tests/http/client/test_all.c), one pass into the
+     * String this returns instead of a curl malloc + char_length + copy +
+     * curl_free per call, and one encoder in the tree instead of two. `self`
+     * stays in the signature - it was never consulted by libcurl either - and
+     * retires with the escape family's next MAJOR.
+     *
+     * The refusal threshold moves with the delegate: a data_size over
+     * HTTP_QUERY_ENCODE_MAX_SIZE (1 MiB) answers an empty String where the old
+     * bound was INT_MAX. Both are far above any URL this client builds, and
+     * both refuse rather than truncate. */
+    String string = string_init_1();
 
-        trace_log_pop();
-
-        return string;
+    /* An empty String is the answer for BOTH an empty input and a refused one, so the
+     * refusal is logged: without it a caller handed a 1 MiB+ value (or a value aliasing the
+     * fresh destination, which cannot happen here) gets an empty escape that reads exactly
+     * like an empty input, and the truncated URL only fails later at the server. */
+    if (!http_query_encode_2(&string, data, data_size) && data_size > 0) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_client_escape: value refused by http_query_encode_2, empty String returned");
     }
-
-    char *const encoded = curl_easy_escape(self->curl, data, (I32) data_size);
-
-    if (memory_empty(encoded)) {
-        String const string = string_init_1();
-
-        trace_log_pop();
-
-        return string;
-    }
-
-    USize const encoded_size = char_length(encoded);
-    String      string       = string_init_1();
-
-    string_add_last_2(&string, encoded, encoded_size);
-
-    curl_free(encoded);
 
     trace_log_pop();
 

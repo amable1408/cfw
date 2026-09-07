@@ -65,13 +65,22 @@ typedef struct Fixture_Server {
      * byte unchanged (body "ok-body-content" / "status-body", and no Content-Type header at
      * all). Set them to answer an arbitrary payload - a `{"success":true}` siteverify reply,
      * a `{"error":"invalid_grant"}` 400 - without a live provider. Both point at
-     * caller-owned, NUL-terminated storage that must outlive fixture_server_join. */
+     * caller-owned, NUL-terminated storage that must outlive fixture_server_join.
+     *
+     * A scripted body or Content-Type the fixture's fixed response buffer cannot hold is
+     * REFUSED, never truncated under a Content-Length that still claims the full size: the
+     * fixture counts it in script_refused and CLOSES the connection. The client then sees a
+     * clean empty reply instead of hanging on a connection the fixture is holding open with
+     * nothing to say, and a suite should assert script_refused == 0 on its healthy runs so a
+     * wrong script fails here, where it is wrong, rather than as a misleading transport
+     * error at the client. */
     char const *response_body;             /**< Body to send instead of the script's default literal. */
     char const *response_content_type;     /**< Content-Type value; null omits the header entirely. */
 
     /* Script outputs - valid only after fixture_server_join. Reflect the LAST request parsed. */
     USize  connection_count;               /**< Number of TCP connections actually accepted. */
     USize  request_count;                  /**< Total requests parsed across every connection. */
+    USize  script_refused;                 /**< Responses the fixture refused to send (see below); 0 in a healthy run. */
     char   request_method[16];             /**< NUL-terminated, truncated if longer. */
     char   request_path[256];              /**< NUL-terminated, truncated if longer. */
     char   request_headers[4096];          /**< Raw header block (no request line, no blank terminator), NUL-terminated. */

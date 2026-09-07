@@ -241,29 +241,44 @@ static bool _fixture_parse_request(Net_Socket const conn, bool const first, Fixt
 
 /* Renders the optional Content-Type header line for the two scriptable responses. A null
  * content_type yields an EMPTY line, so an unscripted FIXTURE_SCRIPT_OK / _STATUS emits the
- * exact bytes it always did - the http/client suite's own totals must not move. */
-static void _fixture_content_type_line(char const *const content_type, char *const line, USize const line_size) {
+ * exact bytes it always did - the http/client suite's own totals must not move. Answers
+ * false when the value does not fit `line`, so an over-long Content-Type is refused with
+ * the body rather than silently cut in half by snprintf. */
+static bool _fixture_content_type_line(char const *const content_type, char *const line, USize const line_size) {
     line[0] = '\0';
 
     if (content_type == nullptr) {
-        return;
+        return true;
     }
 
-    snprintf(line, line_size, "Content-Type: %s\r\n", content_type);
+    I32 const written = snprintf(line, line_size, "Content-Type: %s\r\n", content_type);
+
+    if (written < 0 || (USize) written >= line_size) {
+        line[0] = '\0';
+
+        return false;
+    }
+
+    return true;
 }
 
-static bool _fixture_respond_ok(Net_Socket const conn, char const *const response_body, char const *const content_type) {
-    char const *const body = response_body != nullptr ? response_body : "ok-body-content";
+/* The two scriptable responders answer true to CLOSE the connection and false to keep it
+ * open for another request. A refusal takes the true path - the fixture has nothing to send,
+ * so holding the connection open would only strand the client on a read that never
+ * completes - and records itself in self->script_refused for the suite to assert on. */
+static bool _fixture_respond_ok(Net_Socket const conn, Fixture_Server *const self) {
+    char const *const body = self->response_body != nullptr ? self->response_body : "ok-body-content";
     char content_type_line[256] = DEFAULT_INITIALIZATION;
 
     // A body the buffer cannot hold is refused outright rather than truncated under a
     // Content-Length that still claims the full size - that would fail at the client with a
     // misleading short-read instead of here, where the script is wrong.
-    if (char_length(body) + _FIXTURE_RESPONSE_HEADER_ROOM > _FIXTURE_RESPONSE_SIZE) {
-        return false;
-    }
+    if (char_length(body) + _FIXTURE_RESPONSE_HEADER_ROOM > _FIXTURE_RESPONSE_SIZE
+        || !_fixture_content_type_line(self->response_content_type, content_type_line, sizeof(content_type_line))) {
+        self->script_refused += 1;
 
-    _fixture_content_type_line(content_type, content_type_line, sizeof(content_type_line));
+        return true;
+    }
 
     char response[_FIXTURE_RESPONSE_SIZE] = DEFAULT_INITIALIZATION;
     I32 const written = snprintf(response, sizeof(response),
@@ -285,16 +300,18 @@ static bool _fixture_respond_ok(Net_Socket const conn, char const *const respons
     return true;
 }
 
-static bool _fixture_respond_status(Net_Socket const conn, USize const status_code, char const *const response_body, char const *const content_type) {
-    char const *const body   = response_body != nullptr ? response_body : "status-body";
-    char const *const reason = status_code == 404 ? "Not Found" : status_code == 500 ? "Internal Server Error" : "Status";
+static bool _fixture_respond_status(Net_Socket const conn, Fixture_Server *const self) {
+    USize const       status_code = self->status_code;
+    char const *const body        = self->response_body != nullptr ? self->response_body : "status-body";
+    char const *const reason      = status_code == 404 ? "Not Found" : status_code == 500 ? "Internal Server Error" : "Status";
     char content_type_line[256] = DEFAULT_INITIALIZATION;
 
-    if (char_length(body) + _FIXTURE_RESPONSE_HEADER_ROOM > _FIXTURE_RESPONSE_SIZE) {
-        return false;
-    }
+    if (char_length(body) + _FIXTURE_RESPONSE_HEADER_ROOM > _FIXTURE_RESPONSE_SIZE
+        || !_fixture_content_type_line(self->response_content_type, content_type_line, sizeof(content_type_line))) {
+        self->script_refused += 1;
 
-    _fixture_content_type_line(content_type, content_type_line, sizeof(content_type_line));
+        return true;
+    }
 
     char response[_FIXTURE_RESPONSE_SIZE] = DEFAULT_INITIALIZATION;
     I32 const written = snprintf(response, sizeof(response),
@@ -507,8 +524,8 @@ static bool _fixture_respond_keep_alive(Net_Socket const conn, USize const reque
 /* Returns true when the connection should close after this response. */
 static bool _fixture_dispatch(Net_Socket const conn, Fixture_Server *const self, char const *const path, USize const request_number) {
     switch (self->script) {
-        case FIXTURE_SCRIPT_OK:            return _fixture_respond_ok(conn, self->response_body, self->response_content_type);
-        case FIXTURE_SCRIPT_STATUS:        return _fixture_respond_status(conn, self->status_code, self->response_body, self->response_content_type);
+        case FIXTURE_SCRIPT_OK:            return _fixture_respond_ok(conn, self);
+        case FIXTURE_SCRIPT_STATUS:        return _fixture_respond_status(conn, self);
         case FIXTURE_SCRIPT_REDIRECT:      return _fixture_respond_redirect(conn, path);
         case FIXTURE_SCRIPT_REDIRECT_LOOP: return _fixture_respond_redirect_loop(conn);
         case FIXTURE_SCRIPT_REDIRECT_FTP:  return _fixture_respond_redirect_ftp(conn);

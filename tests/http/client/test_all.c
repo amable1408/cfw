@@ -22,8 +22,10 @@
  * not depend on handle history), default and overridden User-Agent as the peer sees it, response_code
  * staying 0 after a transport failure, keep-alive counting exactly one connection across two
  * requests, the response buffer being cleared between calls, http_client_result_uninit being
- * idempotent, two clients on one thread staying independent, and the escape_1 family
- * (unreserved/space/UTF-8/empty).
+ * idempotent, two clients on one thread staying independent, the escape_1 family
+ * (unreserved/space/UTF-8/empty), escape_3 agreeing with the RFC 3986 rule on every byte
+ * 0x00-0xFF (the parity pin that gated moving the family off curl_easy_escape onto
+ * http_query_encode_2), and the fixture COUNTING and CLOSING on a script it cannot send.
  *
  * No network beyond loopback; every port is OS-assigned; every wait is timeout-bounded so a
  * broken peer cannot hang the suite.
@@ -803,8 +805,8 @@ static void _test_method_lines_and_bodies(Test *const test) {
 
     /* GET on a completely FRESH handle - libcurl's own "CURLOPT_POSTFIELDS implies
      * CURLOPT_POST" rule (unconditional, even for a nullptr value) used to flip
-     * every http_client_get into a POST + "Content-Length: 0" on the wire; this
-     * is the Critical-1 pin the suite never had before. */
+     * every http_client_get into a POST + "Content-Length: 0" on the wire. This
+     * pins that a fresh handle's GET reaches the server as a bare GET. */
     {
         Fixture_Server server = DEFAULT_INITIALIZATION;
         server.script = FIXTURE_SCRIPT_OK;
@@ -1042,7 +1044,7 @@ static void _test_method_lines_and_bodies(Test *const test) {
     }
 
     /* DELETE on `client`, which has already POSTed and PUT above in this same function - the
-     * exact handle history High-1 flags: CURLOPT_POSTFIELDS "implies POST" on setopt, so without
+     * handle history that matters: CURLOPT_POSTFIELDS "implies POST" on setopt, so without
      * resetting the handle to GET before CUSTOMREQUEST, this DELETE would carry the prior
      * request's POST semantics (Content-Length: 0) instead of a bare, body-less DELETE. */
     {
@@ -1069,7 +1071,7 @@ static void _test_method_lines_and_bodies(Test *const test) {
         }
     }
 
-    /* DELETE on a completely FRESH handle - the other half of the High-1 pin: a handle that has
+    /* DELETE on a completely FRESH handle - the other half of that pin: a handle that has
      * never POSTed must not carry a stale Content-Length either (this leg was already GET-shaped
      * before the fix; kept as the paired assertion so a future regression that reintroduces the
      * bug for ONLY the "used handle" case cannot slip through unnoticed). */
@@ -1343,6 +1345,140 @@ static void _test_escape_vectors(Test *const test) {
     string_uninit(&utf8);
     string_uninit(&empty);
     http_client_delete(&client);
+
+    test_case_end(test);
+}
+
+static void _test_escape_matches_rfc_3986_every_byte(Test *const test) {
+    test_case_begin(test, "http_client_escape_3: every byte 0x00-0xFF encodes exactly as RFC 3986 says (curl_easy_escape parity)");
+
+    /* The pin that gated moving the escape family off curl_easy_escape onto http_query_encode_2.
+     * The expected form is DERIVED from the RFC 3986 rule here, not read back out of curl: a pin
+     * that asks the replaced implementation what it did could only ever agree with it, including
+     * where both are wrong. escape_3 rather than escape_1 because 0x00 is one of the 256 bytes
+     * and a NUL-terminated argument cannot carry it. */
+    HTTP_Client *client = http_client_new();
+
+    char const *const hex_digits        = "0123456789ABCDEF";
+    USize             mismatch_count    = 0;
+    USize             passthrough_count = 0;
+    USize             escaped_count     = 0;
+
+    for (USize value = 0; value < 256; value += 1) {
+        char const byte     = (char) value;
+        char       expected[4] = DEFAULT_INITIALIZATION;
+
+        if ((byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') || (byte >= '0' && byte <= '9')
+            || byte == '-' || byte == '.' || byte == '_' || byte == '~') {
+            expected[0]        = byte;
+            passthrough_count += 1;
+        } else {
+            expected[0]    = '%';
+            expected[1]    = hex_digits[(value >> 4) & 0x0F];
+            expected[2]    = hex_digits[value & 0x0F];
+            escaped_count += 1;
+        }
+
+        String       source        = string_init_static(&byte, 1);
+        String       encoded       = http_client_escape_3(client, &source);
+        USize const  expected_size = char_length(expected);
+
+        if (string_get_size(&encoded) != expected_size || memcmp(string_get_data(&encoded), expected, expected_size) != 0) {
+            mismatch_count += 1;
+        }
+
+        string_uninit(&encoded);
+        string_uninit(&source);
+    }
+
+    test_expect_u(test, "66 bytes are RFC 3986 unreserved and pass through", 66, passthrough_count);
+    test_expect_u(test, "the other 190 bytes escape to uppercase %XX", 190, escaped_count);
+    test_expect_u(test, "no byte in 0x00-0xFF disagrees with the RFC 3986 rule", 0, mismatch_count);
+
+    http_client_delete(&client);
+
+    test_case_end(test);
+}
+
+static void _test_fixture_refuses_unsendable_script_and_closes(Test *const test) {
+    test_case_begin(test, "fixture: a script the response buffer cannot hold is REFUSED, counted, and the connection closed");
+
+    /* The fixture's refusal used to be silent: it returned false, which the connection loop read
+     * as "keep this connection open", so a wrong script reached the client as an empty reply or a
+     * timeout with nothing pointing back at the script. It now counts itself and closes, so a
+     * script that cannot be sent fails at this assertion instead of as a transport error. */
+    char body[2000] = DEFAULT_INITIALIZATION;
+
+    memset(body, 'x', sizeof(body) - 1);
+
+    Fixture_Server server = DEFAULT_INITIALIZATION;
+    server.script          = FIXTURE_SCRIPT_OK;
+    server.response_body   = body;
+    server.max_connections = 1;
+
+    if (!_start(test, &server)) {
+        test_case_end(test);
+
+        return;
+    }
+
+    char url[64] = DEFAULT_INITIALIZATION;
+    _url_for(fixture_server_port(&server), "/", url, sizeof(url));
+
+    HTTP_Client       *client   = http_client_new();
+    String             response = string_init_1();
+    HTTP_Client_Result result   = http_client_get(client, url, &response);
+
+    fixture_server_join(&server);
+
+    test_expect_u(test, "the fixture counted exactly one refused response", 1, server.script_refused);
+    test_expect_u(test, "the request itself was parsed before the response was refused", 1, server.request_count);
+    test_expect_false(test, "the client sees a transport failure, not a hang", result.success);
+    test_expect_u(test, "and no body bytes arrived", 0, string_get_size(&response));
+
+    http_client_result_uninit(&result);
+    string_uninit(&response);
+    http_client_delete(&client);
+    string_uninit(&server.request_body);
+
+    test_case_end(test);
+}
+
+static void _test_fixture_refuses_oversized_content_type(Test *const test) {
+    test_case_begin(test, "fixture: a Content-Type too long for its line buffer is refused too, never silently truncated");
+
+    char content_type[400] = DEFAULT_INITIALIZATION;
+
+    memset(content_type, 'c', sizeof(content_type) - 1);
+
+    Fixture_Server server = DEFAULT_INITIALIZATION;
+    server.script                = FIXTURE_SCRIPT_STATUS;
+    server.status_code           = 404;
+    server.response_content_type = content_type;
+    server.max_connections       = 1;
+
+    if (!_start(test, &server)) {
+        test_case_end(test);
+
+        return;
+    }
+
+    char url[64] = DEFAULT_INITIALIZATION;
+    _url_for(fixture_server_port(&server), "/", url, sizeof(url));
+
+    HTTP_Client       *client   = http_client_new();
+    String             response = string_init_1();
+    HTTP_Client_Result result   = http_client_get(client, url, &response);
+
+    fixture_server_join(&server);
+
+    test_expect_u(test, "the fixture counted the refusal", 1, server.script_refused);
+    test_expect_false(test, "no half-written header reached the client", result.success);
+
+    http_client_result_uninit(&result);
+    string_uninit(&response);
+    http_client_delete(&client);
+    string_uninit(&server.request_body);
 
     test_case_end(test);
 }
@@ -1631,6 +1767,9 @@ int main(void) {
     _test_result_uninit_idempotent(&test);
     _test_two_clients_one_thread_independent(&test);
     _test_escape_vectors(&test);
+    _test_escape_matches_rfc_3986_every_byte(&test);
+    _test_fixture_refuses_unsendable_script_and_closes(&test);
+    _test_fixture_refuses_oversized_content_type(&test);
     _test_empty_string_str_payload_no_abort(&test);
     _test_perform_resets_active_response_and_postfields(&test);
     _test_refused_arena_response_write_reports_truncation(&test);

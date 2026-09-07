@@ -36,6 +36,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - sync: container/string, http/headers, http/service/ip_block, net
 - sync: http/cookie, http/query
 - `http/service/permission`
+- sync: http/client
 
 ## 0.2.0 - release
 

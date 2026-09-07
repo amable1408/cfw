@@ -1,5 +1,16 @@
-/*
- * http_client.h - HTTP client wrapper (libcurl-based) for the C Libraries Framework
+/* ============================================================================
+ *  CFW — HTTP Client (libcurl)
+ *  --------------------------------------------------------------------------
+ *  @file    http_client.h
+ *  @brief   Blocking HTTP client wrapper over libcurl, behind an opaque, reusable handle.
+ *  @version 0.3.0
+ *  @license MIT (see LICENSE file)
+ *
+ *  General-purpose (no project coupling). Wraps one libcurl easy handle per
+ *  client: every request is blocking, answers its outcome as data rather than
+ *  aborting, and keeps its response state on the handle that made it. URL
+ *  escaping is delegated to http/query, so the tree carries one percent-encoder
+ *  rather than a second copy behind curl_easy_escape.
  *
  * Features:
  *   - Blocking GET / POST / PUT / DELETE / HEAD over an opaque, reusable handle
@@ -11,9 +22,10 @@
  *     budget) so a hostile or misbehaving server cannot exhaust memory
  *   - Per-handle request headers and per-handle last-response headers/status -
  *     no state shared between two clients on the same thread
- *   - URL escaping (char* or String)
+ *   - URL escaping (char* or String), percent-encoded by http/query - one
+ *     encoder in the tree, not a second copy behind curl_easy_escape
  *
- * Usage Example:
+ * Usage Examples:
  *   @code
  *   HTTP_Client *client = http_client_new();
  *   String response = string_init_1();
@@ -113,7 +125,13 @@
  *     consumer's override never leaks into a later request on the same handle.
  *
  * Dependencies:
- *   - <curl/curl.h>, <pthread.h>, <container/string/string.h>
+ *   - <curl/curl.h>, <pthread.h>, <container/string/string.h>,
+ *     <http/query/query.h>
+ *   - <http/query/query.h>: the escape family's percent-encoder. Included here
+ *     rather than in the .c per the tree's "includes live in the header"
+ *     convention; it pulls only arena/str/string, so no cycle and no new
+ *     third-party dependency. Every makefile that compiles http_client.c must
+ *     also compile include/http/query/query.c.
  *   - <pthread.h>: pthread_once/pthread_once_t gate the process-wide
  *     curl_global_init in the .c. Needed on both platforms this tree builds
  *     for - MinGW ships a full winpthreads-backed <pthread.h> on Windows,
@@ -124,6 +142,7 @@
  *     live in the header" convention.
  *
  * See http_client.c for implementation details.
+ * ============================================================================
  */
 #ifndef HTTP_CLIENT_H
 #define HTTP_CLIENT_H
@@ -132,6 +151,7 @@
 #include <pthread.h>
 
 #include <container/string/string.h>
+#include <http/query/query.h>
 
 #if !CURL_AT_LEAST_VERSION(7, 85, 0)
 #error "http/client requires libcurl >= 7.85 (CURLOPT_REDIR_PROTOCOLS_STR)"
@@ -213,22 +233,32 @@ typedef struct {
 void http_client_delete(HTTP_Client **const self);
 
 /**
- * @brief URL-encode raw string data. `self` is accepted for a stable API across
- *        the escape family but not consulted (curl_easy_escape's handle
- *        parameter is itself unused by libcurl).
- * @param self HTTP client handle.
+ * @brief URL-encode raw string data per RFC 3986 (unreserved set through,
+ *        every other byte "%XX" with uppercase hex, a space "%20"). Encoding is
+ *        done by http_query_encode_2, not curl_easy_escape - byte-for-byte the
+ *        same output, one fewer allocation and copy. `self` is accepted for a
+ *        stable API across the escape family but not consulted (curl_easy_escape
+ *        never consulted its handle parameter either); it is still null-CHECKED,
+ *        so passing nullptr aborts rather than being quietly ignored, and it
+ *        retires at this family's next MAJOR.
+ * @param self HTTP client handle: must be non-null (checked), though unused.
  * @param data Raw string data.
- * @return Encoded String. Empty input and input longer than INT_MAX both
- *         answer an empty String rather than aborting.
+ * @return Encoded String. Empty input and input longer than
+ *         HTTP_QUERY_ENCODE_MAX_SIZE (1 MiB) both answer an empty String rather
+ *         than aborting; the oversized case is logged at WARN, since the two
+ *         are otherwise indistinguishable at the call site.
  */
 String http_client_escape_1(HTTP_Client const *const self, char const *const data);
 
 /**
- * @brief URL-encode String data. See http_client_escape_1 for the `self` note.
- * @param self HTTP client handle.
+ * @brief URL-encode String data. See http_client_escape_1 for the `self` note
+ *        and the encoder behind both.
+ * @param self HTTP client handle: must be non-null (checked), though unused.
  * @param data Raw String data.
- * @return Encoded String. Empty input and input longer than INT_MAX both
- *         answer an empty String rather than aborting.
+ * @return Encoded String. Empty input and input longer than
+ *         HTTP_QUERY_ENCODE_MAX_SIZE (1 MiB) both answer an empty String rather
+ *         than aborting; the oversized case is logged at WARN, since the two
+ *         are otherwise indistinguishable at the call site.
  */
 String http_client_escape_3(HTTP_Client const *const self, String const *const data);
 
