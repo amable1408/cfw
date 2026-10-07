@@ -48,6 +48,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - `http/service/csrf`
 - sync: process
 - `http/service/email`
+- `http/service/oauth`
 
 ## 0.2.0 - release
 

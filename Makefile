@@ -174,6 +174,11 @@ $(UNCHECKED_BIN): %$(EXE): %.c $(HARNESS) libcfw_unchecked.a
 tests/http/service/captcha/test_all$(EXE) tests/http/service/captcha/test_unchecked$(EXE): SUITE_EXTRA_INC := -Itests/http/client
 tests/http/service/captcha/test_all$(EXE) tests/http/service/captcha/test_unchecked$(EXE): SUITE_EXTRA_SRC := tests/http/client/fixture.c
 tests/http/service/captcha/test_all$(EXE) tests/http/service/captcha/test_unchecked$(EXE): tests/http/client/fixture.c tests/http/client/fixture.h
+# tests/http/service/oauth borrows tests/http/client rather than carrying a second copy of it; the per-suite
+# wildcard in the recipes above only ever sees a suite's OWN directory.
+tests/http/service/oauth/test_all$(EXE) tests/http/service/oauth/test_unchecked$(EXE): SUITE_EXTRA_INC := -Itests/http/client
+tests/http/service/oauth/test_all$(EXE) tests/http/service/oauth/test_unchecked$(EXE): SUITE_EXTRA_SRC := tests/http/client/fixture.c
+tests/http/service/oauth/test_all$(EXE) tests/http/service/oauth/test_unchecked$(EXE): tests/http/client/fixture.c tests/http/client/fixture.h
 
 test-unchecked: $(UNCHECKED_BIN)
 	@status=0; failed=""; \
