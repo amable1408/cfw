@@ -4,6 +4,10 @@
 
 #include <http/service/oauth/oauth.h>
 
+// char.h is singled out because it declares no TYPES at all: no header's API can ever name one,
+// so every chain that happens to reach it is accidental and a file using char_* owes it directly.
+#include <char/char.h>
+
 /*==============================================================================
  * MARK: - Constants
  *============================================================================*/
@@ -48,6 +52,19 @@ struct HTTP_Service_OAuth_Row {
     Str token_url;
 };
 
+/* What a row snapshot answered. A bool plus an optional `found` out-parameter could express a
+ * state it can never hold (true with found == false), cost every interested caller four lines
+ * to carry one bit, and left the uninterested callers passing a nullptr whose meaning lived in
+ * a comment. Three named outcomes make the impossible state unrepresentable. */
+typedef enum {
+    /** @brief The row was copied; `out` is the caller's to uninit. */
+    _HTTP_SERVICE_OAUTH_SNAPSHOT_OK,
+    /** @brief The row EXISTS and the allocator refused its copy - "misconfigured". */
+    _HTTP_SERVICE_OAUTH_SNAPSHOT_REFUSED,
+    /** @brief No row carries that name - "unknown_provider". */
+    _HTTP_SERVICE_OAUTH_SNAPSHOT_UNKNOWN
+} _HTTP_Service_OAuth_Snapshot;
+
 /*==============================================================================
  * MARK: - Helpers
  *============================================================================*/
@@ -69,9 +86,13 @@ static char const* _http_service_oauth_str_text(Str const *const self) {
     return str_get_size(self) == 0 ? "" : str_get_data(self);
 }
 
-static bool _http_service_oauth_char_has_query(char const *const data) {
+static bool _http_service_oauth_char_contains(char const *const data, char const character) {
+    if (data == nullptr) {
+        return false;
+    }
+
     for (USize i = 0; data[i] != '\0'; i += 1) {
-        if (data[i] == '?') {
+        if (data[i] == character) {
             return true;
         }
     }
@@ -81,7 +102,7 @@ static bool _http_service_oauth_char_has_query(char const *const data) {
 
 /* An access token is DATA that arrived from a token endpoint, and it is pasted into a header
  * line. A CR or LF inside it would end that line and start a header the caller never wrote. */
-static bool _http_service_oauth_char_line_break(char const *const data, USize const size) {
+static bool _http_service_oauth_char_line_break_2(char const *const data, USize const size) {
     if (data == nullptr) {
         return false;
     }
@@ -93,6 +114,20 @@ static bool _http_service_oauth_char_line_break(char const *const data, USize co
     }
 
     return false;
+}
+
+// The NUL-terminated spelling, for the configuration fields and the verbatim URL fragment.
+static bool _http_service_oauth_char_line_break_1(char const *const data) {
+    return _http_service_oauth_char_line_break_2(data, data == nullptr ? 0 : char_length(data));
+}
+
+/* RFC 7636 4.1's 43..128 chars, the one rule both halves of the PKCE pair enforce: the challenge
+ * derivation refuses a verifier outside it, and the exchange refuses one before spending a round
+ * trip to be told invalid_grant. One predicate, so a future bound change has one home. */
+static bool _http_service_oauth_pkce_verifier_valid(char const *const verifier) {
+    USize const verifier_size = verifier == nullptr ? 0 : char_length(verifier);
+
+    return verifier_size >= _HTTP_SERVICE_OAUTH_PKCE_VERIFIER_MIN_SIZE && verifier_size <= _HTTP_SERVICE_OAUTH_PKCE_VERIFIER_MAX_SIZE;
 }
 
 static void* _http_service_oauth_try_borrow(HTTP_Service_OAuth const *const self, USize const byte_count) {
@@ -240,6 +275,36 @@ static bool _http_service_oauth_row_build(HTTP_Service_OAuth const *const self, 
         return false;
     }
 
+    /* Refused ONCE at the boundary rather than per call. authorize_url is appended to the
+     * authorize URL verbatim - the one configured piece that never passes through an encoder -
+     * and that URL lands in a caller's "Location:" header, where a CR or LF pasted in with a
+     * line break ends the header. The other eight are covered too, so every "oauth: provider=%s"
+     * log line stays a single line for every registered name. _row_snapshot builds through this
+     * same function, so a stored row can never fail the test later. */
+    if (_http_service_oauth_char_line_break_1(provider->authorize_url) ||
+        _http_service_oauth_char_line_break_1(provider->client_id)     ||
+        _http_service_oauth_char_line_break_1(provider->client_secret) ||
+        _http_service_oauth_char_line_break_1(provider->name)          ||
+        _http_service_oauth_char_line_break_1(provider->profile_url)   ||
+        _http_service_oauth_char_line_break_1(provider->redirect_uri)  ||
+        _http_service_oauth_char_line_break_1(provider->revoke_url)    ||
+        _http_service_oauth_char_line_break_1(provider->scope)         ||
+        _http_service_oauth_char_line_break_1(provider->token_url)) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    /* The authorize URL builder appends its parameters after the configured endpoint and only
+     * looks for "?" to pick the separator. An endpoint carrying a "#" fragment would take every
+     * parameter AFTER the fragment, where no server sees them - a login that can never complete,
+     * and one this module cannot fix per call. Refused here, where the operator can fix it. */
+    if (_http_service_oauth_char_contains(provider->authorize_url, '#')) {
+        trace_log_pop();
+
+        return false;
+    }
+
     bool built = true;
 
     built = _http_service_oauth_str_build(self, provider->authorize_url, &out->authorize_url) && built;
@@ -336,11 +401,14 @@ static USize _http_service_oauth_provider_at(HTTP_Service_OAuth const *const sel
  * A borrowed Str would not do: the row it points into can be replaced by provider_add while
  * the request is in flight, and the replacement releases the old bytes.
  *
- * `found` is OPTIONAL and answers what the bool return cannot: false means the registry holds no
- * such name, true means the row EXISTS and its copy was refused. Those are two different operator
- * problems - "you never registered google" versus "this service is out of memory" - and folding
- * them into one answer sent an operator hunting a registration bug that did not exist. */
-static bool _http_service_oauth_row_snapshot(HTTP_Service_OAuth *const self, char const *const provider, HTTP_Service_OAuth_Row *const out, bool *const found) {
+ * UNKNOWN and REFUSED are two different operator problems - "you never registered google"
+ * versus "this service is out of memory" - and folding them into one answer sent an operator
+ * hunting a registration bug that did not exist. Only the REFUSED branch logs: there the name is
+ * a REGISTERED one, so the line cannot carry a string that came straight off a route parameter.
+ * The public entry points that log the name BEFORE this lookup (get_authorize_url_2's refusals,
+ * get_profile_1/_2's, revoke_2's missing endpoint) each refuse a CR/LF provider by value first,
+ * so every "oauth: provider=%s" line in this module stays one line whatever the route sent. */
+static _HTTP_Service_OAuth_Snapshot _http_service_oauth_row_snapshot(HTTP_Service_OAuth *const self, char const *const provider, HTTP_Service_OAuth_Row *const out) {
     trace_log_push(LOG_METADATA);
 
     error_check_null(LOG_METADATA, "self", (void*) self);
@@ -348,10 +416,6 @@ static bool _http_service_oauth_row_snapshot(HTTP_Service_OAuth *const self, cha
     error_check_null(LOG_METADATA, "out", (void*) out);
 
     *out = (HTTP_Service_OAuth_Row) DEFAULT_INITIALIZATION;
-
-    if (found != nullptr) {
-        *found = false;
-    }
 
     thread_mutex_lock(&self->mutex);
 
@@ -362,11 +426,7 @@ static bool _http_service_oauth_row_snapshot(HTTP_Service_OAuth *const self, cha
 
         trace_log_pop();
 
-        return false;
-    }
-
-    if (found != nullptr) {
-        *found = true;
+        return _HTTP_SERVICE_OAUTH_SNAPSHOT_UNKNOWN;
     }
 
     HTTP_Service_OAuth_Provider const view = _http_service_oauth_row_view(&self->rows[index]);
@@ -374,9 +434,13 @@ static bool _http_service_oauth_row_snapshot(HTTP_Service_OAuth *const self, cha
 
     thread_mutex_unlock(&self->mutex);
 
+    if (!copied) {
+        log_message_1(LOG_LEVEL_WARN, "oauth: provider=%s row copy refused - the allocator is exhausted, call answered as misconfigured\n", provider);
+    }
+
     trace_log_pop();
 
-    return copied;
+    return copied ? _HTTP_SERVICE_OAUTH_SNAPSHOT_OK : _HTTP_SERVICE_OAUTH_SNAPSHOT_REFUSED;
 }
 
 static void _http_service_oauth_string_add(String *const self, char const *const data) {
@@ -633,9 +697,13 @@ static void _http_service_oauth_token_parse(HTTP_Service_OAuth_Token *const toke
     ISize const now = datetime_now();
 
     /* An absolute deadline is what a caller actually stores; computing it here means the
-     * arithmetic is done once, beside the clock reading that justifies it. */
+     * arithmetic is done once, beside the clock reading that justifies it. expires_in is the
+     * PROVIDER's number, read from a JSON uint or a 20-digit string, so it is unbounded in a way
+     * state_issue's ttl is not. A wrap could only ever move the deadline EARLIER (both operands
+     * are non-negative), never make a token look valid forever - but a deadline in 1970 is still
+     * a lie, so it is clamped to "never", which is what a provider sending that number means. */
     if (token->expires_in > 0 && now > 0) {
-        token->expires_at = (USize) now + token->expires_in;
+        token->expires_at = token->expires_in > USIZE_MAX - (USize) now ? USIZE_MAX : (USize) now + token->expires_in;
     }
 
     json_delete(&json);
@@ -777,9 +845,28 @@ static HTTP_Service_OAuth_Profile _http_service_oauth_profile_refused(HTTP_Servi
     return profile;
 }
 
-// "provider|nonce|expiry" - the exact bytes the MAC covers, on both the issue and verify paths.
-static String _http_service_oauth_state_message(HTTP_Service_OAuth const *const self, char const *const provider, char const *const nonce, USize const nonce_size,
-    char const *const expiry, USize const expiry_size) {
+/* "<provider_size>:<provider>|<binding_size>:<binding>|nonce|expiry" - the exact bytes the MAC
+ * covers, on both the issue and verify paths.
+ *
+ * The binding is what makes a state token a login-CSRF defence at all. Without it the MAC proves
+ * only that THIS service minted the token for THIS provider within the TTL - true of every token
+ * it ever minted, including one an attacker obtained from /start on their own browser and
+ * planted in a victim's callback URL next to the attacker's own code (RFC 6749 10.12). Folding
+ * the caller's binding in ties the token to the user agent that started the login, and keeps
+ * the token stateless: nothing is stored, the callback supplies the same binding again.
+ *
+ * Both variable fields are LENGTH-PREFIXED, not merely delimited: a binding is arbitrary caller
+ * bytes and may contain "|", so "ab" + "c" and "a" + "bc" must produce different messages. The
+ * provider is a route parameter and may contain "|" just the same - and with only the binding
+ * prefixed, provider "x" + binding "3:abc|0:" spelled the very bytes of provider "x|8:3:abc" +
+ * the empty binding, so a token issued under one pair verified under the other. Not exploitable
+ * (it needs the victim's binding either way) but an ambiguity in a MAC message all the same, so
+ * the provider carries the same decimal "<size>:" prefix since 0.3.0. The nonce is exactly
+ * 2x _NONCE_SIZE hex chars and the expiry decimal digits only - both pinned by state_verify_2 -
+ * so no other field can absorb a neighbour's bytes either. A null binding is only ever reached
+ * here with a size of 0, which the add below skips: string_add_2 contract-checks its data. */
+static String _http_service_oauth_state_message(HTTP_Service_OAuth const *const self, char const *const provider, char const *const binding, USize const binding_size,
+    char const *const nonce, USize const nonce_size, char const *const expiry, USize const expiry_size) {
     trace_log_push(LOG_METADATA);
 
     error_check_null(LOG_METADATA, "self", (void*) self);
@@ -787,13 +874,32 @@ static String _http_service_oauth_state_message(HTTP_Service_OAuth const *const 
     error_check_null(LOG_METADATA, "nonce", (void*) nonce);
     error_check_null(LOG_METADATA, "expiry", (void*) expiry);
 
+    char binding_prefix[21]  = DEFAULT_INITIALIZATION;
+    char provider_prefix[21] = DEFAULT_INITIALIZATION;
+
+    static_assert(sizeof(binding_prefix) == 20 + 1, "the binding length prefix must hold a 20-digit USize plus a terminator");
+    static_assert(sizeof(provider_prefix) == 20 + 1, "the provider length prefix must hold a 20-digit USize plus a terminator");
+
+    char_from_numbers_uint_1(binding_prefix, sizeof(binding_prefix), binding_size);
+    char_from_numbers_uint_1(provider_prefix, sizeof(provider_prefix), char_length(provider));
+
     /* One allocator for every String this module builds, scratch included. _string_init is the
      * service's own initializer and answers the arena when the service has one; a bare
      * string_init_1 here would put half the module's storage on the heap and half in the arena,
      * which is one allocator too many for an operator sizing that arena to reason about. */
     String message = _http_service_oauth_string_init(self);
 
+    _http_service_oauth_string_add(&message, provider_prefix);
+    _http_service_oauth_string_add(&message, ":");
     _http_service_oauth_string_add(&message, provider);
+    _http_service_oauth_string_add(&message, "|");
+    _http_service_oauth_string_add(&message, binding_prefix);
+    _http_service_oauth_string_add(&message, ":");
+
+    if (binding_size > 0) {
+        string_add_last_2(&message, binding, binding_size);
+    }
+
     _http_service_oauth_string_add(&message, "|");
 
     string_add_last_2(&message, nonce, nonce_size);
@@ -805,6 +911,271 @@ static String _http_service_oauth_state_message(HTTP_Service_OAuth const *const 
     trace_log_pop();
 
     return message;
+}
+
+/* The binding is caller DATA - a session id or cookie value read off a request - so it is bounded
+ * and refused by value, never contract-checked: an oversized one, or a null one claiming a size,
+ * must not be able to abort the server from a callback URL. A size of 0 is the EMPTY binding
+ * whatever the pointer says: it is how the _1 tiers reach the cores, and the public _2 tiers
+ * refuse it before this is ever asked. */
+static bool _http_service_oauth_binding_valid(char const *const binding, USize const binding_size) {
+    if (binding_size == 0) {
+        return true;
+    }
+
+    return binding != nullptr && binding_size <= HTTP_SERVICE_OAUTH_STATE_BINDING_MAX_SIZE;
+}
+
+// The parsed shape this service mints: exactly 2x _NONCE_SIZE lowercase hex chars, nothing else.
+static bool _http_service_oauth_nonce_valid(char const *const nonce, USize const nonce_size) {
+    if (nonce == nullptr || nonce_size != _HTTP_SERVICE_OAUTH_NONCE_SIZE * 2) {
+        return false;
+    }
+
+    for (USize i = 0; i < nonce_size; i += 1) {
+        bool const digit = nonce[i] >= '0' && nonce[i] <= '9';
+        bool const hex   = nonce[i] >= 'a' && nonce[i] <= 'f';
+
+        if (!digit && !hex) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/* The provider name on the state paths is a route parameter, so it is bounded by value like the
+ * binding - the binding's cap is reused because the two fields sit side by side in the message
+ * and the point of either cap is the same: request data must not size the MAC scratch. The
+ * registry lookups bound it on their own (a name that long is never registered). */
+static bool _http_service_oauth_state_provider_valid(char const *const provider) {
+    return provider != nullptr && char_length(provider) <= HTTP_SERVICE_OAUTH_STATE_BINDING_MAX_SIZE;
+}
+
+/* The one state-issuing path. The binding is the caller's: the _1 tier passes the empty one,
+ * the _2 tier a non-empty one it has already insisted on, so this core accepts either and the
+ * tiers differ only in what they let through. Neither tier is more than a thin gate over this. */
+static bool _http_service_oauth_state_issue(HTTP_Service_OAuth *const self, char const *const provider, char const *const binding, USize const binding_size,
+    USize const ttl_seconds, char *const out) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+    error_check_null(LOG_METADATA, "provider", (void*) provider);
+    error_check_null(LOG_METADATA, "out", (void*) out);
+
+    if (_http_service_oauth_char_empty(provider) || ttl_seconds == 0) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    /* The provider and the binding are both caller data - a route parameter and a cookie - so
+     * both are bounded and refused by value, never contract-checked, and neither can size the
+     * MAC message: without the provider bound a 1 MiB name costs a 1 MiB scratch String here. */
+    if (!_http_service_oauth_state_provider_valid(provider) || !_http_service_oauth_binding_valid(binding, binding_size)) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    char nonce[(16 * 2) + 1] = DEFAULT_INITIALIZATION;
+
+    static_assert(sizeof(nonce) == (16 * 2) + 1, "the nonce buffer must hold 2 hex chars per random byte plus a terminator");
+
+    // Fail closed: without randomness there is no unguessable state, and a fixed one is worse.
+    if (result_is_error(crypto_random_hex(nonce, _HTTP_SERVICE_OAUTH_NONCE_SIZE))) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    ISize const now = datetime_now();
+
+    if (now <= 0) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    /* A ttl within reach of USIZE_MAX wraps "now + ttl_seconds" to a SMALL expiry, so the token
+     * is born already expired and every verify fails - a silently broken login rather than a
+     * refused configuration. Refusing here also removes the 20-digit expiry from the set of
+     * strings this service can MINT, which makes the verify side's char_to_numbers_uint_2 wrap
+     * unreachable by construction rather than merely gated behind the MAC. */
+    if ((USize) now > USIZE_MAX - ttl_seconds) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    char expiry[21] = DEFAULT_INITIALIZATION;
+
+    static_assert(sizeof(expiry) == 20 + 1, "the expiry buffer must hold a 20-digit USize plus a terminator; see _EXPIRY_MAX_SIZE");
+
+    char_from_numbers_uint_1(expiry, sizeof(expiry), (USize) now + ttl_seconds);
+
+    /* state_key and state_key_size are read WITHOUT the mutex, here and in _state_verify, and
+     * that is deliberate: both are written once by _construct before any thread can reach the
+     * service and zeroed once by uninit, and provider_add never touches either. Every other
+     * member access in this module is locked, so the one exception is worth naming. */
+    String      message = _http_service_oauth_state_message(self, provider, binding, binding_size, nonce, char_length(nonce), expiry, char_length(expiry));
+    char        mac[CRYPTO_HMAC_SHA256_HEX_SIZE + 1] = DEFAULT_INITIALIZATION;
+    Result const signature = crypto_hmac_sha256_hex_1((char const*) self->state_key, self->state_key_size, string_get_data(&message), string_get_size(&message), mac);
+
+    string_uninit(&message);
+
+    if (result_is_error(signature)) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    String state = _http_service_oauth_string_init(self);
+
+    _http_service_oauth_string_add(&state, nonce);
+    _http_service_oauth_string_add(&state, ".");
+    _http_service_oauth_string_add(&state, expiry);
+    _http_service_oauth_string_add(&state, ".");
+    _http_service_oauth_string_add(&state, mac);
+
+    USize const state_size = string_get_size(&state);
+
+    /* The documented buffer is the only thing this can write into, so an over-long token is a
+     * refusal rather than a truncated one a verify would reject days later. */
+    if (state_size == 0 || state_size > HTTP_SERVICE_OAUTH_STATE_MAX_SIZE) {
+        string_uninit(&state);
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    memory_copy_2(out, HTTP_SERVICE_OAUTH_STATE_MAX_SIZE + 1, string_get_data(&state), state_size);
+
+    out[state_size] = '\0';
+
+    string_uninit(&state);
+
+    trace_log_pop();
+
+    return true;
+}
+
+/* The one state-verifying path, the issue core's mirror: the same message, the same bounds on the
+ * same data, and an empty binding accepted here ONLY because _1 is the tier that passes it. */
+static bool _http_service_oauth_state_verify(HTTP_Service_OAuth *const self, char const *const provider, char const *const binding, USize const binding_size,
+    char const *const state) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+    error_check_null(LOG_METADATA, "provider", (void*) provider);
+
+    /* The state arrives on the callback URL, so it is DATA in the most literal sense: a
+     * GET /callback with no ?state= yields the null string_get_data of an empty String, and an
+     * error_check_null here would let any unauthenticated request abort the server. The binding
+     * is read off the same request (a cookie, a session id) and gets the same treatment, and so
+     * does the provider, a route parameter: bounded here so request data cannot size the MAC
+     * message. */
+    if (_http_service_oauth_char_empty(provider)                    ||
+        _http_service_oauth_char_empty(state)                       ||
+        !_http_service_oauth_state_provider_valid(provider)         ||
+        !_http_service_oauth_binding_valid(binding, binding_size)) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    USize const state_size = char_length(state);
+
+    if (state_size > HTTP_SERVICE_OAUTH_STATE_MAX_SIZE) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    USize first  = USIZE_MAX;
+    USize second = USIZE_MAX;
+    bool  shaped = true;
+
+    for (USize i = 0; i < state_size; i += 1) {
+        if (state[i] != '.') {
+            continue;
+        }
+
+        if (first == USIZE_MAX) {
+            first = i;
+        }
+        else if (second == USIZE_MAX) {
+            second = i;
+        }
+        else {
+            shaped = false;
+
+            break;
+        }
+    }
+
+    if (!shaped || first == USIZE_MAX || second == USIZE_MAX) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    char const *const nonce       = state;
+    USize      const  nonce_size  = first;
+    char const *const expiry      = state + first + 1;
+    USize      const  expiry_size = second - first - 1;
+    char const *const mac         = state + second + 1;
+    USize      const  mac_size    = state_size - second - 1;
+
+    /* The nonce is pinned to the exact shape this service mints - 32 hex chars - rather than
+     * merely non-empty, so no field of the MAC message can be made to absorb a neighbour: a
+     * nonce free to carry "|" or ":" could spell a binding prefix and its bytes. */
+    if (!_http_service_oauth_nonce_valid(nonce, nonce_size) || expiry_size == 0 || expiry_size > _HTTP_SERVICE_OAUTH_EXPIRY_MAX_SIZE || mac_size != CRYPTO_HMAC_SHA256_HEX_SIZE) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    for (USize i = 0; i < expiry_size; i += 1) {
+        if (expiry[i] < '0' || expiry[i] > '9') {
+            trace_log_pop();
+
+            return false;
+        }
+    }
+
+    /* The MAC covers the PROVIDER and the BINDING as well as the nonce and expiry, so a state
+     * minted for "github" cannot be replayed onto "google", and one minted on an attacker's
+     * browser cannot be replayed on a victim's - the callback that redeems a code has to be the
+     * same provider's callback, reached by the same user agent that started the login. */
+    // state_key is read unlocked here for the reason _state_issue states.
+    String message = _http_service_oauth_state_message(self, provider, binding, binding_size, nonce, nonce_size, expiry, expiry_size);
+
+    // Constant-time, and checked BEFORE the expiry so the two failures take the same shape.
+    bool const verified = crypto_hmac_sha256_verify_1((char const*) self->state_key, self->state_key_size, string_get_data(&message), string_get_size(&message), mac);
+
+    string_uninit(&message);
+
+    if (!verified) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    ISize const now = datetime_now();
+
+    if (now <= 0) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    bool const live = char_to_numbers_uint_2(expiry, expiry_size) > (USize) now;
+
+    trace_log_pop();
+
+    return live;
 }
 
 static bool _http_service_oauth_construct(HTTP_Service_OAuth *const self, U8 const *const key, USize const key_size) {
@@ -921,6 +1292,19 @@ HTTP_Service_OAuth_Token http_service_oauth_exchange_code_2(HTTP_Service_OAuth *
     error_check_null(LOG_METADATA, "self", (void*) self);
     error_check_null(LOG_METADATA, "provider", (void*) provider);
 
+    /* The provider name is a ROUTE PARAMETER, and this function logs it before the registry is
+     * consulted - so a CR or LF inside it would end that log line and start one nobody wrote.
+     * Refused by value first (it is data, not a contract): a name carrying a line break cannot be
+     * a registered one, registration refuses the same bytes. No log here - the name IS the
+     * problem. Answered in this function's own refusal shape. */
+    if (_http_service_oauth_char_line_break_1(provider)) {
+        HTTP_Service_OAuth_Token const token = _http_service_oauth_token_refused(self, "invalid_request");
+
+        trace_log_pop();
+
+        return token;
+    }
+
     /* The code comes off a browser redirect, so it is DATA - and a GET /callback with no ?code=
      * hands string_get_data of an empty String, which is a null pointer in this tree. It is
      * refused BY VALUE here; an error_check_null above would have aborted the server on it.
@@ -934,33 +1318,30 @@ HTTP_Service_OAuth_Token http_service_oauth_exchange_code_2(HTTP_Service_OAuth *
         return token;
     }
 
-    /* One half of the PKCE pair already validates: pkce_challenge_create enforces RFC 7636 4.1's
-     * 43..128 chars. A verifier outside that range cannot match a challenge this module derived,
-     * so sending it spends a whole round trip to be told invalid_grant - refused here instead,
-     * in the shape an empty code already gets. An empty or null verifier still means "no PKCE on
+    /* A verifier outside RFC 7636 4.1's range cannot match a challenge this module derived, so
+     * sending it spends a whole round trip to be told invalid_grant - refused here instead, in
+     * the shape an empty code already gets. This is the right LAYER for the refusal (a caller
+     * that generated its pair elsewhere is still covered); the RULE itself lives in the one
+     * predicate pkce_challenge_create shares. An empty or null verifier still means "no PKCE on
      * this exchange" and is not bounded. */
-    if (!_http_service_oauth_char_empty(code_verifier)) {
-        USize const verifier_size = char_length(code_verifier);
+    if (!_http_service_oauth_char_empty(code_verifier) && !_http_service_oauth_pkce_verifier_valid(code_verifier)) {
+        HTTP_Service_OAuth_Token const token = _http_service_oauth_token_refused(self, "invalid_request");
 
-        if (verifier_size < _HTTP_SERVICE_OAUTH_PKCE_VERIFIER_MIN_SIZE || verifier_size > _HTTP_SERVICE_OAUTH_PKCE_VERIFIER_MAX_SIZE) {
-            HTTP_Service_OAuth_Token const token = _http_service_oauth_token_refused(self, "invalid_request");
+        trace_log_pop();
 
-            trace_log_pop();
-
-            return token;
-        }
+        return token;
     }
 
-    HTTP_Service_OAuth_Row  row   = DEFAULT_INITIALIZATION;
-    bool                    found = false;
+    HTTP_Service_OAuth_Row              row      = DEFAULT_INITIALIZATION;
+    _HTTP_Service_OAuth_Snapshot const  snapshot = _http_service_oauth_row_snapshot(self, provider, &row);
 
-    if (!_http_service_oauth_row_snapshot(self, provider, &row, &found)) {
+    if (snapshot != _HTTP_SERVICE_OAUTH_SNAPSHOT_OK) {
         _http_service_oauth_row_uninit(&row);
 
         /* "misconfigured" when the row EXISTS and its copy was refused; "unknown_provider" only
          * when the name was never registered. The header has documented both since 0.2.0 and
          * this branch used to report the second for either. */
-        HTTP_Service_OAuth_Token const token = _http_service_oauth_token_refused(self, found ? "misconfigured" : "unknown_provider");
+        HTTP_Service_OAuth_Token const token = _http_service_oauth_token_refused(self, snapshot == _HTTP_SERVICE_OAUTH_SNAPSHOT_REFUSED ? "misconfigured" : "unknown_provider");
 
         trace_log_pop();
 
@@ -1026,6 +1407,17 @@ String http_service_oauth_get_authorize_url_2(HTTP_Service_OAuth *const self, ch
     String                      url = _http_service_oauth_string_init(self);
     HTTP_Service_OAuth_Row      row = DEFAULT_INITIALIZATION;
 
+    /* The provider name is a ROUTE PARAMETER, and this function logs it before the registry is
+     * consulted - so a CR or LF inside it would end that log line and start one nobody wrote.
+     * Refused by value first (it is data, not a contract): a name carrying a line break cannot be
+     * a registered one, registration refuses the same bytes. No log here - the name IS the
+     * problem. Answered in this function's own refusal shape. */
+    if (_http_service_oauth_char_line_break_1(provider)) {
+        trace_log_pop();
+
+        return url;
+    }
+
     /* The state is DATA the caller usually read off a request, so an absent one is a null
      * pointer, not an abort: string_get_data of an empty String is null in this tree. An empty
      * state would build "&state=" - a URL the provider echoes back with nothing for
@@ -1041,7 +1433,7 @@ String http_service_oauth_get_authorize_url_2(HTTP_Service_OAuth *const self, ch
      * defect this module already refuses for an access token before building "Authorization:
      * Bearer", one function away. Appending the fragment verbatim is the feature; appending a
      * header terminator is not. Refused as an unknown provider is: the empty URL. */
-    if (!_http_service_oauth_char_empty(extra_params) && _http_service_oauth_char_line_break(extra_params, char_length(extra_params))) {
+    if (_http_service_oauth_char_line_break_1(extra_params)) {
         log_message_1(LOG_LEVEL_ERROR, "oauth: provider=%s extra params contain CR/LF - refusing to build an authorize URL\n", provider);
 
         trace_log_pop();
@@ -1049,8 +1441,19 @@ String http_service_oauth_get_authorize_url_2(HTTP_Service_OAuth *const self, ch
         return url;
     }
 
-    // No `found` out-parameter: this builder has one refusal shape - the empty URL - for both.
-    if (!_http_service_oauth_row_snapshot(self, provider, &row, nullptr)) {
+    /* An S256 challenge is base64url of a 32-byte digest: 43 chars, always. One of any other
+     * length is sent today and refused at the provider - a round trip spent to learn what the
+     * exchange side already refuses for the verifier. Empty or null still means "no PKCE". */
+    if (!_http_service_oauth_char_empty(code_challenge) && char_length(code_challenge) != HTTP_SERVICE_OAUTH_PKCE_CHALLENGE_SIZE) {
+        log_message_1(LOG_LEVEL_ERROR, "oauth: provider=%s code challenge is not %d chars - refusing to build an authorize URL\n", provider, (I32) HTTP_SERVICE_OAUTH_PKCE_CHALLENGE_SIZE);
+
+        trace_log_pop();
+
+        return url;
+    }
+
+    // One refusal shape - the empty URL - for both the unknown and the refused outcome.
+    if (_http_service_oauth_row_snapshot(self, provider, &row) != _HTTP_SERVICE_OAUTH_SNAPSHOT_OK) {
         _http_service_oauth_row_uninit(&row);
 
         trace_log_pop();
@@ -1065,10 +1468,9 @@ String http_service_oauth_get_authorize_url_2(HTTP_Service_OAuth *const self, ch
 
     /* An authorize endpoint may already carry a query - a tenant id, a locale. Appending a
      * second "?" made the whole parameter list one opaque value of the first one. Only "?" is
-     * looked for: a configured endpoint carrying a "#" fragment would take these parameters
-     * after the fragment, where no server ever sees them. Configuration, not data - see the
-     * header's note on authorize_url. */
-    _http_service_oauth_string_add(&url, _http_service_oauth_char_has_query(authorize_url) ? "&" : "?");
+     * looked for, and that is enough: an endpoint carrying a "#" fragment never reaches this
+     * point, because _row_build refuses it at registration. */
+    _http_service_oauth_string_add(&url, _http_service_oauth_char_contains(authorize_url, '?') ? "&" : "?");
     _http_service_oauth_string_add(&url, "response_type=code&client_id=");
 
     /* Every encode is checked. A value over http/query's encode ceiling, or an allocator
@@ -1125,14 +1527,71 @@ String http_service_oauth_get_authorize_url(HTTP_Service_OAuth *const self, char
     return http_service_oauth_get_authorize_url_1(self, provider, state);
 }
 
-HTTP_Service_OAuth_Profile http_service_oauth_get_profile(HTTP_Service_OAuth *const self, char const *const provider, HTTP_Service_OAuth_Token const *const token) {
+HTTP_Service_OAuth_Profile http_service_oauth_get_profile_1(HTTP_Service_OAuth *const self, char const *const provider, HTTP_Service_OAuth_Token const *const token) {
     trace_log_push(LOG_METADATA);
 
     error_check_null(LOG_METADATA, "self", (void*) self);
     error_check_null(LOG_METADATA, "provider", (void*) provider);
     error_check_null(LOG_METADATA, "token", (void*) token);
 
-    if (string_empty(&token->access_token)) {
+    /* The provider name is a ROUTE PARAMETER, and this function logs it before the registry is
+     * consulted - so a CR or LF inside it would end that log line and start one nobody wrote.
+     * Refused by value first (it is data, not a contract): a name carrying a line break cannot be
+     * a registered one, registration refuses the same bytes. No log here - the name IS the
+     * problem. Answered in this function's own refusal shape. */
+    if (_http_service_oauth_char_line_break_1(provider)) {
+        HTTP_Service_OAuth_Profile const profile = _http_service_oauth_profile_refused(self, "invalid_request");
+
+        trace_log_pop();
+
+        return profile;
+    }
+
+    /* _2 always sends "Authorization: Bearer", so a token the provider issued under another
+     * scheme (RFC 6750 names MAC; some deployments answer "DPoP") would be presented wrongly
+     * and refused at the endpoint. Refused here instead, by value: the type is the provider's
+     * data. Case-insensitive, because GitHub spells it "bearer" and Google "Bearer". An EMPTY
+     * type is not refused - a provider that sends none is the common case this module assumes. */
+    if (!string_empty(&token->token_type) && !char_compare_iequal_2(string_get_data(&token->token_type), string_get_size(&token->token_type), "bearer", 6)) {
+        log_message_1(LOG_LEVEL_WARN, "oauth: provider=%s token type is not Bearer - refusing to present it as one\n", provider);
+
+        HTTP_Service_OAuth_Profile const profile = _http_service_oauth_profile_refused(self, "invalid_request");
+
+        trace_log_pop();
+
+        return profile;
+    }
+
+    // An empty String's data pointer is null, which _2 refuses by value as an empty token.
+    HTTP_Service_OAuth_Profile const profile = http_service_oauth_get_profile_2(self, provider, string_get_data(&token->access_token));
+
+    trace_log_pop();
+
+    return profile;
+}
+
+HTTP_Service_OAuth_Profile http_service_oauth_get_profile_2(HTTP_Service_OAuth *const self, char const *const provider, char const *const access_token) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+    error_check_null(LOG_METADATA, "provider", (void*) provider);
+
+    /* The provider name is a ROUTE PARAMETER, and this function logs it before the registry is
+     * consulted - so a CR or LF inside it would end that log line and start one nobody wrote.
+     * Refused by value first (it is data, not a contract): a name carrying a line break cannot be
+     * a registered one, registration refuses the same bytes. No log here - the name IS the
+     * problem. Answered in this function's own refusal shape. */
+    if (_http_service_oauth_char_line_break_1(provider)) {
+        HTTP_Service_OAuth_Profile const profile = _http_service_oauth_profile_refused(self, "invalid_request");
+
+        trace_log_pop();
+
+        return profile;
+    }
+
+    /* DATA, refused by value: an access token read back from storage absent arrives as the null
+     * string_get_data of an empty String, and an abort here would be reachable from a request. */
+    if (_http_service_oauth_char_empty(access_token)) {
         HTTP_Service_OAuth_Profile const profile = _http_service_oauth_profile_refused(self, "invalid_request");
 
         trace_log_pop();
@@ -1144,7 +1603,7 @@ HTTP_Service_OAuth_Profile http_service_oauth_get_profile(HTTP_Service_OAuth *co
      * terminates that line, and everything after becomes a header the caller never wrote - the
      * classic response-splitting shape, aimed here at the request. Refused before the line is
      * built, not sanitized: a token containing a line break is not a token this module minted. */
-    if (_http_service_oauth_char_line_break(string_get_data(&token->access_token), string_get_size(&token->access_token))) {
+    if (_http_service_oauth_char_line_break_1(access_token)) {
         log_message_1(LOG_LEVEL_ERROR, "oauth: provider=%s access token contains CR/LF - refusing to build a header from it\n", provider);
 
         HTTP_Service_OAuth_Profile const profile = _http_service_oauth_profile_refused(self, "invalid_request");
@@ -1154,14 +1613,14 @@ HTTP_Service_OAuth_Profile http_service_oauth_get_profile(HTTP_Service_OAuth *co
         return profile;
     }
 
-    HTTP_Service_OAuth_Row  row   = DEFAULT_INITIALIZATION;
-    bool                    found = false;
+    HTTP_Service_OAuth_Row              row      = DEFAULT_INITIALIZATION;
+    _HTTP_Service_OAuth_Snapshot const  snapshot = _http_service_oauth_row_snapshot(self, provider, &row);
 
-    if (!_http_service_oauth_row_snapshot(self, provider, &row, &found)) {
+    if (snapshot != _HTTP_SERVICE_OAUTH_SNAPSHOT_OK) {
         _http_service_oauth_row_uninit(&row);
 
         // See exchange_code_2: a refused row copy is "misconfigured", not a missing registration.
-        HTTP_Service_OAuth_Profile const profile = _http_service_oauth_profile_refused(self, found ? "misconfigured" : "unknown_provider");
+        HTTP_Service_OAuth_Profile const profile = _http_service_oauth_profile_refused(self, snapshot == _HTTP_SERVICE_OAUTH_SNAPSHOT_REFUSED ? "misconfigured" : "unknown_provider");
 
         trace_log_pop();
 
@@ -1173,9 +1632,9 @@ HTTP_Service_OAuth_Profile http_service_oauth_get_profile(HTTP_Service_OAuth *co
     String                      header      = _http_service_oauth_string_init(self);
     String                      response    = _http_service_oauth_string_init(self);
 
-    // A Bearer token is assumed; token.token_type is not consulted. See the header's Known gaps.
+    // A Bearer token is what this tier sends; _1 is where a token's own type gets checked.
     _http_service_oauth_string_add(&header, "Authorization: Bearer ");
-    _http_service_oauth_string_add(&header, string_get_data(&token->access_token));
+    _http_service_oauth_string_add(&header, access_token);
 
     http_client_header_add(client, string_get_data(&header));
     http_client_header_add(client, "Accept: application/json");
@@ -1227,6 +1686,10 @@ HTTP_Service_OAuth_Profile http_service_oauth_get_profile(HTTP_Service_OAuth *co
     trace_log_pop();
 
     return profile;
+}
+
+HTTP_Service_OAuth_Profile http_service_oauth_get_profile(HTTP_Service_OAuth *const self, char const *const provider, HTTP_Service_OAuth_Token const *const token) {
+    return http_service_oauth_get_profile_1(self, provider, token);
 }
 
 bool http_service_oauth_init_1(HTTP_Service_OAuth *const self) {
@@ -1293,10 +1756,8 @@ bool http_service_oauth_pkce_challenge_create(char const *const verifier, char *
     error_check_null(LOG_METADATA, "verifier", (void*) verifier);
     error_check_null(LOG_METADATA, "out", (void*) out);
 
-    USize const verifier_size = char_length(verifier);
-
     // RFC 7636 4.1 bounds. Refused by value: the verifier is the caller's data, not a contract.
-    if (verifier_size < _HTTP_SERVICE_OAUTH_PKCE_VERIFIER_MIN_SIZE || verifier_size > _HTTP_SERVICE_OAUTH_PKCE_VERIFIER_MAX_SIZE) {
+    if (!_http_service_oauth_pkce_verifier_valid(verifier)) {
         trace_log_pop();
 
         return false;
@@ -1304,7 +1765,7 @@ bool http_service_oauth_pkce_challenge_create(char const *const verifier, char *
 
     U8 digest[CRYPTO_HASH_SHA256_SIZE] = DEFAULT_INITIALIZATION;
 
-    if (result_is_error(crypto_hash_sha256((U8 const*) verifier, verifier_size, digest))) {
+    if (result_is_error(crypto_hash_sha256((U8 const*) verifier, char_length(verifier), digest))) {
         trace_log_pop();
 
         return false;
@@ -1475,6 +1936,19 @@ HTTP_Service_OAuth_Token http_service_oauth_refresh(HTTP_Service_OAuth *const se
     error_check_null(LOG_METADATA, "self", (void*) self);
     error_check_null(LOG_METADATA, "provider", (void*) provider);
 
+    /* The provider name is a ROUTE PARAMETER, and this function logs it before the registry is
+     * consulted - so a CR or LF inside it would end that log line and start one nobody wrote.
+     * Refused by value first (it is data, not a contract): a name carrying a line break cannot be
+     * a registered one, registration refuses the same bytes. No log here - the name IS the
+     * problem. Answered in this function's own refusal shape. */
+    if (_http_service_oauth_char_line_break_1(provider)) {
+        HTTP_Service_OAuth_Token const token = _http_service_oauth_token_refused(self, "invalid_request");
+
+        trace_log_pop();
+
+        return token;
+    }
+
     /* DATA, refused by value: a stored refresh token read back absent arrives as the null
      * string_get_data of an empty String, and an abort here would be reachable from a request. */
     if (_http_service_oauth_char_empty(refresh_token)) {
@@ -1485,14 +1959,14 @@ HTTP_Service_OAuth_Token http_service_oauth_refresh(HTTP_Service_OAuth *const se
         return token;
     }
 
-    HTTP_Service_OAuth_Row  row   = DEFAULT_INITIALIZATION;
-    bool                    found = false;
+    HTTP_Service_OAuth_Row              row      = DEFAULT_INITIALIZATION;
+    _HTTP_Service_OAuth_Snapshot const  snapshot = _http_service_oauth_row_snapshot(self, provider, &row);
 
-    if (!_http_service_oauth_row_snapshot(self, provider, &row, &found)) {
+    if (snapshot != _HTTP_SERVICE_OAUTH_SNAPSHOT_OK) {
         _http_service_oauth_row_uninit(&row);
 
         // See exchange_code_2: a refused row copy is "misconfigured", not a missing registration.
-        HTTP_Service_OAuth_Token const token = _http_service_oauth_token_refused(self, found ? "misconfigured" : "unknown_provider");
+        HTTP_Service_OAuth_Token const token = _http_service_oauth_token_refused(self, snapshot == _HTTP_SERVICE_OAUTH_SNAPSHOT_REFUSED ? "misconfigured" : "unknown_provider");
 
         trace_log_pop();
 
@@ -1543,6 +2017,17 @@ bool http_service_oauth_revoke_2(HTTP_Service_OAuth *const self, char const *con
     error_check_null(LOG_METADATA, "self", (void*) self);
     error_check_null(LOG_METADATA, "provider", (void*) provider);
 
+    /* The provider name is a ROUTE PARAMETER, and this function logs it before the registry is
+     * consulted - so a CR or LF inside it would end that log line and start one nobody wrote.
+     * Refused by value first (it is data, not a contract): a name carrying a line break cannot be
+     * a registered one, registration refuses the same bytes. No log here - the name IS the
+     * problem. Answered in this function's own refusal shape. */
+    if (_http_service_oauth_char_line_break_1(provider)) {
+        trace_log_pop();
+
+        return false;
+    }
+
     /* DATA, refused by value: the token to revoke is whatever the caller has on hand, and an
      * absent one is the null string_get_data of an empty String rather than a contract breach. */
     if (_http_service_oauth_char_empty(token)) {
@@ -1553,8 +2038,8 @@ bool http_service_oauth_revoke_2(HTTP_Service_OAuth *const self, char const *con
 
     HTTP_Service_OAuth_Row row = DEFAULT_INITIALIZATION;
 
-    // No `found` out-parameter: revoke answers a bare bool, so both refusals have one shape.
-    if (!_http_service_oauth_row_snapshot(self, provider, &row, nullptr)) {
+    // revoke answers a bare bool, so the unknown and the refused outcome have one shape.
+    if (_http_service_oauth_row_snapshot(self, provider, &row) != _HTTP_SERVICE_OAUTH_SNAPSHOT_OK) {
         _http_service_oauth_row_uninit(&row);
 
         trace_log_pop();
@@ -1625,202 +2110,45 @@ bool http_service_oauth_revoke_2(HTTP_Service_OAuth *const self, char const *con
     return value;
 }
 
+bool http_service_oauth_state_issue_1(HTTP_Service_OAuth *const self, char const *const provider, USize const ttl_seconds, char *const out) {
+    return _http_service_oauth_state_issue(self, provider, "", 0, ttl_seconds, out);
+}
+
+bool http_service_oauth_state_issue_2(HTTP_Service_OAuth *const self, char const *const provider, char const *const binding, USize const binding_size, USize const ttl_seconds,
+    char *const out) {
+    /* An EMPTY binding is refused here, by value, before anything else: with it this tier would
+     * mint exactly what _1 mints, a state any browser's callback can redeem, and a _2 route
+     * reaches that only through a bug - a /start that lost its cookie value. The _2 tier is the
+     * login-CSRF defence, so it never degrades to the tier that is not; a caller that genuinely
+     * has no binding calls _1 and accepts what that means. */
+    if (binding_size == 0) {
+        return false;
+    }
+
+    return _http_service_oauth_state_issue(self, provider, binding, binding_size, ttl_seconds, out);
+}
+
 bool http_service_oauth_state_issue(HTTP_Service_OAuth *const self, char const *const provider, USize const ttl_seconds, char *const out) {
-    trace_log_push(LOG_METADATA);
+    return http_service_oauth_state_issue_1(self, provider, ttl_seconds, out);
+}
 
-    error_check_null(LOG_METADATA, "self", (void*) self);
-    error_check_null(LOG_METADATA, "provider", (void*) provider);
-    error_check_null(LOG_METADATA, "out", (void*) out);
+bool http_service_oauth_state_verify_1(HTTP_Service_OAuth *const self, char const *const provider, char const *const state) {
+    return _http_service_oauth_state_verify(self, provider, "", 0, state);
+}
 
-    if (_http_service_oauth_char_empty(provider) || ttl_seconds == 0) {
-        trace_log_pop();
-
+bool http_service_oauth_state_verify_2(HTTP_Service_OAuth *const self, char const *const provider, char const *const binding, USize const binding_size, char const *const state) {
+    /* The empty binding is refused by value, as at issue: a callback that lost its cookie is the
+     * attack posture (the attacker's planted state, a victim's browser with nothing to bind it
+     * to), and must fail by construction rather than fall through to the _1 tier's answer. */
+    if (binding_size == 0) {
         return false;
     }
 
-    char nonce[(16 * 2) + 1] = DEFAULT_INITIALIZATION;
-
-    static_assert(sizeof(nonce) == (16 * 2) + 1, "the nonce buffer must hold 2 hex chars per random byte plus a terminator");
-
-    // Fail closed: without randomness there is no unguessable state, and a fixed one is worse.
-    if (result_is_error(crypto_random_hex(nonce, _HTTP_SERVICE_OAUTH_NONCE_SIZE))) {
-        trace_log_pop();
-
-        return false;
-    }
-
-    ISize const now = datetime_now();
-
-    if (now <= 0) {
-        trace_log_pop();
-
-        return false;
-    }
-
-    /* A ttl within reach of USIZE_MAX wraps "now + ttl_seconds" to a SMALL expiry, so the token
-     * is born already expired and every verify fails - a silently broken login rather than a
-     * refused configuration. Refusing here also removes the 20-digit expiry from the set of
-     * strings this service can MINT, which makes the verify side's char_to_numbers_uint_2 wrap
-     * unreachable by construction rather than merely gated behind the MAC. */
-    if ((USize) now > USIZE_MAX - ttl_seconds) {
-        trace_log_pop();
-
-        return false;
-    }
-
-    char expiry[21] = DEFAULT_INITIALIZATION;
-
-    char_from_numbers_uint_1(expiry, sizeof(expiry), (USize) now + ttl_seconds);
-
-    /* state_key and state_key_size are read WITHOUT the mutex, here and in state_verify, and
-     * that is deliberate: both are written once by _construct before any thread can reach the
-     * service and zeroed once by uninit, and provider_add never touches either. Every other
-     * member access in this module is locked, so the one exception is worth naming. */
-    String      message = _http_service_oauth_state_message(self, provider, nonce, char_length(nonce), expiry, char_length(expiry));
-    char        mac[CRYPTO_HMAC_SHA256_HEX_SIZE + 1] = DEFAULT_INITIALIZATION;
-    Result const signature = crypto_hmac_sha256_hex_1((char const*) self->state_key, self->state_key_size, string_get_data(&message), string_get_size(&message), mac);
-
-    string_uninit(&message);
-
-    if (result_is_error(signature)) {
-        trace_log_pop();
-
-        return false;
-    }
-
-    String state = _http_service_oauth_string_init(self);
-
-    _http_service_oauth_string_add(&state, nonce);
-    _http_service_oauth_string_add(&state, ".");
-    _http_service_oauth_string_add(&state, expiry);
-    _http_service_oauth_string_add(&state, ".");
-    _http_service_oauth_string_add(&state, mac);
-
-    USize const state_size = string_get_size(&state);
-
-    /* The documented buffer is the only thing this can write into, so an over-long token is a
-     * refusal rather than a truncated one a verify would reject days later. */
-    if (state_size == 0 || state_size > HTTP_SERVICE_OAUTH_STATE_MAX_SIZE) {
-        string_uninit(&state);
-
-        trace_log_pop();
-
-        return false;
-    }
-
-    memory_copy_2(out, HTTP_SERVICE_OAUTH_STATE_MAX_SIZE + 1, string_get_data(&state), state_size);
-
-    out[state_size] = '\0';
-
-    string_uninit(&state);
-
-    trace_log_pop();
-
-    return true;
+    return _http_service_oauth_state_verify(self, provider, binding, binding_size, state);
 }
 
 bool http_service_oauth_state_verify(HTTP_Service_OAuth *const self, char const *const provider, char const *const state) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "self", (void*) self);
-    error_check_null(LOG_METADATA, "provider", (void*) provider);
-
-    /* The state arrives on the callback URL, so it is DATA in the most literal sense: a
-     * GET /callback with no ?state= yields the null string_get_data of an empty String, and an
-     * error_check_null here would let any unauthenticated request abort the server. */
-    if (_http_service_oauth_char_empty(provider) || _http_service_oauth_char_empty(state)) {
-        trace_log_pop();
-
-        return false;
-    }
-
-    USize const state_size = char_length(state);
-
-    if (state_size > HTTP_SERVICE_OAUTH_STATE_MAX_SIZE) {
-        trace_log_pop();
-
-        return false;
-    }
-
-    USize first  = USIZE_MAX;
-    USize second = USIZE_MAX;
-    bool  shaped = true;
-
-    for (USize i = 0; i < state_size; i += 1) {
-        if (state[i] != '.') {
-            continue;
-        }
-
-        if (first == USIZE_MAX) {
-            first = i;
-        }
-        else if (second == USIZE_MAX) {
-            second = i;
-        }
-        else {
-            shaped = false;
-
-            break;
-        }
-    }
-
-    if (!shaped || first == USIZE_MAX || second == USIZE_MAX) {
-        trace_log_pop();
-
-        return false;
-    }
-
-    char const *const nonce       = state;
-    USize      const  nonce_size  = first;
-    char const *const expiry      = state + first + 1;
-    USize      const  expiry_size = second - first - 1;
-    char const *const mac         = state + second + 1;
-    USize      const  mac_size    = state_size - second - 1;
-
-    if (nonce_size == 0 || expiry_size == 0 || expiry_size > _HTTP_SERVICE_OAUTH_EXPIRY_MAX_SIZE || mac_size != CRYPTO_HMAC_SHA256_HEX_SIZE) {
-        trace_log_pop();
-
-        return false;
-    }
-
-    for (USize i = 0; i < expiry_size; i += 1) {
-        if (expiry[i] < '0' || expiry[i] > '9') {
-            trace_log_pop();
-
-            return false;
-        }
-    }
-
-    /* The MAC covers the PROVIDER as well as the nonce and expiry, so a state minted for
-     * "github" cannot be replayed onto "google" - the callback that redeems a code has to be
-     * the same provider's callback. */
-    // state_key is read unlocked here for the reason state_issue states.
-    String message = _http_service_oauth_state_message(self, provider, nonce, nonce_size, expiry, expiry_size);
-
-    // Constant-time, and checked BEFORE the expiry so the two failures take the same shape.
-    bool const verified = crypto_hmac_sha256_verify_1((char const*) self->state_key, self->state_key_size, string_get_data(&message), string_get_size(&message), mac);
-
-    string_uninit(&message);
-
-    if (!verified) {
-        trace_log_pop();
-
-        return false;
-    }
-
-    ISize const now = datetime_now();
-
-    if (now <= 0) {
-        trace_log_pop();
-
-        return false;
-    }
-
-    bool const live = char_to_numbers_uint_2(expiry, expiry_size) > (USize) now;
-
-    trace_log_pop();
-
-    return live;
+    return http_service_oauth_state_verify_1(self, provider, state);
 }
 
 bool http_service_oauth_token_is_ok(HTTP_Service_OAuth_Token const *const self) {
@@ -1875,7 +2203,9 @@ void http_service_oauth_uninit(HTTP_Service_OAuth *const self) {
     self->allocator = nullptr;
 #endif // ARENA_IMPLEMENTATION
 
-    // The key signs state tokens; a released service should not leave it lying in the struct.
+    /* The key signs state tokens; a released service should not leave it lying in the struct.
+     * Best effort only: this is a dead store as far as the optimizer can tell, and LTO is free
+     * to elide it - the same memory-wiping gap the header's Memory Management names. */
     memory_set(self->state_key, sizeof(self->state_key), 0);
 
     self->state_key_size = 0;

@@ -42,7 +42,7 @@ static HTTP_Service_OAuth_Provider _provider(char const *const name) {
     };
 }
 
-/* A Token the caller builds by hand, since get_profile takes one but only ever reads its
+/* A Token the caller builds by hand, since get_profile_1 takes one but only ever reads its
  * access_token. Every String member has to exist, because profile teardown uninits them all.
  * Heap, not the arena under test: this is the harness's storage, not the module's. */
 static HTTP_Service_OAuth_Token _token_with_access(char const *const access_token) {
@@ -259,8 +259,35 @@ static void _test_null_data_parameters_are_real_branches(Test *const test) {
 
     test_expect_false(test, "a null token to revoke is refused", http_service_oauth_revoke_1(&oauth, "google", nullptr));
     test_expect_false(test, "an empty token to revoke is refused", http_service_oauth_revoke_1(&oauth, "google", ""));
-    test_expect_false(test, "a null state does not verify", http_service_oauth_state_verify(&oauth, "google", nullptr));
-    test_expect_false(test, "an empty state does not verify", http_service_oauth_state_verify(&oauth, "google", ""));
+    test_expect_false(test, "a null state does not verify", http_service_oauth_state_verify_1(&oauth, "google", nullptr));
+    test_expect_false(test, "an empty state does not verify", http_service_oauth_state_verify_1(&oauth, "google", ""));
+
+    HTTP_Service_OAuth_Profile null_profile = http_service_oauth_get_profile_2(&oauth, "google", nullptr);
+
+    test_expect_string(test, "a null access token is refused by get_profile_2", "invalid_request", string_get_data(&null_profile.error));
+
+    http_service_oauth_profile_uninit(&null_profile);
+
+    /* A CR/LF provider name is refused by value at every entry point that logs the name before
+     * the registry lookup - a real branch, so it holds with the checks compiled out. */
+    char const *const forged = "google\r\nforged";
+
+    HTTP_Service_OAuth_Token forged_code = http_service_oauth_exchange_code_2(&oauth, forged, "c", nullptr);
+
+    test_expect_string(test, "a CR/LF provider is refused at exchange_code_2", "invalid_request", string_get_data(&forged_code.error));
+
+    HTTP_Service_OAuth_Profile forged_profile = http_service_oauth_get_profile_2(&oauth, forged, "at");
+
+    test_expect_string(test, "and at get_profile_2", "invalid_request", string_get_data(&forged_profile.error));
+
+    HTTP_Service_OAuth_Token forged_refresh = http_service_oauth_refresh(&oauth, forged, "rt");
+
+    test_expect_string(test, "and at refresh", "invalid_request", string_get_data(&forged_refresh.error));
+    test_expect_false(test, "and at revoke_2", http_service_oauth_revoke_2(&oauth, forged, "at", ""));
+
+    http_service_oauth_token_uninit(&forged_refresh);
+    http_service_oauth_profile_uninit(&forged_profile);
+    http_service_oauth_token_uninit(&forged_code);
 
     String null_state_url = http_service_oauth_get_authorize_url_1(&oauth, "google", nullptr);
 
@@ -371,7 +398,7 @@ static void _test_a_refused_row_copy_reports_misconfigured(Test *const test) {
     test_expect_string(test, "while a name that was never registered stays unknown_provider", "unknown_provider", string_get_data(&unknown.error));
 
     HTTP_Service_OAuth_Token   bearer  = _token_with_access("at-1");
-    HTTP_Service_OAuth_Profile profile = http_service_oauth_get_profile(&oauth, "google", &bearer);
+    HTTP_Service_OAuth_Profile profile = http_service_oauth_get_profile_1(&oauth, "google", &bearer);
 
     test_expect_string(test, "get_profile reports the same two answers apart", "misconfigured", string_get_data(&profile.error));
 
@@ -396,20 +423,57 @@ static void _test_state_and_pkce_refuse_rather_than_abort(Test *const test) {
 
     char state[HTTP_SERVICE_OAUTH_STATE_MAX_SIZE + 1] = DEFAULT_INITIALIZATION;
 
-    test_expect_false(test, "a zero ttl is refused", http_service_oauth_state_issue(&oauth, "google", 0, state));
-    test_expect_false(test, "a ttl that would wrap the expiry is refused", http_service_oauth_state_issue(&oauth, "google", USIZE_MAX, state));
-    test_expect_false(test, "an empty provider is refused", http_service_oauth_state_issue(&oauth, "", 600, state));
-    test_expect_true(test, "a well-formed request still succeeds", http_service_oauth_state_issue(&oauth, "google", 600, state));
-    test_expect_true(test, "and verifies", http_service_oauth_state_verify(&oauth, "google", state));
+    test_expect_false(test, "a zero ttl is refused", http_service_oauth_state_issue_1(&oauth, "google", 0, state));
+    test_expect_false(test, "a ttl that would wrap the expiry is refused", http_service_oauth_state_issue_1(&oauth, "google", USIZE_MAX, state));
+    test_expect_false(test, "an empty provider is refused", http_service_oauth_state_issue_1(&oauth, "", 600, state));
+    test_expect_true(test, "a well-formed request still succeeds", http_service_oauth_state_issue_1(&oauth, "google", 600, state));
+    test_expect_true(test, "and verifies", http_service_oauth_state_verify_1(&oauth, "google", state));
 
     // Shapes a hand-written parser would run off the end of.
-    test_expect_false(test, "a state with no separators is refused", http_service_oauth_state_verify(&oauth, "google", "aaaa"));
-    test_expect_false(test, "a state with one separator is refused", http_service_oauth_state_verify(&oauth, "google", "aaaa.bbbb"));
-    test_expect_false(test, "a state with three is refused", http_service_oauth_state_verify(&oauth, "google", "a.b.c.d"));
-    test_expect_false(test, "empty fields are refused", http_service_oauth_state_verify(&oauth, "google", ".."));
+    test_expect_false(test, "a state with no separators is refused", http_service_oauth_state_verify_1(&oauth, "google", "aaaa"));
+    test_expect_false(test, "a state with one separator is refused", http_service_oauth_state_verify_1(&oauth, "google", "aaaa.bbbb"));
+    test_expect_false(test, "a state with three is refused", http_service_oauth_state_verify_1(&oauth, "google", "a.b.c.d"));
+    test_expect_false(test, "empty fields are refused", http_service_oauth_state_verify_1(&oauth, "google", ".."));
     char const *const non_numeric = "abcd.notanumber.0123456789012345678901234567890123456789012345678901234567890123";
 
-    test_expect_false(test, "a non-numeric expiry is refused", http_service_oauth_state_verify(&oauth, "google", non_numeric));
+    test_expect_false(test, "a non-numeric expiry is refused", http_service_oauth_state_verify_1(&oauth, "google", non_numeric));
+
+    /* The binding is request data (a cookie, a session id), so with the checks compiled out a
+     * null one claiming a size, or an oversized one, must be a real branch and not a read off
+     * the end of nothing. */
+    char bound[HTTP_SERVICE_OAUTH_STATE_MAX_SIZE + 1] = DEFAULT_INITIALIZATION;
+
+    test_expect_false(test, "a null binding with a size is refused at issue", http_service_oauth_state_issue_2(&oauth, "google", nullptr, 4, 600, bound));
+    test_expect_true(test, "a real binding issues", http_service_oauth_state_issue_2(&oauth, "google", "cookie", 6, 600, bound));
+    test_expect_false(test, "a null binding with a size is refused at verify", http_service_oauth_state_verify_2(&oauth, "google", nullptr, 4, bound));
+    test_expect_false(test, "an oversized binding is refused at verify", http_service_oauth_state_verify_2(&oauth, "google", bound, HTTP_SERVICE_OAUTH_STATE_BINDING_MAX_SIZE + 1, bound));
+    test_expect_false(test, "another binding is refused", http_service_oauth_state_verify_2(&oauth, "google", "cookie2", 7, bound));
+    test_expect_false(test, "and so is the _1 tier's empty one", http_service_oauth_state_verify_1(&oauth, "google", bound));
+    test_expect_true(test, "the matching binding verifies", http_service_oauth_state_verify_2(&oauth, "google", "cookie", 6, bound));
+
+    /* The EMPTY binding is the _1 tier's alone: a _2 issue or verify with size 0 is a refusal,
+     * not a fall-through to the _1 answer - a callback that lost its cookie must fail closed. */
+    test_expect_false(test, "an empty binding is refused at _2 verify", http_service_oauth_state_verify_2(&oauth, "google", "", 0, state));
+    test_expect_false(test, "and a null one with size 0", http_service_oauth_state_verify_2(&oauth, "google", nullptr, 0, state));
+    test_expect_false(test, "and at _2 issue", http_service_oauth_state_issue_2(&oauth, "google", nullptr, 0, 600, bound));
+
+    // The provider is bounded by value on the state paths too, so a route parameter never sizes the MAC scratch.
+    char long_provider[HTTP_SERVICE_OAUTH_STATE_BINDING_MAX_SIZE + 2] = DEFAULT_INITIALIZATION;
+
+    memory_set(long_provider, sizeof(long_provider) - 1, 'p');
+
+    long_provider[sizeof(long_provider) - 1] = '\0';
+
+    test_expect_false(test, "an over-long provider is refused at issue", http_service_oauth_state_issue_1(&oauth, long_provider, 600, bound));
+    test_expect_false(test, "and at verify", http_service_oauth_state_verify_2(&oauth, long_provider, "cookie", 6, bound));
+
+    /* The provider is length-prefixed in the MAC message (0.3.0): ("x", "3:abc|0:") and
+     * ("x|8:3:abc", empty) spelled the same bytes before. Pinned here too, on the arena path. */
+    char collision[HTTP_SERVICE_OAUTH_STATE_MAX_SIZE + 1] = DEFAULT_INITIALIZATION;
+
+    test_expect_true(test, "a state issues under a separator-carrying pair", http_service_oauth_state_issue_2(&oauth, "x", "3:abc|0:", 8, 600, collision));
+    test_expect_true(test, "and verifies under it", http_service_oauth_state_verify_2(&oauth, "x", "3:abc|0:", 8, collision));
+    test_expect_false(test, "and is REFUSED under the pair whose old bytes collided", http_service_oauth_state_verify_1(&oauth, "x|8:3:abc", collision));
 
     char challenge[HTTP_SERVICE_OAUTH_PKCE_CHALLENGE_SIZE + 1] = DEFAULT_INITIALIZATION;
 

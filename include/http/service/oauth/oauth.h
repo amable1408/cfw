@@ -1,8 +1,9 @@
 /*
  * oauth.h - HTTP OAuth 2.0 client service for the C Libraries Framework
- * @version 0.2.2
+ * @version 0.3.0
  *
- * Provides provider configuration, login-CSRF state tokens, PKCE (RFC 7636)
+ * Provides provider configuration, signed state tokens bound to a provider, a
+ * TTL and the user agent that started the login, PKCE (RFC 7636)
  * verifier/challenge generation, authorization URL generation, token exchange,
  * token refresh, token revocation, and profile fetching. Account creation,
  * account linking, and session creation must stay in application code.
@@ -10,13 +11,23 @@
  * THE SERVICE HAS NO STORE. It holds provider configuration and one HMAC key;
  * it never persists a token, a code, or a nonce. `state` is self-contained
  * (nonce.expiry.mac) precisely so no server-side table is needed, and the PKCE
- * verifier is the caller's to keep between /start and /callback.
+ * verifier is the caller's to keep between /start and /callback. The login-CSRF
+ * BINDING is stateless too: the caller hands the same bytes to issue and verify
+ * (a session id, or a random value /start set as an HttpOnly SameSite=Lax
+ * cookie), and the MAC - not a table - ties the token to them.
  *
  * Features:
- *   - Generic provider configuration, registered or updated all-or-nothing.
+ *   - Generic provider configuration, registered or updated all-or-nothing;
+ *     a field carrying a CR or LF, or an authorize_url carrying a "#", is
+ *     refused at registration.
  *   - Endpoint constants for Google and GitHub (the registry stays generic).
- *   - Stateless HMAC state tokens: issue with a TTL, verify constant-time,
- *     expiry-checked and bound to the provider they were issued for.
+ *   - Stateless HMAC state tokens: issue with a TTL and a caller binding,
+ *     verify constant-time, expiry-checked, bound to the provider they were
+ *     issued for and to the user agent that started the login (the _2 tiers;
+ *     the _1 tiers bind no user agent and are NOT a login-CSRF defence alone).
+ *     The MAC covers the provider name and the binding, each LENGTH-PREFIXED,
+ *     plus the nonce and the expiry - so no (provider, binding) pair can spell
+ *     another pair's bytes, whatever separators either value carries.
  *   - PKCE S256: verifier generation and challenge derivation.
  *   - Authorization URL generation with encoded query parameters, extra
  *     provider parameters, and an authorize endpoint that already has a query.
@@ -52,9 +63,19 @@
  *   char verifier[HTTP_SERVICE_OAUTH_PKCE_VERIFIER_SIZE + 1] = DEFAULT_INITIALIZATION;
  *   char challenge[HTTP_SERVICE_OAUTH_PKCE_CHALLENGE_SIZE + 1] = DEFAULT_INITIALIZATION;
  *
- *   http_service_oauth_state_issue(&oauth, "google", 600, state);
- *   http_service_oauth_pkce_verifier_create(verifier);
- *   http_service_oauth_pkce_challenge_create(verifier, challenge);
+ *   // `login` is a random value /start sets as an HttpOnly SameSite=Lax cookie (or the
+ *   // user's session id); the callback reads the same cookie back and verifies with it.
+ *   char login[33] = DEFAULT_INITIALIZATION;
+ *
+ *   // Every one of these fails CLOSED: on false there is no state, no verifier, no challenge.
+ *   if (result_is_error(crypto_random_hex(login, 16))                                              ||
+ *       !http_service_oauth_state_issue_2(&oauth, "google", login, sizeof(login) - 1, 600, state) ||
+ *       !http_service_oauth_pkce_verifier_create(verifier)                                         ||
+ *       !http_service_oauth_pkce_challenge_create(verifier, challenge)) {
+ *       http_service_oauth_uninit(&oauth);
+ *
+ *       return;
+ *   }
  *
  *   // Send the browser here; keep `verifier` in the user's own cookie/session.
  *   String url = http_service_oauth_get_authorize_url_2(&oauth, "google", state, challenge,
@@ -62,12 +83,12 @@
  *
  *   string_uninit(&url);
  *
- *   // ... on the callback, with `state` and `code` read off the query string:
- *   if (http_service_oauth_state_verify(&oauth, "google", state)) {
+ *   // ... on the callback, with `state` and `code` off the query string and `login` off the cookie:
+ *   if (http_service_oauth_state_verify_2(&oauth, "google", login, sizeof(login) - 1, state)) {
  *       HTTP_Service_OAuth_Token token = http_service_oauth_exchange_code_2(&oauth, "google", "the-code", verifier);
  *
  *       if (http_service_oauth_token_is_ok(&token)) {
- *           HTTP_Service_OAuth_Profile profile = http_service_oauth_get_profile(&oauth, "google", &token);
+ *           HTTP_Service_OAuth_Profile profile = http_service_oauth_get_profile_1(&oauth, "google", &token);
  *
  *           http_service_oauth_profile_uninit(&profile);
  *       }
@@ -88,10 +109,22 @@
  *     to revoke is refused exactly like an empty one - never aborted, because an
  *     unauthenticated request must not be able to kill the server. The same
  *     holds for configuration fields (an empty client_id, an absent revoke
- *     endpoint), an unparsable or expired state token, and a state issued for a
- *     different provider. Registration answers false; the network calls answer a
- *     token or profile whose `status`, `response_code` and `error` say what
- *     happened.
+ *     endpoint, a CR or LF in any of the nine, a "#" in authorize_url), an
+ *     unparsable or expired state token, a state issued for a different
+ *     provider, and a state issued under a different binding. Registration
+ *     answers false; the network calls answer a token or profile whose
+ *     `status`, `response_code` and `error` say what happened.
+ *   - The state BINDING is data too: it is read off the callback's cookie or
+ *     session, so a null one claiming a size, or one over
+ *     HTTP_SERVICE_OAUTH_STATE_BINDING_MAX_SIZE, is refused by value at both
+ *     issue and verify. So is an EMPTY one (size 0) on the _2 tiers: the
+ *     empty binding is what the _1 tiers mean, and only they may pass it. The
+ *     provider name on the state paths is bounded the same way, so request
+ *     data never sizes the MAC message.
+ *   - "misconfigured" covers two operator responses: a provider whose
+ *     registration never completed is permanent, a row copy the allocator
+ *     refused is transient and worth retrying once the arena drains. The field
+ *     cannot tell them apart; the WARN logged on the second one can.
  *   - A request body or authorize URL that could not be built WHOLE is never
  *     sent or returned: one field over http/query's encode ceiling, or an
  *     allocator refusal, fails the whole call with error "invalid_request" (or
@@ -103,7 +136,9 @@
  *     a caller puts in a "Location:" header is returned.
  *   - A PKCE code_verifier outside RFC 7636's 43..128 chars is refused locally
  *     with error "invalid_request", rather than spending a round trip to be
- *     told invalid_grant - the same bounds pkce_challenge_create enforces.
+ *     told invalid_grant - the same bounds pkce_challenge_create enforces. The
+ *     other half is bounded too: a code_challenge that is not exactly
+ *     HTTP_SERVICE_OAUTH_PKCE_CHALLENGE_SIZE chars yields an empty authorize URL.
  *   - A provider that is not registered yields an empty URL and a token/profile
  *     carrying error "unknown_provider" - never a request to a wrong endpoint.
  *     A provider that IS registered whose row copy the allocator refused is
@@ -135,7 +170,9 @@
  *     Their storage is released, not wiped, on uninit: a memory-wiping primitive
  *     is an open CFW gap, so the bytes can outlive the free. The same holds for
  *     the client_secret in the per-call provider snapshot, which is deep-copied
- *     and released unwiped once the round trip ends.
+ *     and released unwiped once the round trip ends - and for the state key,
+ *     which http_service_oauth_uninit zeroes with a plain memory_set that is a
+ *     dead store to the optimizer, so LTO may elide it.
  *   - An arena-backed service allocates every String this module builds from
  *     that arena - returned values and per-call scratch alike - so size it for
  *     the response cap below, not just for the provider rows.
@@ -158,11 +195,14 @@
  *   - GitHub keeps a user's verified addresses at /user/emails, not on /user, so
  *     get_profile can leave `email` empty for a GitHub account with a private
  *     address. Fetch that endpoint with the same bearer token if you need it.
- *   - get_profile assumes a Bearer token and ignores token.token_type; a provider
- *     answering another scheme needs its own request.
- *   - The authorize-URL separator is chosen by looking for "?" only. An
- *     authorize_url configured with a "#" fragment would take the parameters
- *     after that fragment, where no server sees them; configure it without one.
+ *   - get_profile_2 always sends a Bearer token; get_profile_1 refuses a token
+ *     whose token_type is set and is not "bearer" (case-insensitively) rather
+ *     than presenting it under the wrong scheme. A provider answering another
+ *     scheme still needs its own request - nothing here can build one.
+ *   - The _1 state tiers bind no user agent. Without a binding, any state this
+ *     service ever minted verifies on any browser's callback until it expires,
+ *     which is exactly RFC 6749 10.12's login-CSRF attack. Use the _2 tiers, or
+ *     PKCE with the verifier held in the user's own cookie.
  *   - Token-endpoint authentication is client_secret_post only: client_id and
  *     client_secret go in the body. RFC 6749 2.3.1 lets a server require
  *     client_secret_basic instead, which some OIDC deployments do; Google and
@@ -223,6 +263,12 @@
 #define HTTP_SERVICE_OAUTH_PKCE_CHALLENGE_SIZE 43
 /** @brief Chars in a generated PKCE code verifier (base64url of 32 random bytes), excluding NUL. */
 #define HTTP_SERVICE_OAUTH_PKCE_VERIFIER_SIZE 43
+/**
+ * @brief Largest caller binding a state token can be issued or verified under,
+ *        in bytes. A session id or a random cookie value is tens of bytes; the
+ *        cap exists so request data cannot size the MAC message.
+ */
+#define HTTP_SERVICE_OAUTH_STATE_BINDING_MAX_SIZE 256
 /** @brief Bytes in the per-service HMAC key that signs state tokens. */
 #define HTTP_SERVICE_OAUTH_STATE_KEY_SIZE 32
 /**
@@ -392,8 +438,6 @@ typedef struct {
  * @note Writes through self rather than returning the service, because it owns a ThreadMutex
  *       and neither CRITICAL_SECTION nor pthread_mutex_t may be copied once initialized - a
  *       by-value return would hand the caller a copy of an initialized lock.
- * @deprecated http_service_oauth_alloc_init is the pre-tier spelling of this
- *             function and forwards to it; it is retired before 1.0.
  */
 bool http_service_oauth_alloc_init_1(HTTP_Service_OAuth *const self, Arena *const allocator);
 
@@ -464,7 +508,7 @@ HTTP_Service_OAuth_Token http_service_oauth_exchange_code(HTTP_Service_OAuth *co
  * @brief Build a provider authorization URL.
  * @param self Service instance.
  * @param provider Provider name.
- * @param state CSRF/session state value - see http_service_oauth_state_issue.
+ * @param state CSRF/session state value - see http_service_oauth_state_issue_2.
  *        Empty or null is REFUSED by value, never aborted, and never sent as
  *        "&state=" - a state the provider echoes back with nothing to verify.
  * @return URL string, empty when the provider is unknown, when `state` was empty
@@ -509,17 +553,45 @@ String http_service_oauth_get_authorize_url_2(HTTP_Service_OAuth *const self, ch
 String http_service_oauth_get_authorize_url(HTTP_Service_OAuth *const self, char const *const provider, char const *const state);
 
 /**
- * @brief Fetch a provider profile using an access token.
+ * @brief Fetch a provider profile using a token response.
  * @param self Service instance.
  * @param provider Provider name.
  * @param token Token response; its access_token is sent as a Bearer credential.
  *        The struct pointer is CONTRACT and checked; the access_token inside is
  *        DATA - empty, or containing a CR or LF, is REFUSED by value with error
  *        "invalid_request" rather than pasted into a header line it would split.
+ *        A token_type that is set and is not "bearer" (case-insensitively) is
+ *        refused the same way rather than presented under the wrong scheme; an
+ *        absent token_type is taken as Bearer.
+ * @return Parsed profile response; see http_service_oauth_get_profile_2, which
+ *         this forwards to with the token's access_token.
+ */
+HTTP_Service_OAuth_Profile http_service_oauth_get_profile_1(HTTP_Service_OAuth *const self, char const *const provider, HTTP_Service_OAuth_Token const *const token);
+
+/**
+ * @brief Fetch a provider profile using a bare access token.
+ * @param self Service instance.
+ * @param provider Provider name.
+ * @param access_token Access token sent as "Authorization: Bearer ...". DATA:
+ *        empty OR NULL (a token read back from storage absent arrives as the
+ *        null data pointer of an empty String), or one containing a CR or LF,
+ *        is REFUSED by value with error "invalid_request", never aborted.
  * @return Parsed profile response with raw JSON and failure fields attached;
  *         error "unknown_provider" for an unregistered name, "misconfigured"
  *         when the row exists and its copy was refused. Caller must
  *         http_service_oauth_profile_uninit it.
+ * @note This is the form for a token stored earlier: nothing has to fabricate
+ *       a Token struct around one char*.
+ */
+HTTP_Service_OAuth_Profile http_service_oauth_get_profile_2(HTTP_Service_OAuth *const self, char const *const provider, char const *const access_token);
+
+/**
+ * @brief Pre-tier spelling of http_service_oauth_get_profile_1.
+ * @param self Service instance.
+ * @param provider Provider name.
+ * @param token Token response.
+ * @return Parsed profile response. Caller must uninitialize it.
+ * @deprecated Call http_service_oauth_get_profile_1; retired before 1.0.
  */
 HTTP_Service_OAuth_Profile http_service_oauth_get_profile(HTTP_Service_OAuth *const self, char const *const provider, HTTP_Service_OAuth_Token const *const token);
 
@@ -573,8 +645,8 @@ bool http_service_oauth_pkce_verifier_create(char *const out);
  * @param self Profile response.
  * @return true when the transport completed, the provider answered 2xx, no error
  *         code was parsed, and an id was parsed out - the same four conditions
- *         http_service_oauth_token_is_ok requires. A 2xx carrying an id AND a
- *         provider complaint (GitHub answers one as `message`) is NOT ok.
+ *         http_service_oauth_token_is_ok requires. A 2xx carrying an id AND an
+ *         `error` is NOT ok.
  */
 bool http_service_oauth_profile_is_ok(HTTP_Service_OAuth_Profile const *const self);
 
@@ -661,33 +733,150 @@ bool http_service_oauth_revoke_2(HTTP_Service_OAuth *const self, char const *con
 /**
  * @brief Issue a signed, self-contained state token for a login round trip.
  * @param self Service instance.
- * @param provider Provider name the state is bound to.
+ * @param provider Provider name the state is bound to. DATA: one longer than
+ *        HTTP_SERVICE_OAUTH_STATE_BINDING_MAX_SIZE is refused by value, so a
+ *        route parameter cannot size the MAC message.
  * @param ttl_seconds Seconds the token stays valid; must be non-zero, and small
  *        enough that "now + ttl_seconds" does not wrap USIZE_MAX.
  * @param out Destination; must hold HTTP_SERVICE_OAUTH_STATE_MAX_SIZE + 1 chars.
- * @return true when a token was written; false (out untouched) on an empty
- *         provider, a zero ttl, a ttl that would wrap the expiry, or a
- *         CSPRNG/HMAC failure - fail closed, never an unsigned state and never a
- *         token born already expired.
+ * @return true when a token was written; false (out untouched) on an empty or
+ *         over-long provider, a zero ttl, a ttl that would wrap the expiry, or
+ *         a CSPRNG/HMAC failure - fail closed, never an unsigned state and never
+ *         a token born already expired.
  * @note The token is "nonce.expiry.mac" and needs no server-side storage. It
  *       proves the callback belongs to a login this service started, for THIS
- *       provider, within the TTL. It is not a session and not a nonce replay
- *       guard: a token stays verifiable until it expires.
+ *       provider, within the TTL - and NOTHING about who started it: the MAC
+ *       message is the one http_service_oauth_state_issue_2 documents, under
+ *       the EMPTY binding (so this tier shares that tier's 0.3.0 format
+ *       change), and the empty binding is this tier's alone - the _2 tier
+ *       refuses it. On its own this tier is NOT a login-CSRF defence: every
+ *       state it ever minted verifies on any browser's callback until it
+ *       expires, so an attacker can plant their own state and code in a
+ *       victim's callback URL (RFC 6749 10.12). Use
+ *       http_service_oauth_state_issue_2 with a binding, or PKCE with the
+ *       verifier held in the user's own cookie. It is not a session and not a
+ *       nonce replay guard either: a token stays verifiable until it expires.
+ */
+bool http_service_oauth_state_issue_1(HTTP_Service_OAuth *const self, char const *const provider, USize const ttl_seconds, char *const out);
+
+/**
+ * @brief Issue a signed state token bound to the user agent that starts the login.
+ * @param self Service instance.
+ * @param provider Provider name the state is bound to. DATA: one longer than
+ *        HTTP_SERVICE_OAUTH_STATE_BINDING_MAX_SIZE is refused by value.
+ * @param binding Bytes identifying the user agent: the user's session id, or a
+ *        random value (16 bytes of crypto_random_hex is plenty) that the /start
+ *        route sets as an HttpOnly SameSite=Lax cookie and the /callback route
+ *        reads back. Arbitrary bytes, NOT NUL-terminated - `binding_size` says
+ *        how many. DATA, refused by value: null with a non-zero size answers
+ *        false, and so does a size of 0 - see the note.
+ * @param binding_size Bytes of `binding`; 1..HTTP_SERVICE_OAUTH_STATE_BINDING_MAX_SIZE,
+ *        refused outside that range.
+ * @param ttl_seconds Seconds the token stays valid; must be non-zero, and small
+ *        enough that "now + ttl_seconds" does not wrap USIZE_MAX.
+ * @param out Destination; must hold HTTP_SERVICE_OAUTH_STATE_MAX_SIZE + 1 chars.
+ * @return true when a token was written; false (out untouched) on an empty or
+ *         over-long provider, a refused binding (empty, over the cap, or null
+ *         with a size), a zero ttl, a ttl that would wrap the expiry, or a
+ *         CSPRNG/HMAC failure - fail closed, never an unsigned state and never
+ *         a token born already expired.
+ * @note An EMPTY binding is a REFUSAL, not a degraded issue: with one this tier
+ *       would mint exactly what http_service_oauth_state_issue_1 mints, a state
+ *       any browser's callback redeems, and a _2 caller only ever reaches that
+ *       through a bug (a /start that lost the value it meant to bind). A
+ *       caller that genuinely has no binding must call _1 and accept what that
+ *       tier's note says it means.
+ * @note The binding is folded into the MAC message LENGTH-PREFIXED, so the
+ *       token is tied to exactly those bytes, and the token itself still
+ *       carries nothing but "nonce.expiry.mac": the state stays stateless. The
+ *       provider name is prefixed the same way, since 0.3.0: a name is a route
+ *       parameter and may carry the message's own separators, and before 0.3.0
+ *       one (provider, binding) pair could spell another's exact bytes. That
+ *       makes 0.3.0's MAC message a DIFFERENT message from 0.2.x's even under
+ *       the same key: a state minted by a 0.2.x process does not verify under
+ *       0.3.0, and the reverse, so a rolling restart across that upgrade sends
+ *       the logins in flight back to /start - the same thing a key change does,
+ *       and as harmless (nothing is stored; the user starts again). A
+ *       callback that presents this token with a different binding - another
+ *       browser's cookie, another session - is refused, which is the login-CSRF
+ *       defence the _1 tier does not have. The binding is the caller's
+ *       SECRET-ENOUGH value: it must be unguessable by the attacker (a random
+ *       cookie or a session id is; a username is not), and it must be the same
+ *       bytes on both routes.
+ */
+bool http_service_oauth_state_issue_2(HTTP_Service_OAuth *const self, char const *const provider, char const *const binding, USize const binding_size, USize const ttl_seconds,
+    char *const out);
+
+/**
+ * @brief Pre-tier spelling of http_service_oauth_state_issue_1.
+ * @param self Service instance.
+ * @param provider Provider name the state is bound to.
+ * @param ttl_seconds Seconds the token stays valid.
+ * @param out Destination; must hold HTTP_SERVICE_OAUTH_STATE_MAX_SIZE + 1 chars.
+ * @return true when a token was written.
+ * @deprecated Call http_service_oauth_state_issue_1 - or, for a login-CSRF
+ *             defence, http_service_oauth_state_issue_2; retired before 1.0.
  */
 bool http_service_oauth_state_issue(HTTP_Service_OAuth *const self, char const *const provider, USize const ttl_seconds, char *const out);
 
 /**
- * @brief Verify a state token issued by this service for this provider.
+ * @brief Verify a state token issued by this service for this provider, under
+ *        no binding.
  * @param self Service instance.
- * @param provider Provider name the state must be bound to.
+ * @param provider Provider name the state must be bound to. DATA: one longer
+ *        than HTTP_SERVICE_OAUTH_STATE_BINDING_MAX_SIZE is refused by value.
  * @param state State token from the provider's redirect. Empty or NULL is
  *        REFUSED by value, never aborted: a callback with no ?state= is the
  *        first thing an attacker sends, and it arrives here as a null pointer.
  * @return true only when the MAC verifies (constant-time), the token was issued
- *         for `provider`, and the expiry has not passed. An absent, empty,
- *         malformed, truncated, oversized, tampered, expired, or cross-provider
- *         token answers false without distinguishing which - the distinction
- *         would be an oracle.
+ *         for `provider` under the EMPTY binding, and the expiry has not passed.
+ *         An absent, empty, malformed, truncated, oversized, tampered, expired,
+ *         cross-provider or cross-binding token, or an over-long provider,
+ *         answers false without distinguishing which - the distinction would be
+ *         an oracle.
+ * @note Verifies under the empty binding - the one binding
+ *       http_service_oauth_state_verify_2 refuses - so it accepts exactly what
+ *       http_service_oauth_state_issue_1 minted, from ANY browser, which is why
+ *       on its own it is NOT a login-CSRF defence; see
+ *       http_service_oauth_state_issue_1.
+ */
+bool http_service_oauth_state_verify_1(HTTP_Service_OAuth *const self, char const *const provider, char const *const state);
+
+/**
+ * @brief Verify a state token issued by this service for this provider and
+ *        this binding.
+ * @param self Service instance.
+ * @param provider Provider name the state must be bound to. DATA: one longer
+ *        than HTTP_SERVICE_OAUTH_STATE_BINDING_MAX_SIZE is refused by value.
+ * @param binding The same bytes the token was issued under - read back off the
+ *        callback's cookie or session. DATA, refused by value exactly as in
+ *        http_service_oauth_state_issue_2, the EMPTY binding included: an
+ *        absent cookie arrives as a null pointer and a size of 0, and that is
+ *        the attack posture (a planted state on a browser that never started
+ *        the login), so it answers false by construction rather than falling
+ *        through to what http_service_oauth_state_verify_1 would say.
+ * @param binding_size Bytes of `binding`; 1..HTTP_SERVICE_OAUTH_STATE_BINDING_MAX_SIZE,
+ *        refused outside that range.
+ * @param state State token from the provider's redirect. Empty or NULL is
+ *        REFUSED by value, never aborted.
+ * @return true only when the MAC verifies (constant-time) over `provider`, this
+ *         exact non-empty binding, the nonce and the expiry, and the expiry has
+ *         not passed. A token issued under any other binding - including the
+ *         empty one http_service_oauth_state_issue_1 uses - answers false, and
+ *         so does an empty binding presented here, with no distinction from any
+ *         other refusal. A caller that genuinely has no binding must call _1
+ *         and accept what that means.
+ */
+bool http_service_oauth_state_verify_2(HTTP_Service_OAuth *const self, char const *const provider, char const *const binding, USize const binding_size, char const *const state);
+
+/**
+ * @brief Pre-tier spelling of http_service_oauth_state_verify_1.
+ * @param self Service instance.
+ * @param provider Provider name the state must be bound to.
+ * @param state State token from the provider's redirect.
+ * @return true only when the token verifies under the empty binding.
+ * @deprecated Call http_service_oauth_state_verify_1 - or, for a login-CSRF
+ *             defence, http_service_oauth_state_verify_2; retired before 1.0.
  */
 bool http_service_oauth_state_verify(HTTP_Service_OAuth *const self, char const *const provider, char const *const state);
 
