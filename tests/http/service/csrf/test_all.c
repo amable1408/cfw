@@ -693,6 +693,12 @@ static void _test_config_refusals(Test *const test) {
      * It now has a getter and a job, so an empty one is a service no request could satisfy. */
     test_expect_false(test, "an empty header_name is refused", http_service_csrf_init_2(&service, 32, 3600, "csrf", "/", "", "Strict", true, false));
 
+    /* A header_name that is not an RFC 9110 token can never match a request header: every
+     * protected request would 403 with nothing logged, the class the cookie-name refusal exists
+     * for. Pinned on the two bytes a hand-typed name most often carries. */
+    test_expect_false(test, "a header_name carrying a space is refused", http_service_csrf_init_2(&service, 32, 3600, "csrf", "/", "X Token", "Strict", true, false));
+    test_expect_false(test, "a header_name carrying ':' is refused", http_service_csrf_init_2(&service, 32, 3600, "csrf", "/", "X-Token:", "Strict", true, false));
+
     test_expect_false(test, "a token_byte_count below the 16-byte floor is refused", http_service_csrf_init_2(&service, 4, 3600, "csrf", "/", "X-CSRF-Token", "Strict", true, false));
     test_expect_false(
         test, "a ttl of 0 is refused (a cookie with Max-Age=0 expires on arrival)",
@@ -813,16 +819,20 @@ static void _route_issue(HTTP_Server_Route *const route) {
 static void _route_submit(HTTP_Server_Route *const route) {
     HTTP_Server_Holder *const holder = http_server_route_get_holder(route);
 
-    char cookie_header[1024]    = DEFAULT_INITIALIZATION;
-    char header_token[256]      = DEFAULT_INITIALIZATION;
+    /* The header's own usage example, verbatim in shape: both headers are read into Strings,
+     * never a fixed buffer - header_copy DROPS (false, "") a header the buffer cannot hold, so a
+     * legitimate user carrying more cookies than the buffer would be refused. Cookie is an
+     * lws-RECOGNIZED header and is readable only through header_get_4 / header_copy; the CSRF
+     * header is custom and is invisible to those, so it needs custom_header_get_4 - and the name
+     * comes from the service's own configuration, not a hard-coded literal. */
+    String      cookie_header = http_server_request_header_get_4(holder->request, HTTP_SERVER_HEADER_COOKIE);
+    String      header_token  = http_server_request_custom_header_get_4(holder->request, http_service_csrf_header_name_get(&_live_csrf));
+    bool const  allowed       = http_service_csrf_request_allowed_4(&_live_csrf, http_server_request_get_method_1(holder->request), &header_token, &cookie_header);
 
-    /* Cookie is an lws-RECOGNIZED header and is readable only through header_copy; the CSRF
-     * header is custom and is invisible to that call, so it needs custom_header_copy - and the
-     * name comes from the service's own configuration, not a hard-coded literal. */
-    http_server_request_header_copy(holder->request, HTTP_SERVER_HEADER_COOKIE, cookie_header, sizeof(cookie_header));
-    http_server_request_custom_header_copy(holder->request, http_service_csrf_header_name_get(&_live_csrf), header_token, sizeof(header_token));
+    string_uninit(&header_token);
+    string_uninit(&cookie_header);
 
-    if (!http_service_csrf_request_allowed_2(&_live_csrf, http_server_request_get_method_1(holder->request), header_token, cookie_header)) {
+    if (!allowed) {
         http_server_response_send_1(holder->response, "forbidden", HTTP_SERVER_CONTENT_TYPE_TEXT_PLAIN, HTTP_SERVER_STATUS_CODE_FORBIDDEN);
 
         return;

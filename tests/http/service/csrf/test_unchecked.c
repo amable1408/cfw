@@ -18,7 +18,7 @@
  *     aborted the whole server depended on the request's METHOD - request data deciding an
  *     abort. With the checks compiled out it was worse: a null dereference inside char_length
  *     instead. It answers false in both builds now.
- *   - Every constructor refusal (browser-dropped cookie configurations, an empty header_name, a
+ *   - Every constructor refusal (browser-dropped cookie configurations, an empty or non-token header_name, a
  *     sub-floor token_byte_count, a ttl of 0). ttl 0 and token_byte_count 0 used to reach
  *     error_check_non_value_uint, which ABORTS - and compiles away here, leaving a service whose
  *     cookie expired on arrival.
@@ -102,6 +102,7 @@ I32 main(void) {
     test_expect_false(&test, "SameSite=None without Secure is still refused", http_service_csrf_init_2(&service, 32, 3600, "csrf", "/", "X-CSRF-Token", "None", false, false));
     test_expect_false(&test, "an empty cookie name is still refused", http_service_csrf_init_2(&service, 32, 3600, "", "/", "X-CSRF-Token", "Strict", true, false));
     test_expect_false(&test, "an empty header_name is still refused", http_service_csrf_init_2(&service, 32, 3600, "csrf", "/", "", "Strict", true, false));
+    test_expect_false(&test, "a header_name carrying a space is still refused", http_service_csrf_init_2(&service, 32, 3600, "csrf", "/", "X Token", "Strict", true, false));
 
     /* These two reached error_check_non_value_uint before this round: with the checks compiled
      * out they used to sail through and build a service whose cookie expired on arrival. */

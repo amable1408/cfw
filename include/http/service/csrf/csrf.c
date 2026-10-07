@@ -4,6 +4,10 @@
 // so every chain that happens to reach it is accidental and a file using char_* owes it directly.
 #include <char/char.h>
 
+// headers.h is owed directly too: csrf.h's API names nothing of it, so no chain through csrf.h
+// reaches http_headers_token_valid_1, the RFC 9110 token test header_name is validated with.
+#include <http/headers/headers.h>
+
 /*==============================================================================
  * MARK: - Helpers
  *============================================================================*/
@@ -201,8 +205,13 @@ static bool _http_service_csrf_config_valid(char const *const caller, HTTP_Cooki
         return false;
     }
 
-    if (char_length(header_name) == 0) {
-        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "%s: refusing - header_name is empty, or the arena refused its copy, so no request could ever carry the token", caller);
+    /* An RFC 9110 token, not merely non-empty: a name carrying ':' or a space can never match a
+     * request header, so every protected request would 403 with nothing logged - the same
+     * silently-unauthenticatable class the cookie-name refusal below exists for. */
+    if (!http_headers_token_valid_1(header_name)) {
+        log_message_2(
+            LOG_LEVEL_WARN, LOG_METADATA, "%s: refusing - header_name \"%s\" is not an RFC 9110 token (empty, an arena-refused copy, or ':'/whitespace in it): no request could carry it",
+            caller, header_name);
 
         trace_log_pop();
 
@@ -559,10 +568,11 @@ bool http_service_csrf_request_allowed_2(HTTP_Service_CSRF const *const self, ch
     /* The ordinary cross-site shape is a request that carries the cookie (the browser sends it
      * unasked) and NO header, because the attacker page could not read the cookie to set one.
      * Testing the header first refuses that request before scanning and allocating; verify_2
-     * would answer false on the same input anyway, one allocation later. An EMPTY Cookie header
-     * is refused for the same reason and by the same one-byte test the String tier applies, so
-     * the two tiers cost the same on the same request. */
-    if (header_token == nullptr || char_length(header_token) == 0 || cookie_header == nullptr || cookie_header[0] == '\0') {
+     * would answer false on the same input anyway, one allocation later. An EMPTY header token or
+     * an EMPTY Cookie header is refused for the same reason and by the same one-byte test on each
+     * side - the test the String tier applies through string_empty - so the two tiers cost the
+     * same on the same request. */
+    if (header_token == nullptr || header_token[0] == '\0' || cookie_header == nullptr || cookie_header[0] == '\0') {
         trace_log_pop();
 
         return false;

@@ -1,6 +1,6 @@
 /*
  * csrf.h - HTTP CSRF service for the C Libraries Framework
- * @version 0.6.0
+ * @version 0.6.1
  *
  * Creates and verifies CSRF tokens for cookie-backed browser sessions, in both of
  * the two patterns that actually ship:
@@ -25,10 +25,15 @@
  * token_verify_1/_2 is the bare comparison underneath it. Every tier carries its
  * number, so a reader never has to guess which one a bare name meant.
  *
- * Token policy: ONE token per session. Issue it at login and re-issue it when
- * http_service_csrf_token_expired says so. Do NOT mint one per request - it
- * breaks multiple tabs and the back button, and buys nothing against a 256-bit
- * random token.
+ * Token policy: in DOUBLE SUBMIT the page's script must read document.cookie at
+ * SUBMIT time, never embed the token at render time - the cookie is then always
+ * the latest token, so a re-mint on a later page load is harmless. Still, mint
+ * only when http_service_csrf_cookie_read answers empty (the browser dropped the
+ * cookie at Max-Age), not on every GET. "ONE token per session" is literally
+ * true of the SYNCHRONIZER pattern, whose token lives in the page: issue it at
+ * login and re-issue it when http_service_csrf_token_expired says so. Do NOT
+ * mint one per request there - it breaks multiple tabs and the back button, and
+ * buys nothing against a 256-bit random token.
  *
  * Features:
  *   - Random CSRF token generation (crypto/random's CSPRNG, lowercase hex).
@@ -50,6 +55,8 @@
  *     http_service_csrf_request_allowed_4 takes the Strings
  *     http_server_request_header_get_4 / _custom_header_get_4 hand back. Both
  *     answer the same verdict for the same bytes.
+ *   - A token and the cookie that carries it in ONE call, all-or-nothing
+ *     (http_service_csrf_mint).
  *   - Whole-object refusal at init (see Error Handling).
  *
  * Usage Example:
@@ -65,31 +72,44 @@
  *   }
  *
  *   // Request 1 - GET the page, in a route handler returning void: mint a token
- *   // and hand it to the browser in the cookie its own JavaScript will read back.
- *   // One all-or-nothing call, the twin of http_service_session_mint.
- *   HTTP_Service_CSRF_Token token  = DEFAULT_INITIALIZATION;
- *   String                  cookie = DEFAULT_INITIALIZATION;
+ *   // only when the browser carries none (it dropped the cookie at Max-Age; see
+ *   // Token policy) and hand it over in the cookie the page's own JavaScript
+ *   // reads back at submit time. One all-or-nothing call, the twin of
+ *   // http_service_session_mint.
+ *   String cookie_header = http_server_request_header_get_4(request, HTTP_SERVER_HEADER_COOKIE);
+ *   String current       = http_service_csrf_cookie_read_4(&_csrf, &cookie_header);
  *
- *   if (http_service_csrf_mint(&_csrf, &token, &cookie)) {
- *       http_server_response_header_add(response, "Set-Cookie", string_get_data(&cookie));
+ *   if (string_empty(&current)) {
+ *       HTTP_Service_CSRF_Token token  = DEFAULT_INITIALIZATION;
+ *       String                  cookie = DEFAULT_INITIALIZATION;
+ *
+ *       if (http_service_csrf_mint(&_csrf, &token, &cookie)) {
+ *           http_server_response_header_add(response, "Set-Cookie", string_get_data(&cookie));
+ *       }
+ *
+ *       string_uninit(&cookie);
+ *       http_service_csrf_token_uninit(&token);
  *   }
  *
- *   string_uninit(&cookie);
- *   http_service_csrf_token_uninit(&token);
+ *   string_uninit(&current);
+ *   string_uninit(&cookie_header);
  *
  *   // Request 2 - the POST, in a route handler returning void: the cookie comes
- *   // back on its own, the header only if
- *   // the page's script set it. Cookie is an lws-RECOGNIZED header, so it is read
- *   // with header_copy; the CSRF header is custom and is NOT, so it needs
- *   // custom_header_copy - and its name is the one this service was configured
+ *   // back on its own, the header only if the page's script set it. Both are
+ *   // read into Strings, never a fixed buffer: a Cookie header a buffer cannot
+ *   // hold is DROPPED, not truncated, and would refuse a legitimate user (see
+ *   // Error Handling). Cookie is an lws-RECOGNIZED header, so it is read with
+ *   // header_get_4; the CSRF header is custom and is NOT, so it needs
+ *   // custom_header_get_4 - and its name is the one this service was configured
  *   // with, http_service_csrf_header_name_get.
- *   char cookie_header[1024]    = DEFAULT_INITIALIZATION;
- *   char header_token[256]      = DEFAULT_INITIALIZATION;
+ *   String      cookie_header = http_server_request_header_get_4(request, HTTP_SERVER_HEADER_COOKIE);
+ *   String      header_token  = http_server_request_custom_header_get_4(request, http_service_csrf_header_name_get(&_csrf));
+ *   bool const  allowed       = http_service_csrf_request_allowed_4(&_csrf, http_server_request_get_method_1(request), &header_token, &cookie_header);
  *
- *   http_server_request_header_copy(request, HTTP_SERVER_HEADER_COOKIE, cookie_header, sizeof(cookie_header));
- *   http_server_request_custom_header_copy(request, http_service_csrf_header_name_get(&_csrf), header_token, sizeof(header_token));
+ *   string_uninit(&header_token);
+ *   string_uninit(&cookie_header);
  *
- *   if (!http_service_csrf_request_allowed_2(&_csrf, http_server_request_get_method_1(request), header_token, cookie_header)) {
+ *   if (!allowed) {
  *       http_server_response_send_1(response, "forbidden", HTTP_SERVER_CONTENT_TYPE_TEXT_PLAIN, HTTP_SERVER_STATUS_CODE_FORBIDDEN);
  *
  *       return;
@@ -109,10 +129,23 @@
  *     header, and a token of the wrong length all answer false. A missing
  *     X-CSRF-Token header is the ordinary shape of an attack, not a contract
  *     violation, and must never abort the server.
+ *   - A request header a fixed buffer cannot hold reads as ABSENT on the char*
+ *     tiers: http_server_request_header_copy and _custom_header_copy DROP such a
+ *     header (false, buffer "") rather than truncate it, so request_allowed_2
+ *     refuses the request. Size the buffer for lws's header budget, or read the
+ *     Strings the _get_4 tiers hand back and gate with request_allowed_4.
+ *   - Return shapes follow one rule, not arity: route-facing promotions answer
+ *     bool plus out-params (http_service_csrf_mint, _request_allowed_1/_2/_4,
+ *     _token_create - single-output, still bool + out); primitives answer a
+ *     String by value gated by string_empty (cookie_clear, cookie_create,
+ *     cookie_read and its _3/_4 tiers). A new tier takes the shape of its row.
  *   - log_init must have run before any call (hash.h ruling 2026-09-05).
  *   - Every constructor is in-place and returns bool. It REFUSES WHOLE - leaving
  *     *self DEFAULT_INITIALIZATION - on: a refused arena; token_byte_count below
- *     HTTP_SERVICE_CSRF_TOKEN_BYTE_COUNT_MIN; ttl 0; an empty header_name; a
+ *     HTTP_SERVICE_CSRF_TOKEN_BYTE_COUNT_MIN; ttl 0; a header_name that is not an
+ *     RFC 9110 token (the empty name included - a name carrying ':' or a space
+ *     can never match a request header, so every protected request would be
+ *     refused with nothing logged); a
  *     cookie_name that is not an RFC 6265 token (the empty name included); a
  *     `__Host-` name without Secure or with a path other than "/"; a `__Secure-`
  *     name without Secure; SameSite=None without Secure. The prefix cases matter
@@ -185,11 +218,18 @@
  *   - Returned String and token values must be uninitialized by the caller
  *     (http_service_csrf_token_uninit for tokens, string_uninit for the rest),
  *     including after a `false` answer.
+ *   - An output left empty by a `false` answer has data == nullptr; on the arena
+ *     tier it also keeps the service's arena, which is the String module's
+ *     bulk-release convention (string.c) and not a leak. string_uninit on it is
+ *     always correct.
  *
  * Performance Characteristics:
  *   - Per token: one CSPRNG call writing straight into one small String, and a
  *     cookie rendered off the stored template - no per-response HTTP_Cookie is
  *     built at all.
+ *   - Per mint: exactly that pair - one CSPRNG call and one render, two
+ *     allocations (the token's and the cookie's) - and nothing else; the GET-side
+ *     cookie_read guard in the example costs one more allocation, the read's.
  *   - Per request: one allocation, one linear Cookie-header scan, and one
  *     constant-time compare over the token (64 bytes at the default size), plus one
  *     char_length ON THE char* TIER ONLY - request_allowed_4 measures neither side,
@@ -198,7 +238,7 @@
  *     before any of that. Nothing here is worth measuring.
  *
  * Dependencies:
- *   - crypto/random, datetime, http/cookie, string.
+ *   - crypto/random, datetime, http/cookie, http/headers, string.
  *
  * See csrf.c for implementation details.
  */
@@ -284,7 +324,7 @@ bool http_service_csrf_alloc_init_1(HTTP_Service_CSRF *const self, Arena *const 
  * @param ttl CSRF token time-to-live in seconds; must be non-zero.
  * @param cookie_name Cookie name; must be an RFC 6265 token, and a `__Host-`/`__Secure-` prefix binds the flags below.
  * @param cookie_path Cookie path scope; must be "/" when cookie_name carries the `__Host-` prefix.
- * @param header_name Request header name; must be non-empty.
+ * @param header_name Request header name; must be an RFC 9110 token (non-empty, no ':' and no whitespace).
  * @param same_site SameSite policy value: "Lax", "None", or "Strict" (case-insensitive); anything else logs a WARN and omits SameSite from built cookies. "None" requires secure.
  * @param secure Secure cookie flag.
  * @param http_only HttpOnly cookie flag; leave it false for double submit, or the page's script cannot echo the token.
@@ -362,7 +402,7 @@ String http_service_csrf_cookie_read_4(HTTP_Service_CSRF const *const self, Stri
 /**
  * @brief Read the configured request header name.
  *
- * Use it for the http_server_request_custom_header_copy lookup and for the CORS
+ * Use it for the http_server_request_custom_header_get_4 (or _copy) lookup and for the CORS
  * Access-Control-Allow-Headers list, so a configured name cannot drift away from a
  * hard-coded one.
  * @param self Service instance.
@@ -386,7 +426,7 @@ bool http_service_csrf_init_1(HTTP_Service_CSRF *const self);
  * @param ttl CSRF token time-to-live in seconds; must be non-zero.
  * @param cookie_name Cookie name; must be an RFC 6265 token, and a `__Host-`/`__Secure-` prefix binds the flags below.
  * @param cookie_path Cookie path scope; must be "/" when cookie_name carries the `__Host-` prefix.
- * @param header_name Request header name; must be non-empty.
+ * @param header_name Request header name; must be an RFC 9110 token (non-empty, no ':' and no whitespace).
  * @param same_site SameSite policy value: "Lax", "None", or "Strict" (case-insensitive); anything else logs a WARN and omits SameSite from built cookies. "None" requires secure.
  * @param secure Secure cookie flag.
  * @param http_only HttpOnly cookie flag; leave it false for double submit, or the page's script cannot echo the token.
