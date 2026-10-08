@@ -1,14 +1,20 @@
+#include <http/service/email/email.h>
+
 /* Every module below is an IMPLEMENTATION dependency: none of them names a type or function in
  * email.h's API, whose only borrowed type is AL_Str. They are included here rather than chained
  * through the header so that a consumer of email.h - and, for the public export, email's
- * dependency closure - carries only what the API actually needs. */
+ * dependency closure - carries only what the API actually needs.
+ *
+ * char.h is singled out because it is the one module the chain rule can NEVER cover: it
+ * declares no types at all, only functions and macros, so no header's API can name a type from
+ * it and every chain reaching it is accidental by the rule's own test. Whatever calls a char_*
+ * function includes char.h itself. */
+#include <char/char.h>
 #include <crypto/random/random.h>
 #include <encoding/base64/base64.h>
 #include <encoding/quoted_printable/quoted_printable.h>
 #include <env/env.h>
 #include <http/client/http_client.h>
-
-#include <http/service/email/email.h>
 
 /*==============================================================================
  * MARK: - Constants
@@ -515,10 +521,15 @@ static bool _http_service_email_recipient_exists(HTTP_Service_Email_Message cons
 }
 
 /* Exactly one '@', a non-empty local part and a non-empty domain, and no byte
- * that could end the header early or break the address parse. A byte >= 0x80 is
- * refused deliberately: an internationalized address needs SMTPUTF8, which this
- * transport never negotiates, so accepting one would produce a message the
- * relay rejects rather than an address that works.
+ * that could end the header early or break the address parse: every RFC 5322
+ * §3.2.3 special but '.' is refused, because an address is rendered BARE into
+ * To:/Cc:/From: and each of them changes what a receiver parses there. A ':'
+ * turns "x:y@d" into a GROUP, a '(' opens a comment, a ';' closes a group, a
+ * '[' opens a domain-literal and a '\' starts a quoted-pair - so the rendered
+ * header named a different recipient than the RCPT TO envelope did. A byte
+ * >= 0x80 is refused deliberately: an internationalized address needs SMTPUTF8,
+ * which this transport never negotiates, so accepting one would produce a
+ * message the relay rejects rather than an address that works.
  *
  * The two length caps are RFC 5321 §4.5.3.1.1/.2, and they are a RENDERING
  * guard as much as a parsing one: _list_payload_add folds BETWEEN recipients and
@@ -536,7 +547,8 @@ static bool _http_service_email_bytes_address_ok(char const *const data, USize c
     for (USize i = 0; success && i < count; i += 1) {
         U8 const c = (U8) data[i];
 
-        if (c <= 0x20 || c >= 0x7f || c == '<' || c == '>' || c == ',' || c == '"') {
+        if (c <= 0x20 || c >= 0x7f || c == '(' || c == ')' || c == '<' || c == '>' || c == '[' || c == ']' ||
+            c == ':' || c == ';' || c == '\\' || c == ',' || c == '"') {
             success = false;
         }
         else if (c == '@') {
@@ -874,6 +886,30 @@ static bool _http_service_email_encoded_word_add(String *const payload, char con
     return added;
 }
 
+/* Answers whether a hard split of `data` at `split` would land right after a
+ * backslash that escapes the byte at `split`: the run of consecutive backslashes
+ * ending at `split` is odd, so the last one is the START of a quoted-pair, not
+ * the escaped half of a `\\`. Unfolding keeps the fold's WSP, so a split there
+ * would hand the receiver `\ ` - the backslash escaping the SPACE - and a `\"`
+ * would then close the quoted-string early, with everything after it OUTSIDE the
+ * quotes, where a `<evil@x>` in the name is parsed as the address. A `\\` split
+ * the same way leaves the quote unterminated instead. */
+static bool _http_service_email_escape_split_at(char const *const data, USize const split) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "data", (void*) data);
+
+    USize run = 0;
+
+    while (run < split && data[split - 1 - run] == '\\') {
+        run += 1;
+    }
+
+    trace_log_pop();
+
+    return run % 2 == 1;
+}
+
 /* Appends an ASCII header value, folding at spaces so no line passes 78 columns,
  * and HARD-SPLITTING a word too long to fit on a line of its own. RFC 5322 makes
  * a line over 998 octets a hard violation and many MTAs answer 5xx; folding at
@@ -933,13 +969,28 @@ static bool _http_service_email_folded_add(String *const payload, char const *co
             }
 
             USize const room    = _HTTP_SERVICE_EMAIL_HEADER_LINE_HARD_LIMIT - column;
-            USize const chunk   = remaining < room ? remaining : room;
+            USize       chunk   = remaining < room ? remaining : room;
 
-            added = added && _http_service_email_bytes_add(payload, data + offset, chunk);
+            /* A hard split never separates a backslash from the byte it escapes:
+             * step the break back one byte so the quoted-pair stays together. */
+            if (chunk < remaining && _http_service_email_escape_split_at(data, offset + chunk)) {
+                chunk -= 1;
+            }
 
-            column      += chunk;
-            offset      += chunk;
-            remaining   -= chunk;
+            if (chunk == 0) {
+                /* The one byte that fit was the escaping backslash itself: fold
+                 * now, and the next pass has 997 columns for the pair. */
+                added = added && _http_service_email_bytes_add(payload, "\r\n ", CHAR_STATIC_SIZE("\r\n "));
+
+                column = 1;
+            }
+            else {
+                added = added && _http_service_email_bytes_add(payload, data + offset, chunk);
+
+                column      += chunk;
+                offset      += chunk;
+                remaining   -= chunk;
+            }
         }
 
         index = word_end + 1;
@@ -994,11 +1045,21 @@ static bool _http_service_email_display_name_quoting_needed(char const *const da
     return needed;
 }
 
-/* "Name" <addr>. An unquoted display name carrying a ',' or a '.' makes a
- * receiver parse two addresses (or a malformed one) out of a single sender; a
- * non-ASCII one is illegal in a header without SMTPUTF8 and renders as mojibake
- * on a strict receiver, so it goes out as an RFC 2047 encoded word instead. */
-static bool _http_service_email_address_payload_add(String *const payload, String const *const name, String const *const email) {
+/* "Name" <addr>, folded like every other header value. An unquoted display name
+ * carrying a ',' or a '.' makes a receiver parse two addresses (or a malformed
+ * one) out of a single sender; a non-ASCII one is illegal in a header without
+ * SMTPUTF8 and renders as mojibake on a strict receiver, so it goes out as an
+ * RFC 2047 encoded word instead.
+ *
+ * The ASCII paths render the whole "name <addr>" into a scratch String and hand
+ * it to _folded_add. from_name_set caps nothing, so a 1000-byte display name was
+ * the one value that reached the wire as a line past the 998-octet hard limit
+ * the rest of the renderer guarantees. A fold at a space INSIDE a quoted-string
+ * is legal FWS (RFC 5322 §3.2.4), and the address token itself is never split:
+ * _bytes_address_ok caps it well under the limit. The encoded-word path needs no
+ * scratch: each word is already on a folded line of its own, and the address
+ * that follows it cannot reach 998 either. */
+static bool _http_service_email_address_payload_add(String *const payload, String const *const name, String const *const email, USize const start_column) {
     trace_log_push(LOG_METADATA);
 
     error_check_null(LOG_METADATA, "payload", (void*) payload);
@@ -1015,32 +1076,55 @@ static bool _http_service_email_address_payload_add(String *const payload, Strin
 
     char    const   *const  data    = string_get_data(name);
     USize   const           size    = string_get_size(name);
-    bool                    added   = true;
 
     if (!_http_service_email_bytes_ascii(data, size)) {
-        added = _http_service_email_encoded_word_add(payload, data, size);
+        bool const encoded = _http_service_email_encoded_word_add(payload, data, size) &&
+                             _http_service_email_string_add(payload, " <")           &&
+                             _http_service_email_string_add_2(payload, email)        &&
+                             _http_service_email_string_add(payload, ">");
+
+        trace_log_pop();
+
+        return encoded;
     }
-    else if (_http_service_email_display_name_quoting_needed(data, size)) {
-        added = _http_service_email_string_add(payload, "\"");
+
+    /* Every name byte may need an escape, plus the quotes, the " <", the ">" and the address. */
+    USize const reserve = 2 * size + CHAR_STATIC_SIZE("\"\" <>") + string_get_size(email) + CHAR_END_CHARACTER;
+
+#ifdef ARENA_IMPLEMENTATION
+    String value = _http_service_email_string_init_sized(reserve, payload->allocator);
+#else
+    String value = _http_service_email_string_init_sized(reserve);
+#endif // ARENA_IMPLEMENTATION
+
+    bool added = true;
+
+    if (_http_service_email_display_name_quoting_needed(data, size)) {
+        added = _http_service_email_string_add(&value, "\"");
 
         for (USize i = 0; added && i < size; i += 1) {
             if (data[i] == '"' || data[i] == '\\') {
-                added = _http_service_email_bytes_add(payload, "\\", CHAR_STATIC_SIZE("\\"));
+                added = _http_service_email_bytes_add(&value, "\\", CHAR_STATIC_SIZE("\\"));
             }
 
-            added = added && _http_service_email_bytes_add(payload, data + i, 1);
+            added = added && _http_service_email_bytes_add(&value, data + i, 1);
         }
 
-        added = added && _http_service_email_string_add(payload, "\"");
+        added = added && _http_service_email_string_add(&value, "\"");
     }
     else {
-        added = _http_service_email_string_add_2(payload, name);
+        added = _http_service_email_string_add_2(&value, name);
     }
 
-    added = added
-         && _http_service_email_string_add(payload, " <")
-         && _http_service_email_string_add_2(payload, email)
-         && _http_service_email_string_add(payload, ">");
+    /* `value` is non-empty whenever `added` still holds, so _folded_add never
+     * sees the NULL data pointer an empty String carries. */
+    added = added                                                                                                 &&
+            _http_service_email_string_add(&value, " <")                                                          &&
+            _http_service_email_string_add_2(&value, email)                                                       &&
+            _http_service_email_string_add(&value, ">")                                                           &&
+            _http_service_email_folded_add(payload, string_get_data(&value), string_get_size(&value), start_column);
+
+    string_uninit(&value);
 
     trace_log_pop();
 
@@ -1791,7 +1875,7 @@ bool http_service_email_init_from_env_2(HTTP_Service_Email *const self, char con
 
     USize   const   prefix_size                 = char_length(prefix);
     char            name[128]                   = DEFAULT_INITIALIZATION;
-    char    const   *const  suffixes[]          = { "_URL", "_USER", "_PASSWORD", "_FROM", "_VERIFY_TLS" };
+    char    const   *const  suffixes[]          = { "_URL", "_USER", "_PASSWORD", "_FROM", "_VERIFY_TLS", "_STARTTLS", "_FROM_NAME" };
     char    const   *values[sizeof(suffixes) / sizeof(suffixes[0])] = DEFAULT_INITIALIZATION;
 
     for (USize i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i += 1) {
@@ -1842,10 +1926,43 @@ bool http_service_email_init_from_env_2(HTTP_Service_Email *const self, char con
         return false;
     }
 
+    /* A display name the module refuses - a control byte in it - is the same
+     * class as a sender that is not an address: the environment named it, and
+     * the message it would head cannot be sent. The configured service is torn
+     * down again so the caller gets the same unconfigured default as above. */
+    if (!memory_empty(values[6]) && values[6][0] != '\0' && !http_service_email_from_name_set(self, values[6])) {
+        *out = HTTP_SERVICE_EMAIL_STATUS_INVALID_CONFIGURATION;
+
+        http_service_email_uninit(self);
+        http_service_email_init_1(self);
+
+        trace_log_pop();
+
+        return false;
+    }
+
     /* Exactly "0" turns verification off - the same parsing the three consumers
      * hand-rolled. Anything else leaves it on, so a typo fails SAFE. */
     if (!memory_empty(values[4]) && char_compare_equal_2((char*) values[4], char_length(values[4]), "0", CHAR_STATIC_SIZE("0"))) {
         http_service_email_verify_tls_set(self, false);
+    }
+
+    /* Exactly "none", "optional" or "required". Empty keeps the REQUIRED default
+     * and so does any other spelling - a typo must never downgrade a relay to
+     * plaintext - but that one is LOGGED, because the deployment asked for a
+     * mode and silently got the strictest one instead. */
+    if (!memory_empty(values[5]) && values[5][0] != '\0') {
+        USize const value_size = char_length(values[5]);
+
+        if (char_compare_equal_2((char*) values[5], value_size, "none", CHAR_STATIC_SIZE("none"))) {
+            http_service_email_security_set(self, HTTP_SERVICE_EMAIL_SECURITY_NONE);
+        }
+        else if (char_compare_equal_2((char*) values[5], value_size, "optional", CHAR_STATIC_SIZE("optional"))) {
+            http_service_email_security_set(self, HTTP_SERVICE_EMAIL_SECURITY_OPTIONAL);
+        }
+        else if (!char_compare_equal_2((char*) values[5], value_size, "required", CHAR_STATIC_SIZE("required"))) {
+            log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_service_email: %s_STARTTLS=\"%s\" is not none, optional or required; STARTTLS stays required", prefix, values[5]);
+        }
     }
 
     *out = HTTP_SERVICE_EMAIL_STATUS_OK;
@@ -2227,7 +2344,7 @@ bool http_service_email_payload_create_2(HTTP_Service_Email const *const self,
 #endif // ARENA_IMPLEMENTATION
 
     bool added = _http_service_email_string_add(&payload, "From: ")
-              && _http_service_email_address_payload_add(&payload, from_name, from)
+              && _http_service_email_address_payload_add(&payload, from_name, from, CHAR_STATIC_SIZE("From: "))
               && _http_service_email_string_add(&payload, "\r\n")
               && _http_service_email_list_payload_add(&payload, "To: ", &message->to)
               && _http_service_email_list_payload_add(&payload, "Cc: ", &message->cc);

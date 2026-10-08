@@ -72,6 +72,133 @@ static bool _contains(String const *const haystack, char const *const needle) {
     return false;
 }
 
+/* The length of the longest rendered line, CRLF excluded: the one number RFC
+ * 5322 §2.1.1's 998-octet limit is measured on. */
+static USize _longest_line(String const *const payload) {
+    char    const   *const  data        = string_get_data(payload);
+    USize   const           size        = string_get_size(payload);
+    USize                   line_length = 0;
+    USize                   longest     = 0;
+
+    for (USize i = 0; i < size; i += 1) {
+        if (data[i] == '\n') {
+            line_length = 0;
+        }
+        else if (data[i] != '\r') {
+            line_length += 1;
+
+            longest = line_length > longest ? line_length : longest;
+        }
+    }
+
+    return longest;
+}
+
+/* Copies the rendered From: line into `line`, UNFOLDED the way RFC 5322 §2.2.3
+ * says a receiver does it - every CRLF that is immediately followed by WSP is
+ * removed and the WSP kept - and answers its length. That is the byte stream a
+ * receiver's address parser actually sees, so it is what the escape-pair pins
+ * below are measured on. */
+static USize _unfolded_from_line(String const *const payload, char *const line, USize const line_capacity) {
+    char    const   *const  data    = string_get_data(payload);
+    USize   const           size    = string_get_size(payload);
+    USize                   start   = 0;
+    USize                   length  = 0;
+
+    while (start + CHAR_STATIC_SIZE("From: ") < size) {
+        bool const line_start = start == 0 || data[start - 1] == '\n';
+
+        if (line_start && char_equal_2(data + start, CHAR_STATIC_SIZE("From: "), "From: ", CHAR_STATIC_SIZE("From: "))) {
+            break;
+        }
+
+        start += 1;
+    }
+
+    for (USize i = start; i < size && length + 1 < line_capacity; i += 1) {
+        if (data[i] == '\r' && i + 2 < size && data[i + 1] == '\n') {
+            if (data[i + 2] == ' ' || data[i + 2] == '\t') {
+                i += 1;
+
+                continue;
+            }
+
+            break;
+        }
+
+        line[length] = data[i];
+
+        length += 1;
+    }
+
+    line[length] = '\0';
+
+    return length;
+}
+
+/* Parses an unfolded `From: "<quoted-string>" <address>` the way a receiver
+ * does - a backslash takes the next byte literally, the first unescaped `"`
+ * closes the quoted-string - and answers true only when the quoted content,
+ * spaces ignored (a hard split legitimately inserts one), is `name` with its own
+ * spaces ignored, and everything after the closing quote is exactly ` <address>`.
+ * A `"` that escaped the quotes early, or a quote that never closes, fails. */
+static bool _quoted_from_ok(char const *const line, char const *const name, char const *const address) {
+    static char const   prefix[]    = "From: \"";
+    USize       const   length      = char_length(line);
+    USize               i           = CHAR_STATIC_SIZE(prefix);
+    USize               n           = 0;
+    bool                closed      = false;
+
+    if (length < CHAR_STATIC_SIZE(prefix) || !char_equal_2(line, CHAR_STATIC_SIZE(prefix), prefix, CHAR_STATIC_SIZE(prefix))) {
+        return false;
+    }
+
+    while (!closed && i < length) {
+        char c = line[i];
+
+        if (c == '"') {
+            closed = true;
+        }
+        else {
+            if (c == '\\') {
+                i += 1;
+
+                c = i < length ? line[i] : '\0';
+            }
+
+            if (c != ' ') {
+                while (name[n] == ' ') {
+                    n += 1;
+                }
+
+                if (name[n] != c) {
+                    return false;
+                }
+
+                n += 1;
+            }
+        }
+
+        i += 1;
+    }
+
+    while (name[n] == ' ') {
+        n += 1;
+    }
+
+    if (!closed || name[n] != '\0') {
+        return false;
+    }
+
+    USize const address_size = char_length(address);
+
+    return i + CHAR_STATIC_SIZE(" <") + address_size + CHAR_STATIC_SIZE(">") == length &&
+           line[i] == ' '                                                              &&
+           line[i + 1] == '<'                                                          &&
+           char_equal_2(line + i + 2, address_size, address, address_size)             &&
+           line[length - 1] == '>';
+}
+
 static HTTP_Service_Email_Render _render_fixed(void) {
     HTTP_Service_Email_Render render = DEFAULT_INITIALIZATION;
 
@@ -344,6 +471,20 @@ static void _test_address_valid_table(Test *const test) {
     test_expect_false(test, "a comma is refused", http_service_email_address_valid("a@b,c@d"));
     test_expect_false(test, "angle brackets are refused", http_service_email_address_valid("<a@b>"));
     test_expect_false(test, "a CR is refused", http_service_email_address_valid("a@b\rBcc: c@d"));
+
+    /* Every RFC 5322 §3.2.3 special but '.' changes what a receiver parses out
+     * of a bare address in To:/Cc:/From:, so the rendered header named a
+     * different recipient than the RCPT TO envelope did. Each one is pinned. */
+    test_expect_false(test, "a ':' is refused - \"x:y@d\" parses as a GROUP", http_service_email_address_valid("x:y@d"));
+    test_expect_false(test, "a ';' is refused - it closes a group", http_service_email_address_valid("x;y@d"));
+    test_expect_false(test, "a '(' is refused - it opens a comment", http_service_email_address_valid("a(b@d"));
+    test_expect_false(test, "a ')' is refused", http_service_email_address_valid("a)b@d"));
+    test_expect_false(test, "a '[' is refused - it opens a domain-literal", http_service_email_address_valid("a@[d"));
+    test_expect_false(test, "a ']' is refused", http_service_email_address_valid("a@d]"));
+    test_expect_false(test, "a '\\' is refused - it starts a quoted-pair", http_service_email_address_valid("a\\b@d"));
+    test_expect_false(test, "a '\"' is refused", http_service_email_address_valid("\"a\"@d"));
+    test_expect_true(test, "the '.' special stays legal in both parts", http_service_email_address_valid("first.last@sub.example.com"));
+    test_expect_true(test, "and the non-special atext punctuation stays legal", http_service_email_address_valid("!#$%&'*+-/=?^_`{|}~@example.com"));
 
     /* SMTPUTF8 is never negotiated by this transport, so a non-ASCII address
      * would produce a message the relay rejects rather than one that works. */
@@ -641,6 +782,169 @@ static void _test_unbreakable_word_folding(Test *const test) {
     test_case_end(test);
 }
 
+/* "No rendered line can pass 998 whatever the input" was false for exactly one
+ * value: from_name_set caps nothing and the From: line was never folded, so a
+ * 1000-byte ASCII display name went out as a single line past the hard limit -
+ * the header an MTA answers 5xx on. The name now takes the same fold-at-spaces,
+ * hard-split-at-998 path every other header value takes, and the address token
+ * that follows it is folded WITH it, so it cannot push the last line over. */
+static void _test_from_name_folding(Test *const test) {
+    test_case_begin(test, "a long From display name folds and hard-splits like every other header value");
+
+    HTTP_Service_Email          email   = DEFAULT_INITIALIZATION;
+    HTTP_Service_Email_Message  message = DEFAULT_INITIALIZATION;
+    char                        name[1001] = DEFAULT_INITIALIZATION;
+
+    for (USize i = 0; i < sizeof(name) - 1; i += 1) {
+        name[i] = 'n';
+    }
+
+    test_expect_true(test, "the service initializes", http_service_email_init_2(&email, _URL, "", "", _FROM));
+    test_expect_true(test, "the message initializes", http_service_email_message_init_1(&message));
+    test_expect_true(test, "a recipient is stored", http_service_email_message_to_add_1(&message, "person@example.com"));
+    test_expect_true(test, "the body is stored", http_service_email_message_text_set(&message, "hello"));
+    test_expect_true(test, "a 1000-byte display name with no space in it is stored, uncapped", http_service_email_from_name_set(&email, name));
+
+    HTTP_Service_Email_Render   const   render  = _render_fixed();
+    String                              payload = DEFAULT_INITIALIZATION;
+
+    test_expect_true(test, "the payload is built", http_service_email_payload_create_2(&email, &message, &render, &payload));
+    test_expect_true(test, "no rendered line passes the 998-octet hard limit", _longest_line(&payload) <= 998);
+    test_expect_u(test, "the From: line was hard-split at the limit exactly", 998, _longest_line(&payload));
+    test_expect_true(test, "onto a continuation line", _contains(&payload, "n\r\n n"));
+    test_expect_true(test, "with the address still attached to the name's last line", _contains(&payload, "n <" _FROM ">\r\nTo: "));
+
+    string_uninit(&payload);
+
+    /* A name WITH spaces (and a ',' that forces quoting) folds at them, like a
+     * Subject does - including inside the quoted-string, which is legal FWS. */
+    for (USize i = 0; i < sizeof(name) - 1; i += 1) {
+        name[i] = i % 10 == 9 ? ' ' : 'q';
+    }
+
+    name[3]                 = ',';
+    name[sizeof(name) - 2]  = 'q';
+
+    test_expect_true(test, "a 1000-byte quoted display name is stored", http_service_email_from_name_set(&email, name));
+    test_expect_true(test, "the payload is built", http_service_email_payload_create_2(&email, &message, &render, &payload));
+    test_expect_true(test, "and it folds at the spaces, so no line passes 78 columns", _longest_line(&payload) <= HTTP_SERVICE_EMAIL_HEADER_LINE_MAX_LENGTH);
+    test_expect_true(test, "the name was quoted", _contains(&payload, "From: \"qqq,qqqqq qqqqqqqqq"));
+    test_expect_true(test, "folded inside the quoted-string", _contains(&payload, "qqqqqqqqq\r\n qqqqqqqqq"));
+    test_expect_true(test, "and closed before the address", _contains(&payload, "\" <" _FROM ">\r\nTo: "));
+
+    string_uninit(&payload);
+
+    /* A non-ASCII name takes the encoded-word path, one word per folded line. */
+    for (USize i = 0; i + 1 < sizeof(name) - 1; i += 2) {
+        name[i]     = (char) 0xc3;
+        name[i + 1] = (char) 0xa9;
+    }
+
+    test_expect_true(test, "a 1000-byte non-ASCII display name is stored", http_service_email_from_name_set(&email, name));
+    test_expect_true(test, "the payload is built", http_service_email_payload_create_2(&email, &message, &render, &payload));
+    test_expect_true(test, "and no encoded-word line passes the hard limit either", _longest_line(&payload) <= 998);
+    test_expect_true(test, "it went out B-encoded", _contains(&payload, "From: =?UTF-8?B?"));
+
+    string_uninit(&payload);
+    http_service_email_message_uninit(&message);
+    http_service_email_uninit(&email);
+
+    test_case_end(test);
+}
+
+/* The hard split at 998 used to cut wherever the column fell, without looking
+ * at the bytes. A quoted display name escapes `"` to `\"` and `\` to `\\`, so a
+ * split landing between a `\` and the byte it escapes left the line ending in
+ * `\` and the continuation starting with the fold's WSP: unfolded (CRLF removed,
+ * WSP KEPT) the receiver reads `\ ` - the backslash now escapes the SPACE, the
+ * `"` closes the quoted-string early, and every byte after it sits OUTSIDE the
+ * quotes, where a `<evil@x>` in the name is parsed as the address. The split
+ * now steps back one byte when it would separate an escaping backslash from
+ * its pair; these pins parse the UNFOLDED From: the way a receiver does. */
+static void _test_from_name_fold_escape_pair(Test *const test) {
+    test_case_begin(test, "a hard split never separates a backslash from the byte it escapes");
+
+    HTTP_Service_Email          email       = DEFAULT_INITIALIZATION;
+    HTTP_Service_Email_Message  message     = DEFAULT_INITIALIZATION;
+    char                        name[1024]  = DEFAULT_INITIALIZATION;
+    char                        line[2048]  = DEFAULT_INITIALIZATION;
+
+    /* `From: "` is 7 columns, so name[i] renders at column 8 + i and the old
+     * split fell after column 998: name[990] is the first byte past it. A `"`
+     * there renders as `\"` with the `\` at 998 and the `"` at 999. */
+    for (USize i = 0; i < 990; i += 1) {
+        name[i] = 'n';
+    }
+
+    name[990] = '"';
+
+    char_copy_1(name + 991, "<evil@x>");
+
+    test_expect_true(test, "the service initializes", http_service_email_init_2(&email, _URL, "", "", _FROM));
+    test_expect_true(test, "the message initializes", http_service_email_message_init_1(&message));
+    test_expect_true(test, "a recipient is stored", http_service_email_message_to_add_1(&message, "person@example.com"));
+    test_expect_true(test, "the body is stored", http_service_email_message_text_set(&message, "hello"));
+    test_expect_true(test, "a space-free name with a '\"' at offset 990 and an address after it is stored", http_service_email_message_from_name_set(&message, name));
+
+    HTTP_Service_Email_Render   const   render  = _render_fixed();
+    String                              payload = DEFAULT_INITIALIZATION;
+
+    test_expect_true(test, "the payload is built", http_service_email_payload_create_2(&email, &message, &render, &payload));
+    test_expect_true(test, "no rendered line passes the 998-octet hard limit", _longest_line(&payload) <= 998);
+    test_expect_true(test, "the split stepped back so the `\\\"` pair opens the continuation together", _contains(&payload, "n\r\n \\\"<evil@x>\" <" _FROM ">\r\n"));
+    test_expect_u(test, "so the first From: line is one column short of the limit, not at it", 997, _longest_line(&payload));
+    test_expect_true(test, "the From: line unfolds", _unfolded_from_line(&payload, line, sizeof(line)) > 0);
+    test_expect_false(test, "and the unfolded line has no `\\ ` in it - no backslash escapes the fold's space", char_contains_1(line, "\\ "));
+    test_expect_true(test, "the ENTIRE name sits inside one quoted-string and the real address comes last", _quoted_from_ok(line, name, _FROM));
+    test_expect_false(test, "so `<evil@x>` is not the address a receiver parses", char_contains_1(line, "\" <evil@x>"));
+
+    string_uninit(&payload);
+
+    /* The `\\` variant: a `\` at offset 990 renders as `\\` across the same
+     * boundary. Split there, the unfolded `\ \"` escapes the space, then the
+     * closing quote - an unterminated quoted-string. */
+    name[990] = '\\';
+
+    test_expect_true(test, "a space-free name with a '\\' at offset 990 is stored", http_service_email_message_from_name_set(&message, name));
+    test_expect_true(test, "the payload is built", http_service_email_payload_create_2(&email, &message, &render, &payload));
+    test_expect_true(test, "no rendered line passes the 998-octet hard limit", _longest_line(&payload) <= 998);
+    test_expect_true(test, "the `\\\\` pair opens the continuation together", _contains(&payload, "n\r\n \\\\<evil@x>\" <" _FROM ">\r\n"));
+    test_expect_true(test, "the From: line unfolds", _unfolded_from_line(&payload, line, sizeof(line)) > 0);
+    test_expect_false(test, "with no `\\ ` in it", char_contains_1(line, "\\ "));
+    test_expect_true(test, "the quoted-string still closes, with the whole name inside and the real address last", _quoted_from_ok(line, name, _FROM));
+
+    string_uninit(&payload);
+
+    /* A fold at a SPACE is a word boundary, so the escape pair before it is
+     * never split: the `\"` ends the first line whole and the space opens the
+     * continuation. Pinned so the two fold paths cannot drift apart. */
+    for (USize i = 0; i < 70; i += 1) {
+        name[i] = 'w';
+    }
+
+    name[70] = '"';
+    name[71] = ' ';
+
+    for (USize i = 72; i < 92; i += 1) {
+        name[i] = 'x';
+    }
+
+    name[92] = '\0';
+
+    test_expect_true(test, "a name with a '\"' right before its only space is stored", http_service_email_message_from_name_set(&message, name));
+    test_expect_true(test, "the payload is built", http_service_email_payload_create_2(&email, &message, &render, &payload));
+    test_expect_true(test, "it folded at the space, with the `\\\"` pair whole at the end of the first line", _contains(&payload, "w\\\"\r\n xxx"));
+    test_expect_true(test, "the From: line unfolds", _unfolded_from_line(&payload, line, sizeof(line)) > 0);
+    test_expect_false(test, "with no `\\ ` in it", char_contains_1(line, "\\ "));
+    test_expect_true(test, "and the whole name sits inside one quoted-string, the real address last", _quoted_from_ok(line, name, _FROM));
+
+    string_uninit(&payload);
+    http_service_email_message_uninit(&message);
+    http_service_email_uninit(&email);
+
+    test_case_end(test);
+}
+
 /* A render context is CALLER-supplied, so its two char arrays are data: an
  * unterminated array runs char_length off the end of the struct, and a CRLF in
  * the Message-ID injects a header into a message every other surface here
@@ -901,6 +1205,39 @@ static void _test_init_from_env(Test *const test) {
     test_expect_true(test, "a non-\"0\" value is set", result_is_success(env_set_1("CFW_TEST_SMTP_VERIFY_TLS", "false")));
     test_expect_true(test, "the environment configures the service", http_service_email_init_from_env(&email, "CFW_TEST_SMTP"));
     test_expect_true(test, "and verification stays ON", email.verify_tls);
+    test_expect_i(test, "STARTTLS is REQUIRED when the variable is absent", HTTP_SERVICE_EMAIL_SECURITY_REQUIRED, email.security);
+    test_expect_true(test, "and the display name is empty when its variable is absent", string_empty(&email.from_name));
+
+    http_service_email_uninit(&email);
+
+    /* The header's own Mailpit example - a plaintext relay on 1025 - needs
+     * STARTTLS off, and that used to be reachable only from code. */
+    test_expect_true(test, "STARTTLS=none is set", result_is_success(env_set_1("CFW_TEST_SMTP_STARTTLS", "none")));
+    test_expect_true(test, "a display name is set", result_is_success(env_set_1("CFW_TEST_SMTP_FROM_NAME", "Mailpit Dev")));
+    test_expect_true(test, "the environment configures the service", http_service_email_init_from_env(&email, "CFW_TEST_SMTP"));
+    test_expect_i(test, "with STARTTLS off", HTTP_SERVICE_EMAIL_SECURITY_NONE, email.security);
+    test_expect_string(test, "and the display name from the environment", "Mailpit Dev", string_get_data(&email.from_name));
+
+    http_service_email_uninit(&email);
+
+    test_expect_true(test, "STARTTLS=optional is set", result_is_success(env_set_1("CFW_TEST_SMTP_STARTTLS", "optional")));
+    test_expect_true(test, "the environment configures the service", http_service_email_init_from_env(&email, "CFW_TEST_SMTP"));
+    test_expect_i(test, "with STARTTLS optional", HTTP_SERVICE_EMAIL_SECURITY_OPTIONAL, email.security);
+
+    http_service_email_uninit(&email);
+
+    test_expect_true(test, "STARTTLS=required is set", result_is_success(env_set_1("CFW_TEST_SMTP_STARTTLS", "required")));
+    test_expect_true(test, "the environment configures the service", http_service_email_init_from_env(&email, "CFW_TEST_SMTP"));
+    test_expect_i(test, "with STARTTLS required", HTTP_SERVICE_EMAIL_SECURITY_REQUIRED, email.security);
+
+    http_service_email_uninit(&email);
+
+    /* Any other spelling fails SAFE, exactly like VERIFY_TLS: a typo must never
+     * downgrade a relay to plaintext. (It is logged at WARN; the suite runs at
+     * ERROR, so the line is not in this output.) */
+    test_expect_true(test, "a misspelt STARTTLS is set", result_is_success(env_set_1("CFW_TEST_SMTP_STARTTLS", "None")));
+    test_expect_true(test, "the environment still configures the service", http_service_email_init_from_env(&email, "CFW_TEST_SMTP"));
+    test_expect_i(test, "and STARTTLS stays REQUIRED", HTTP_SERVICE_EMAIL_SECURITY_REQUIRED, email.security);
 
     http_service_email_uninit(&email);
 
@@ -909,6 +1246,8 @@ static void _test_init_from_env(Test *const test) {
     env_unset("CFW_TEST_SMTP_USER");
     env_unset("CFW_TEST_SMTP_PASSWORD");
     env_unset("CFW_TEST_SMTP_VERIFY_TLS");
+    env_unset("CFW_TEST_SMTP_STARTTLS");
+    env_unset("CFW_TEST_SMTP_FROM_NAME");
 
     test_case_end(test);
 }
@@ -963,8 +1302,23 @@ static void _test_init_from_env_diagnosis(Test *const test) {
 
     http_service_email_uninit(&email);
 
+    /* A display name the setter refuses is the same class: the environment
+     * named a value that cannot head a message, so the whole configuration is
+     * refused and the service handed back is the unconfigured default. */
+    test_expect_true(test, "a display name with a control byte is set", result_is_success(env_set_1("CFW_TEST_DIAG_SMTP_FROM_NAME", "App\rBcc: x@y")));
+
+    status = HTTP_SERVICE_EMAIL_STATUS_TRANSPORT_FAILED;
+
+    test_expect_false(test, "a display name the module refuses is refused", http_service_email_init_from_env_2(&email, "CFW_TEST_DIAG_SMTP", &status));
+    test_expect_i(test, "and named INVALID_CONFIGURATION", HTTP_SERVICE_EMAIL_STATUS_INVALID_CONFIGURATION, status);
+    test_expect_false(test, "with the service left unconfigured, not half-built", http_service_email_valid(&email));
+    test_expect_true(test, "and nothing of the refused name kept", string_empty(&email.from_name));
+
+    http_service_email_uninit(&email);
+
     env_unset("CFW_TEST_DIAG_SMTP_URL");
     env_unset("CFW_TEST_DIAG_SMTP_FROM");
+    env_unset("CFW_TEST_DIAG_SMTP_FROM_NAME");
 
     /* Every consumer logging a failed send hand-wrote these six names. */
     test_expect_string(test, "OK has a name", "ok", http_service_email_status_name(HTTP_SERVICE_EMAIL_STATUS_OK));
@@ -1075,6 +1429,8 @@ I32 main(void) {
     _test_quoted_printable_encoder(&test);
     _test_long_header_folding(&test);
     _test_unbreakable_word_folding(&test);
+    _test_from_name_folding(&test);
+    _test_from_name_fold_escape_pair(&test);
     _test_render_context_refusal(&test);
     _test_allocator_refusal(&test);
     _test_render_init(&test);

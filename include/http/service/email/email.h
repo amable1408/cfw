@@ -6,7 +6,7 @@
  *           libcurl SMTP transport and an in-memory capture transport.
  *  @author  CFW
  *  @date    2026-09-06
- *  @version 0.3.0
+ *  @version 0.4.0
  *  @license MIT (see LICENSE file)
  *
  *  Sends account, security, receipt, and notification emails while keeping
@@ -34,13 +34,16 @@
  *      mandatory; a missing Message-ID is a standard spam-score hit).
  *    - Non-ASCII Subject and display names RFC 2047 B-encoded; display names
  *      carrying RFC 5322 specials quoted; long header lines folded at their
- *      spaces - including caller-supplied custom headers - and HARD-SPLIT only
- *      at the 998-octet hard limit when a single word has no space to fold at,
- *      so no rendered line can pass RFC 5322's limit whatever the input.
+ *      spaces - including caller-supplied custom headers and the From display
+ *      name - and HARD-SPLIT only at the 998-octet hard limit when a single
+ *      word has no space to fold at, so no rendered line can pass RFC 5322's
+ *      limit whatever the input.
  *    - To, Cc, Bcc, Reply-To, custom headers, and default sender support.
  *    - Env-driven construction (http_service_email_init_from_env, and
  *      http_service_email_init_from_env_2 when the caller wants to tell "no
- *      relay was configured" from "the configured relay was refused").
+ *      relay was configured" from "the configured relay was refused"),
+ *      including the STARTTLS mode and the default display name, so the
+ *      Mailpit example below is reachable from <prefix>_STARTTLS=none.
  *    - Payload generation for tests and previews, with a caller-supplied render
  *      context so the output is byte-for-byte reproducible.
  *    - Arena and heap allocation support.
@@ -376,10 +379,13 @@ bool http_service_email_message_alloc_init_1(HTTP_Service_Email_Message *const s
  * @param email Address to check.
  * @return True when it holds EXACTLY ONE '@' with a non-empty local part and a
  *         non-empty domain, and every byte is printable US-ASCII other than
- *         whitespace, controls, '<', '>', ',' and '"' (which would otherwise
- *         permit header injection or break the address parse). A byte >= 0x80
- *         is refused: an internationalized address needs SMTPUTF8, which this
- *         transport does not negotiate.
+ *         whitespace, controls and every RFC 5322 §3.2.3 special but '.':
+ *         '(', ')', '<', '>', '[', ']', ':', ';', '\', ',' and '"'. Each of
+ *         those would permit header injection or change what a receiver parses
+ *         - "x:y@d" in a To: is a GROUP, "a(b@d" opens a comment - so the
+ *         rendered header would name a different recipient than the RCPT TO
+ *         envelope. A byte >= 0x80 is refused: an internationalized address
+ *         needs SMTPUTF8, which this transport does not negotiate.
  * @note The local part is capped at 64 octets and the domain at 255 - RFC 5321
  *       §4.5.3.1.1 and §4.5.3.1.2, the sizes every SMTP implementation must
  *       accept. The cap is not pedantry: a recipient list folds BETWEEN
@@ -425,6 +431,9 @@ bool http_service_email_ca_bundle_set(HTTP_Service_Email *const self, char const
  * @param name Sender display name; may be empty.
  * @return true when stored; false when it carried a control byte or the
  *         allocator refused.
+ * @note The length is NOT capped: the rendered From: line folds at the name's
+ *       spaces and is hard-split at 998 octets like every other header value,
+ *       so a long name can never produce a line an MTA rejects.
  */
 bool http_service_email_from_name_set(HTTP_Service_Email *const self, char const *const name);
 
@@ -450,9 +459,11 @@ void http_service_email_header_sanitize(char *const value);
 /**
  * @brief Initialize email service with defaults, in place.
  * @param self Uninitialized service to fill.
- * @return true when initialized. The service is VALID but NOT CONFIGURED: it
- *         has no URL, so http_service_email_valid answers false and a send
- *         reports HTTP_SERVICE_EMAIL_STATUS_NOT_CONFIGURED.
+ * @return true ALWAYS: the default allocates nothing (every String starts
+ *         empty), so there is no path on which it can refuse. The service is
+ *         VALID but NOT CONFIGURED: it has no URL, so http_service_email_valid
+ *         answers false and a send reports
+ *         HTTP_SERVICE_EMAIL_STATUS_NOT_CONFIGURED.
  */
 bool http_service_email_init_1(HTTP_Service_Email *const self);
 
@@ -474,15 +485,25 @@ bool http_service_email_init_2(HTTP_Service_Email *const self, char const *const
  * @param self Uninitialized service to fill.
  * @param prefix Environment variable prefix, e.g. "TRAYMON_SMTP".
  * @return true when <prefix>_URL and <prefix>_FROM were both present and the
- *         service came up configured. False means the service was initialized
- *         to the UNCONFIGURED default instead (still safe to use and to
- *         uninit), or - when it answers false with `self` untouched - that the
- *         allocator refused; http_service_email_valid tells the two apart.
- * @note Reads <prefix>_URL, <prefix>_USER, <prefix>_PASSWORD, <prefix>_FROM and
- *       <prefix>_VERIFY_TLS. VERIFY_TLS is honored only when it is exactly "0",
- *       which disables peer and host verification; anything else leaves
- *       verification on. These are the names the three existing consumers
- *       already read by hand.
+ *         service came up configured. False means `self` was initialized to
+ *         the UNCONFIGURED default instead - still safe to use and to uninit -
+ *         whether the environment named no relay or named one the module
+ *         refused. This bool CANNOT tell those two apart, and neither can
+ *         http_service_email_valid: the default has no URL, so valid() is
+ *         false on both paths. http_service_email_init_from_env_2 reports
+ *         which, and http_service_email_status_name puts it in a log line.
+ * @note Reads <prefix>_URL, <prefix>_USER, <prefix>_PASSWORD, <prefix>_FROM,
+ *       <prefix>_FROM_NAME, <prefix>_STARTTLS and <prefix>_VERIFY_TLS. The
+ *       first five are the names the three existing consumers already read by
+ *       hand. VERIFY_TLS is honored only when it is exactly "0", which disables
+ *       peer and host verification; anything else leaves verification on.
+ *       STARTTLS is exactly "none", "optional" or "required"
+ *       (HTTP_Service_Email_Security in that order); empty keeps the REQUIRED
+ *       default, and any other spelling ALSO stays REQUIRED - the safe side -
+ *       and is logged at WARN, because the deployment asked for a mode and did
+ *       not get it. FROM_NAME is passed through
+ *       http_service_email_from_name_set, so a control byte in it refuses the
+ *       whole configuration.
  * @note This tier CANNOT tell an unset variable from a value the module
  *       refused: `TRAYMON_SMTP_URL=smtp:/host` - one missing slash - boots a
  *       server that silently never mails and answers exactly like a machine
@@ -505,14 +526,16 @@ bool http_service_email_init_from_env(HTTP_Service_Email *const self, char const
  *       described no relay - a deliberate local build, not a fault.
  *       HTTP_SERVICE_EMAIL_STATUS_INVALID_CONFIGURATION means it described one
  *       and the module refused it: a URL that is not smtp:// or smtps://, one
- *       carrying userinfo, a sender that is not an address, or an allocator
- *       that declined. That one is a MISCONFIGURED deployment and deserves a
- *       loud startup line, because it looks identical to a working server until
- *       the first mail is not delivered.
+ *       carrying userinfo, a sender that is not an address, a display name
+ *       carrying a control byte, or an allocator that declined. That one is a
+ *       MISCONFIGURED deployment and deserves a loud startup line, because it
+ *       looks identical to a working server until the first mail is not
+ *       delivered.
  * @note Both false paths leave `self` initialized to the UNCONFIGURED default,
- *       safe to use and to uninit - except when the allocator refuses even that
- *       default, which leaves `self` untouched exactly as
- *       http_service_email_init_1 does.
+ *       safe to use and to uninit, without exception: that default is
+ *       http_service_email_init_1's, which allocates nothing and cannot refuse.
+ * @note Reads the same seven variables as http_service_email_init_from_env,
+ *       with the same STARTTLS and VERIFY_TLS parsing.
  */
 bool http_service_email_init_from_env_2(HTTP_Service_Email *const self, char const *const prefix, HTTP_Service_Email_Status *const out);
 
@@ -559,6 +582,7 @@ bool http_service_email_message_cc_add_2(HTTP_Service_Email_Message *const self,
  * @param name Sender display name; may be empty.
  * @return true when stored; false when it carried a control byte or the
  *         allocator refused.
+ * @note Not length-capped; see http_service_email_from_name_set.
  */
 bool http_service_email_message_from_name_set(HTTP_Service_Email_Message *const self, char const *const name);
 

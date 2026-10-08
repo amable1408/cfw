@@ -53,6 +53,8 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - sync: http/service/oauth
 - http/service/oauth 0.3.0 changes the signed state token's format (provider and binding are now length-prefixed, and the _2 tiers bind the state to a caller cookie). A 0.2.x process and a 0.3.0 process sharing a key do not verify each other's states: restart a multi-process deployment all at once, or expect one TTL (600 s) of bad_state redirects during a rolling restart.
 - sync: http/service/compression
+- sync: http/service/email
+- email 0.4.0: a hard header fold never splits a quoted-pair (step-back), closing a From-address spoof through an escaped display name
 
 ## 0.2.0 - release
 

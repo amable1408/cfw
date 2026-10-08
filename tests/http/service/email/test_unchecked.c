@@ -85,6 +85,12 @@ I32 main(void) {
 
     test_expect_false(&test, "a 65-octet local part is refused, not fatal", http_service_email_address_valid(oversized));
 
+    /* Every RFC 5322 special but '.' is a value refusal too: a ':' would turn
+     * the rendered To: into a GROUP and name a different recipient than the
+     * envelope does. */
+    test_expect_false(&test, "a group-opening ':' is refused, not fatal", http_service_email_address_valid("x:y@d"));
+    test_expect_false(&test, "a comment-opening '(' is refused, not fatal", http_service_email_address_valid("a(b@d"));
+
     test_expect_true(&test, "the message initializes", http_service_email_message_init_1(&message));
 
     /* An empty address is DATA (a blank users.email cell), never a programming
