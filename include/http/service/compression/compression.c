@@ -907,8 +907,15 @@ bool http_service_compression_send(HTTP_Service_Compression const *const self, H
      * slice labelled `bytes a-b/n` of the identity file is a body no client can reassemble.
      * The refusal lives HERE rather than in each caller because the seam is public: static's
      * Range path already routes through it, and any future caller would repeat the mistake.
-     * Vary is still emitted below - it is about the representation, not this one reply. */
-    bool const codeable = status_code != HTTP_SERVER_STATUS_CODE_PARTIAL_CONTENT;
+     * Vary is still emitted below - it is about the representation, not this one reply.
+     * The body-less statuses join it: a 1xx, 204 or 304 is the set http_server_response_send_2
+     * drops a body for even when the caller passed one, and RFC 9110 15.4.5 wants no
+     * representation metadata on a 304 - so coding that body would spend the codec to queue a
+     * Content-Encoding the reply must not carry. */
+    bool const codeable = status_code >= 200                                   &&
+                          status_code != HTTP_SERVER_STATUS_CODE_NO_CONTENT      &&
+                          status_code != HTTP_SERVER_STATUS_CODE_PARTIAL_CONTENT &&
+                          status_code != HTTP_SERVER_STATUS_CODE_NOT_MODIFIED;
 
     HTTP_Service_Compression_Type type = HTTP_SERVICE_COMPRESSION_TYPE_NONE;
 

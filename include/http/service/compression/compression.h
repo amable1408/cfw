@@ -1,6 +1,6 @@
 /*
  * compression.h - HTTP response compression service for the C Libraries Framework
- * @version 0.3.1
+ * @version 0.3.2
  *
  * Negotiates a response content coding from the client's Accept-Encoding header,
  * compresses a whole response body buffer-to-buffer, and - through one send seam -
@@ -173,7 +173,9 @@ typedef struct {
 #endif // ARENA_IMPLEMENTATION
     /** @brief Brotli quality, HTTP_SERVICE_COMPRESSION_MIN_BROTLI_QUALITY..MAX. */
     int brotli_quality;
-    /** @brief zlib deflate level, HTTP_SERVICE_COMPRESSION_MIN_GZIP_LEVEL..MAX. */
+    /** @brief zlib deflate level, HTTP_SERVICE_COMPRESSION_MIN_GZIP_LEVEL..MAX. Level 0 is accepted but
+     * can never win: Z_NO_COMPRESSION emits stored blocks, which are always at least the input plus
+     * framing, so the seam refuses the result on every call and sends identity. Use 1..9. */
     int gzip_level;
     /** @brief Largest payload that may be compressed; 0 means no upper bound. */
     USize max_size;
@@ -333,10 +335,13 @@ HTTP_Service_Compression_Type http_service_compression_negotiate_3(HTTP_Service_
  * which no client can undo. Send such a body through http_server_response_send_2 with its own
  * Content-Encoding header instead.
  *
- * A BODY-LESS reply is never coded either. A 204 No Content or a 304 Not Modified carries no
- * representation to code: data_size 0 is below any min_size above 0, and even at min_size 0
- * compress refuses a zero size, so the reply goes out as identity on both routes. At min_size 0
- * a compressible type still gets its Vary header, which is what a shared cache wants.
+ * A BODY-LESS status is never coded either, WHATEVER body it is handed. A 1xx, a 204 No Content or a
+ * 304 Not Modified is refused on the status code exactly as 206 is - the same set
+ * http_server_response_send_2 itself drops a body for - so a caller that passes the payload with a
+ * 304 gets no codec run and no Content-Encoding label; RFC 9110 section 15.4.5 says a 304 SHOULD NOT
+ * carry representation metadata beyond Content-Location, Date, ETag and Vary. The gate does not
+ * argue from data_size 0, which send_2 never imposes. A compressible type still gets its Vary
+ * header, which is what a shared cache wants.
  *
  * The request METHOD is deliberately NOT inspected. A HEAD reply must carry the headers the GET
  * it mirrors would carry, so the seam negotiates, compresses and labels it identically and lets

@@ -21,8 +21,11 @@
  *   - one live server on port 0 answering br, gzip and identity, with Content-Encoding
  *     and Vary on the wire and a decoded body byte-identical to what the route handed in,
  *     including an Accept-Encoding that is present but names no coding;
- *   - and the same live server refusing to code a 206 Partial Content reply (RFC 9110
- *     section 14.4), which still carries Vary.
+ *   - the same live server refusing to code a 206 Partial Content reply (RFC 9110
+ *     section 14.4), which still carries Vary;
+ *   - and a 304 Not Modified handed the WHOLE payload, which must leave with no
+ *     Content-Encoding and no coded body (RFC 9110 section 15.4.5): the seam gates on the
+ *     status code, not on a data_size 0 that send_2 never imposes.
  *
  * The live case is shaped after tests/http/server/test_all.c: http_server_run on port 0, the
  * ephemeral port read back with http_server_get_port, and a raw `net` socket for the client so
@@ -742,6 +745,16 @@ static void _on_slice(HTTP_Server_Route *const route) {
         sizeof(_live_payload), _HTML_TYPE, HTTP_SERVER_STATUS_CODE_PARTIAL_CONTENT);
 }
 
+/* The 304 shape a careless conditional-GET caller writes: the full payload handed to the seam
+ * with Not Modified. send_2 drops that body on its own; the seam has to refuse the CODING before
+ * it, or the reply queues a Content-Encoding for a body that never leaves. */
+static void _on_fresh(HTTP_Server_Route *const route) {
+    HTTP_Server_Holder *const holder = http_server_route_get_holder(route);
+
+    http_service_compression_send(&_live_compression, holder->request, holder->response, (Byte const*) _live_payload,
+        sizeof(_live_payload), _HTML_TYPE, HTTP_SERVER_STATUS_CODE_NOT_MODIFIED);
+}
+
 static void _handle(void *const context, HTTP_Server_Request *const request, HTTP_Server_Response *const response) {
     HTTP_Server        *const server = (HTTP_Server*) context;
     HTTP_Server_Holder         holder = { .request = request, .response = response, .arena = nullptr };
@@ -840,6 +853,30 @@ static void _live_slice_exchange(Test *const test, U16 const port) {
         char_compare_equal_2((char const*) reply + body_start, sizeof(_live_payload), _live_payload, sizeof(_live_payload)));
 }
 
+/* The 304 exchange: a client that asked for br, a route that hands the seam the whole payload
+ * under Not Modified, and a reply with no Content-Encoding and no body at all. */
+static void _live_fresh_exchange(Test *const test, U16 const port) {
+    Byte    reply[_REPLY_MAX]   = DEFAULT_INITIALIZATION;
+    USize   reply_size          = 0;
+
+    if (!test_expect_true(test, "the fresh request round trips", _round_trip(port, "/fresh", "br", reply, sizeof(reply), &reply_size))) {
+        return;
+    }
+
+    USize header_size = 0;
+    USize body_start  = 0;
+
+    if (!test_expect_true(test, "the fresh reply has a header block", _reply_split(reply, reply_size, &header_size, &body_start))) {
+        return;
+    }
+
+    char const *const headers = (char const*) reply;
+
+    test_expect_true(test, "answered 304", _find_ignore_case(headers, header_size, "304") != USIZE_MAX);
+    test_expect_true(test, "no Content-Encoding on a 304", _find_ignore_case(headers, header_size, "content-encoding") == USIZE_MAX);
+    test_expect_u(test, "and no coded body behind it", 0, reply_size - body_start);
+}
+
 static void _test_compression_live_route(Test *const test) {
     test_case_begin(test, "a live route answers br, gzip and identity");
 
@@ -855,6 +892,7 @@ static void _test_compression_live_route(Test *const test) {
 
     test_expect_true(test, "the route registers", http_server_route_add(&server, "/document", _on_document));
     test_expect_true(test, "the Range route registers", http_server_route_add(&server, "/slice", _on_slice));
+    test_expect_true(test, "the Not Modified route registers", http_server_route_add(&server, "/fresh", _on_fresh));
     test_expect_true(test, "http_server_run succeeds on port 0", result_is_success(http_server_run(&server, 0, true)));
 
     U16 const port = http_server_get_port(&server);
@@ -874,6 +912,7 @@ static void _test_compression_live_route(Test *const test) {
      * still answers identity for a syntactically present but coding-free value. */
     _live_exchange(test, port, ",", "");
     _live_slice_exchange(test, port);
+    _live_fresh_exchange(test, port);
 
     http_server_stop(&server);
     http_server_uninit(&server);
