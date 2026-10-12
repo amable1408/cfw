@@ -212,6 +212,40 @@ static void _test_rate_limit_unknown_rule_refused(Test *const test) {
     test_case_end(test);
 }
 
+static void _test_rate_limit_refusal_time_left(Test *const test) {
+    test_case_begin(test, "a refusal's get_time_left_2 is check_2's retry_after, never 0");
+
+    HTTP_Service_Rate_Limit rate_limit = DEFAULT_INITIALIZATION;
+
+    /* The instance's cooldown (45) and the registered rule's (300) differ on purpose, so each
+     * assertion below proves WHICH cooldown answered, not merely that something non-zero did. */
+    test_expect_true(test, "init_2 succeeds", http_service_rate_limit_init_2(&rate_limit, 60, 45));
+    test_expect_true(test, "rule_add registers login", http_service_rate_limit_rule_add_1(&rate_limit, "login", 5, 300) != USIZE_MAX);
+
+    char const *const key = "203.0.113.31";
+
+    /* The recommended 429 pairing is blocked_2 -> get_time_left_2. blocked_2 reads an unknown
+     * rule as blocked, so a 0 here would emit "Retry-After: 0" for the very request refused. */
+    HTTP_Service_Rate_Limit_Result result = DEFAULT_INITIALIZATION;
+
+    test_expect_false(test, "check_2 refuses the unknown rule", http_service_rate_limit_check_2(&rate_limit, "lgoin", key, &result));
+    test_expect_u(test, "with the instance's cooldown as its retry_after", 45, result.retry_after);
+    test_expect_true(test, "blocked_2 reads the unknown rule as blocked", http_service_rate_limit_blocked_2(&rate_limit, "lgoin", key));
+    test_expect_u(test, "get_time_left_2 answers the same instance cooldown", result.retry_after, http_service_rate_limit_get_time_left_2(&rate_limit, "lgoin", key));
+
+    /* An unusable key under a REGISTERED rule answers that rule's cooldown on both forms. */
+    HTTP_Service_Rate_Limit_Result empty_result = DEFAULT_INITIALIZATION;
+
+    test_expect_false(test, "check_2 refuses an empty key", http_service_rate_limit_check_2(&rate_limit, "login", "", &empty_result));
+    test_expect_u(test, "with the rule's cooldown as its retry_after", 300, empty_result.retry_after);
+    test_expect_u(test, "get_time_left_2 answers the same rule cooldown", empty_result.retry_after, http_service_rate_limit_get_time_left_2(&rate_limit, "login", ""));
+    test_expect_u(test, "no refusal recorded anything", 0, http_service_rate_limit_get_size(&rate_limit));
+
+    http_service_rate_limit_uninit(&rate_limit);
+
+    test_case_end(test);
+}
+
 static void _test_rate_limit_key_refusals(Test *const test) {
     test_case_begin(test, "an empty or oversize key is refused fail-closed");
 
@@ -260,7 +294,14 @@ static void _test_rate_limit_null_key_refused(Test *const test) {
     test_expect_false(test, "check_2 refuses a null key", http_service_rate_limit_check_2(&rate_limit, nullptr, nullptr, &result));
     test_expect_true(test, "and still fills a well-formed 429 answer", !result.allowed && result.remaining == 0 && result.retry_after > 0);
     test_expect_u(test, "get_remaining_2 answers no budget", 0, http_service_rate_limit_get_remaining_2(&rate_limit, nullptr, nullptr));
-    test_expect_u(test, "get_time_left_2 answers nothing to wait for", 0, http_service_rate_limit_get_time_left_2(&rate_limit, nullptr, nullptr));
+
+    /* A refusal is a real wait, not "nothing to wait for": blocked_2 just read this key as
+     * blocked, so a 429 built from blocked_2 -> get_time_left_2 must not send Retry-After: 0. */
+    USize const time_left = http_service_rate_limit_get_time_left_2(&rate_limit, nullptr, nullptr);
+
+    test_expect_true(test, "get_time_left_2 answers a real wait, never 0", time_left > 0);
+    test_expect_u(test, "the same wait check_2 reported as its retry_after", result.retry_after, time_left);
+    test_expect_u(test, "get_time_left_1 agrees on an empty key", 60, http_service_rate_limit_get_time_left_1(&rate_limit, ""));
 
     http_service_rate_limit_hit_2(&rate_limit, nullptr, nullptr);
     http_service_rate_limit_reset_2(&rate_limit, nullptr, nullptr);
@@ -1166,6 +1207,7 @@ int main(void) {
     _test_rate_limit_check_result(&test);
     _test_rate_limit_per_rule_budgets(&test);
     _test_rate_limit_unknown_rule_refused(&test);
+    _test_rate_limit_refusal_time_left(&test);
     _test_rate_limit_key_refusals(&test);
     _test_rate_limit_null_key_refused(&test);
     _test_rate_limit_window_expiry(&test);

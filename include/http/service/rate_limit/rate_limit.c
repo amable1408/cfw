@@ -613,6 +613,11 @@ static bool _http_service_rate_limit_hit(HTTP_Service_Rate_Limit *const self, ch
  * same instant this call judged it against rather than taking a second reading. It is written
  * before any refusal, so it is usable on every path.
  *
+ * `cooldown` is likewise written before any refusal: the INSTANCE's cooldown until the rule
+ * resolves, then the rule's. A refused read therefore still carries the wait check_* reports as
+ * its retry_after for the same input - the instance's for an unknown rule, the rule's for an
+ * unusable key - so get_time_left_* can answer that wait instead of 0 (rate_limit.h Error Handling).
+ *
  * `overflow_left` is how much longer the rule's overflow bucket refuses a key that has NO record,
  * and 0 whenever it does not - so every read-only query judges an unrecorded key against the same
  * bucket the registering calls spend, instead of reading it as unlimited while the table is
@@ -627,7 +632,7 @@ static bool _http_service_rate_limit_read(HTTP_Service_Rate_Limit *const self, c
                                           USize *const limit, USize *const cooldown, ChronoInstant *const now, USize *const overflow_left, USize *const overflow_remaining) {
     trace_log_push(LOG_METADATA);
 
-    *cooldown           = 0;
+    *cooldown           = self->cooldown;
     *count              = 0;
     *index              = USIZE_MAX;
     *limit              = 0;
@@ -1063,6 +1068,14 @@ USize http_service_rate_limit_get_time_left_2(HTTP_Service_Rate_Limit *const sel
                 value = elapsed >= cooldown ? 1 : cooldown - elapsed;
             }
         }
+    }
+    else {
+        /* A REFUSED read - unknown rule, empty, null or oversize key - is blocked_* answering true
+         * and check_* answering false with a real retry_after, so the wait here is that same
+         * retry_after, never 0: the recommended 429 pairing (blocked_2 -> get_time_left_2) would
+         * otherwise send "Retry-After: 0" to exactly the request it refused. _read leaves the
+         * instance's cooldown for an unknown rule and the rule's for an unusable key. */
+        value = cooldown;
     }
 
     thread_mutex_unlock(&self->mutex);

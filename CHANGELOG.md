@@ -55,6 +55,12 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - sync: http/service/compression
 - sync: http/service/email
 - email 0.4.0: a hard header fold never splits a quoted-pair (step-back), closing a From-address spoof through an escaped display name
+- sync: encoding/quoted_printable, http/client, http/query, http/service/cors, http/service/oauth, http/service/rate_limit, http/service/static
+- http/client 0.4.0: `http_client_header_add` and `http_client_set_user_agent` now return bool and REFUSE a value carrying CR or LF (libcurl forwards header strings verbatim, so caller data could inject header lines); new `http_client_header_add_2(name, value)`; an arena-backed Result's `error` is now an owned copy (it was a view the next request on the same handle overwrote). Source-compatible for callers that ignored the old void return.
+- http/service/static 0.4.0: a Range response's window is capped at 1 MiB (was 4 MiB buffered per in-flight request); the ETag is now STRONG (`"size-mtime"`, no `W/`), so clients revalidate once after upgrading; If-None-Match uses the weak comparison (lists, `*`, `W/`); new opt-in `refuse_dotfiles`. On Windows it now refuses NTFS stream names (`:`), components ending in `.` or space, 8.3 short-name aliases (`~` + digit), and reserved device names with spaces or dots before the extension (`CONIN$ .txt`, `AUX .html` previously opened the device and blocked the serving thread), plus `CONIN$`, `CONOUT$`, `CLOCK$` and the superscript COM/LPT forms.
+- http/service/cors 0.4.0: `origin_add` refuses a malformed origin (it must be `scheme://host[:port]`), refuses `null` while `allow_credentials` is on (as it already refused `*`), strips a scheme's default port (`:443`, `:80`) and refuses a port that is 0, has a leading zero or exceeds 65535. A configuration that relied on any of these now gets `false` and a WARN at startup.
+- http/service/rate_limit 0.3.5: `get_time_left_*` answers the same wait `check_*` reports on a refusal, never 0, so the blocked/time-left pairing no longer emits `Retry-After: 0`.
+- encoding/quoted_printable 0.2.0: new `ENCODING_QUOTED_PRINTABLE_ENCODE_SIZE_MAX(byte_count)` for sizing a fixed buffer.
 
 ## 0.2.0 - release
 

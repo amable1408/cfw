@@ -4,17 +4,21 @@
 
 #include <http/service/static/static.h>
 
-/* Implementation dependencies: static.h's API names none of them. Keeping compression OUT of the
- * header is not cosmetic - there it dragged an unpublished module into published static's
- * dependency closure and broke the public export. file arrives only through http_server.h, whose
- * API names no File type, an ACCIDENTAL chain.
- * See style_guidelines.md, "Avoid Redundant Chained Includes". */
+// libwebsockets.h is owed directly: lws_get_mimetype, lws_hdr_copy, WSI_TOKEN_* and struct lws are
+// named here, and a third-party header a CFW module re-exports is included like any other.
+#include <libwebsockets.h>
+
+// char.h is singled out because it declares no TYPES at all: no header's API can ever name one,
+// so every chain that happens to reach it is accidental and a file using char_* owes it directly.
 #include <char/char.h>
 #include <datetime/datetime.h>
 #include <dir/dir.h>
 #include <file/file.h>
 #include <http/headers/headers.h>
+// Compression stays OUT of static.h: there it dragged an unpublished module into published
+// static's dependency closure and broke the public export.
 #include <http/service/compression/compression.h>
+#include <memory/memory.h>
 
 /*==============================================================================
  * MARK: - Types
@@ -126,14 +130,21 @@ static _HTTP_Service_Static_Mime const _HTTP_SERVICE_STATIC_MIME_TABLE[] = {
     { ".gz",            CHAR_STATIC_SIZE(".gz"),            "application/gzip",             false }
 };
 
-/* Largest window returned for one Range response; caps memory for open-ended ranges. See
- * static.h's Range requests note for the LWS_WITH_RANGES trade-off this cap avoids. */
-#define _HTTP_SERVICE_STATIC_RANGE_CHUNK_MAX (4 * 1024 * 1024)
+/* Largest window returned for one Range response. The 206 path BUFFERS its whole window - one heap
+ * copy here, then a second LWS_PRE-prefixed copy inside http_server_response_send_2, which lws may
+ * hold for a slow reader - where the 200 path streams through send_file with no per-connection
+ * copy. Any client turns the cheap path into this one with `Range: bytes=0-`, so the cap is a
+ * per-request memory amplifier and stays small: 1 MiB. A streaming
+ * http_server_response_send_file_range (the window read in lws-sized chunks on the writable
+ * callback, no module-side buffer at all) is deferred behind an RSS measurement of many slow
+ * concurrent ranged readers. See static.h's Range requests note for the LWS_WITH_RANGES
+ * trade-off. */
+#define _HTTP_SERVICE_STATIC_RANGE_CHUNK_MAX (1 * 1024 * 1024)
 /* Maximum digits accepted per Range number; the I64/ISize digit count keeps
  * accumulation below 2^64 (no wrap) and stays cross-checked by types.h. */
 #define _HTTP_SERVICE_STATIC_RANGE_DIGITS_MAX ISIZE_DIGITS_MAX
 /* Buffer size for the Range request header and the Content-Range response header. Also used for
- * If-None-Match/If-Range: a weak ETag here is short (size+mtime in hex), but a client may quote
+ * If-None-Match/If-Range: an ETag here is short (size+mtime in hex), but a client may quote
  * a longer value than we generated - this stays generous rather than truncating a real one into
  * a false mismatch. NOTE: lws_hdr_copy returns -1 (not clamped) for a header longer
  * than the buffer, and every call site below treats that exactly like "header absent" - a client
@@ -326,19 +337,83 @@ static bool _http_service_static_range_parse(char const *const range, USize cons
 }
 
 /*
- * Render a weak ETag from file size and mtime - "W/<size-hex>-<mtime-hex>". Cheap (no file
- * content is read) and changes whenever either input changes, which is what a static-file
- * server needs: it does not survive a byte-identical rewrite with a preserved mtime, but no
- * caller here relies on that finer guarantee.
+ * Render a STRONG ETag from file size and mtime - "<size-hex>-<mtime-hex>", quoted, no W/
+ * prefix. Cheap (no file content is read) and changes whenever either input changes, which is
+ * what a static-file server needs: it does not survive a byte-identical rewrite with a preserved
+ * mtime, but no caller here relies on that finer guarantee. Strong, as nginx and Apache emit the
+ * same size+mtime pair, because If-Range uses the strong comparison (RFC 9110 S13.1.5) - a weak
+ * tag can never match there, and Chromium resumes a partial download only against a strong
+ * validator. The one-second mtime granularity is the same accepted risk either way.
  */
 static USize _http_service_static_etag(USize const file_size, I64 const mtime, char *const buffer, USize const capacity) {
     trace_log_push(LOG_METADATA);
 
-    USize const size = (USize) snprintf(buffer, capacity, "W/\"%llx-%llx\"", (unsigned long long) file_size, (unsigned long long) mtime);
+    USize const size = (USize) snprintf(buffer, capacity, "\"%llx-%llx\"", (unsigned long long) file_size, (unsigned long long) mtime);
 
     trace_log_pop();
 
     return size;
+}
+
+/*
+ * Whether an If-None-Match VALUE matches `etag`, by the WEAK comparison RFC 9110 S13.1.2 requires
+ * there (unlike If-Range's strong one): "*" matches any existing representation, and otherwise the
+ * value is a comma-separated list whose members match when their opaque-tags are equal once a
+ * leading "W/" is stripped from each side. Every member is trimmed of optional whitespace (space,
+ * tab). The scan is bounded by `value_size` - the value is request data, so a malformed one is
+ * simply "no match", never an error_check. The caller only asks this for a file it has stat'ed.
+ */
+static bool _http_service_static_if_none_match(char const *const value, USize const value_size, char const *const etag, USize const etag_size) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "value", (void*) value);
+    error_check_null(LOG_METADATA, "etag", (void*) etag);
+
+    char    const   *tag        = etag;
+    USize           tag_size    = etag_size;
+
+    if (tag_size >= CHAR_STATIC_SIZE("W/") && tag[0] == 'W' && tag[1] == '/') {
+        tag         += CHAR_STATIC_SIZE("W/");
+        tag_size    -= CHAR_STATIC_SIZE("W/");
+    }
+
+    USize cursor = 0;
+
+    while (cursor < value_size) {
+        USize member_start  = cursor;
+        USize member_end    = cursor;
+
+        while (member_end < value_size && value[member_end] != ',') {
+            member_end += 1;
+        }
+
+        cursor = member_end + 1;
+
+        while (member_start < member_end && (value[member_start] == ' ' || value[member_start] == '\t')) {
+            member_start += 1;
+        }
+
+        while (member_end > member_start && (value[member_end - 1] == ' ' || value[member_end - 1] == '\t')) {
+            member_end -= 1;
+        }
+
+        if (member_end - member_start >= CHAR_STATIC_SIZE("W/") && value[member_start] == 'W' && value[member_start + 1] == '/') {
+            member_start += CHAR_STATIC_SIZE("W/");
+        }
+
+        char    const *const    member      = value + member_start;
+        USize   const           member_size = member_end - member_start;
+
+        if ((member_size == 1 && member[0] == '*') || (tag_size > 0 && char_compare_equal_2(member, member_size, tag, tag_size))) {
+            trace_log_pop();
+
+            return true;
+        }
+    }
+
+    trace_log_pop();
+
+    return false;
 }
 
 /* RFC 7231 "HTTP-date" (IMF-fixdate) rendering, e.g. "Wed, 21 Oct 2015 07:28:00 GMT". Datetime's
@@ -415,7 +490,15 @@ static bool _http_service_static_is_symlink(HTTP_Service_Static const *const sel
 
         if (dir_list_entries_1(parent_for_lookup, &entries, &count)) {
             for (USize i = 0; i < count; i += 1) {
-                if (char_compare_equal_1(entries[i].name, segment)) {
+#ifdef _WIN32
+                /* NTFS names are case-insensitive: "LINKDIR" opens the entry listed as "linkdir",
+                 * so an exact match would miss the link and serve straight through it. */
+                bool const matches = char_compare_iequal_1(entries[i].name, segment);
+#else
+                bool const matches = char_compare_equal_1(entries[i].name, segment);
+#endif // _WIN32
+
+                if (matches) {
                     is_link = entries[i].is_link;
 
                     break;
@@ -452,26 +535,78 @@ static bool _http_service_static_is_symlink(HTTP_Service_Static const *const sel
     return false;
 }
 
+/*
+ * Whether any component of the request-relative path `rel_path` starts with '.', for the opt-in
+ * self->refuse_dotfiles check - `.git`, `.env`, `.htaccess`, `.vscode/` and the like, at any
+ * depth. Exactly `.well-known` is exempt: it is the one dot-directory the web platform mandates
+ * (ACME challenges, assetlinks.json, security.txt). Both '/' and '\\' separate components, since
+ * Windows opens either. Pure path arithmetic - no file-system access.
+ */
+static bool _http_service_static_has_dotfile(char const *const rel_path, USize const rel_path_size) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "rel_path", (void*) rel_path);
+
+    USize cursor = 0;
+
+    while (cursor < rel_path_size) {
+        USize const segment_start = cursor;
+
+        while (cursor < rel_path_size && rel_path[cursor] != '/' && rel_path[cursor] != '\\') {
+            cursor += 1;
+        }
+
+        USize const segment_size = cursor - segment_start;
+
+        if (segment_size > 0                                                                                          &&
+            rel_path[segment_start] == '.'                                                                            &&
+            !char_compare_equal_2(rel_path + segment_start, segment_size, ".well-known", CHAR_STATIC_SIZE(".well-known"))) {
+            trace_log_pop();
+
+            return true;
+        }
+
+        cursor += 1;
+    }
+
+    trace_log_pop();
+
+    return false;
+}
+
 #ifdef _WIN32
 /*
  * Whether `name` (a single path COMPONENT, not a full path - the caller passes the resolved
- * file's base name) is a Windows reserved device name: CON, PRN, AUX, NUL, COM1-9, LPT1-9,
- * matched case-insensitively and with or without a trailing extension ("nul.txt" counts, same as
- * bare "nul"). Windows resolves these specially at the filesystem-API level regardless of
- * whatever a stat-family call like file_exists_1 reports - "nul" opens the null device (a stream
- * that reads EOF and discards writes) and "con"/"aux"/"lpt1" open a console/serial/parallel
- * device, none of which is the on-disk file the request appeared to name. Checked only on
- * Windows, since the restriction is Windows-specific; static roots deployed on Linux have no
- * such device namespace to guard against.
+ * file's base name) is refused on Windows. Two shapes:
+ *   - A reserved device name: AUX, CLOCK$, CON, CONIN$, CONOUT$, NUL, PRN, COM1-9, LPT1-9 and
+ *     the superscript-digit COM/LPT forms, matched case-insensitively and with or without a
+ *     trailing extension ("nul.txt" counts, same as bare "nul"). The stem is what precedes the
+ *     first '.', with its own trailing spaces and dots trimmed the way Win32 trims them before
+ *     its device check ("CONIN$ .txt" and "AUX .html" open the device). The superscript forms
+ *     are refused in BOTH encodings: the ANSI APIs file_exists_1 and lws call read one byte
+ *     (cp1252 0xB9/0xB2/0xB3) as the device digit, the wide APIs read the UTF-8 pair, so any
+ *     stem of COM or LPT followed only by bytes >= 0x80 is refused - never a real asset name. Windows
+ *     resolves these specially at the filesystem-API level regardless of whatever a stat-family
+ *     call like file_exists_1 reports - "nul" opens the null device (a stream that reads EOF and
+ *     discards writes) and "con"/"aux"/"lpt1" open a console/serial/parallel device, none of
+ *     which is the on-disk file the request appeared to name.
+ *   - A name ending in ' ' or '.': Win32 strips those before the lookup, so "secret.txt." opens
+ *     secret.txt - a second spelling of every asset, under a MIME type its suffix no longer
+ *     names. No real NTFS name ends that way, so the spelling is refused, not normalized.
+ * Checked only on Windows, since both are Win32 path semantics; static roots deployed on Linux
+ * have neither to guard against. (A ':' anywhere - an NTFS alternate data stream - is refused
+ * by the caller on the whole relative path, not here.)
  */
-static bool _http_service_static_is_reserved_windows_name(char const *const name, USize const name_size) {
+static bool _http_service_static_is_refused_windows_name(char const *const name, USize const name_size) {
     trace_log_push(LOG_METADATA);
 
     error_check_null(LOG_METADATA, "name", (void*) name);
 
+    /* The superscript-digit COM/LPT forms are not listed: the non-ASCII rule below refuses them
+     * in both their single-byte ANSI and their UTF-8 spellings. */
     static char const *const reserved[] = {
-        "AUX", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-        "CON", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "NUL"
+        "AUX", "CLOCK$", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "CON", "CONIN$", "CONOUT$",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "NUL", "PRN"
     };
 
     /* Win32 strips trailing spaces and dots from a final path component before it looks the
@@ -493,14 +628,87 @@ static bool _http_service_static_is_reserved_windows_name(char const *const name
         }
     }
 
+    /* Win32 trims the stem too before its device check: "CONIN$ .txt" and "AUX .html" open the
+     * device exactly like "CONIN$.txt" and "AUX.html" do. */
+    while (stem_size > 0 && (name[stem_size - 1] == ' ' || name[stem_size - 1] == '.')) {
+        stem_size -= 1;
+    }
+
+    bool is_reserved = false;
+
     for (USize i = 0; i < sizeof(reserved) / sizeof(reserved[0]); i += 1) {
         USize const reserved_size = char_length(reserved[i]);
 
         if (stem_size == reserved_size && _http_service_static_extension_equal(name, reserved[i], reserved_size)) {
+            is_reserved = true;
+
+            break;
+        }
+    }
+
+    /* COM or LPT followed only by bytes >= 0x80: the ANSI APIs read the single cp1252 byte
+     * 0xB9/0xB2/0xB3 as the superscript device digit, the wide APIs the UTF-8 pair. */
+    if (!is_reserved && stem_size > 3 && (_http_service_static_extension_equal(name, "COM", 3) || _http_service_static_extension_equal(name, "LPT", 3))) {
+        is_reserved = true;
+
+        for (USize i = 3; i < stem_size; i += 1) {
+            if ((U8) name[i] < 0x80) {
+                is_reserved = false;
+
+                break;
+            }
+        }
+    }
+
+    trace_log_pop();
+
+    return is_reserved || trimmed_size != name_size;
+}
+
+/*
+ * Whether any component of the request-relative path `rel_path` - intermediate ones included, not
+ * just the base name _http_service_static_is_refused_windows_name sees - is a second Win32
+ * spelling of some other on-disk name. Two shapes, refused unconditionally on Windows (nginx and
+ * IIS refuse both):
+ *   - A component ending in '.' or ' ': Win32 strips a trailing dot from an INTERMEDIATE
+ *     component too, so "sub./a.txt" opens sub/a.txt while every lexical check - the
+ *     refuse_symlinks listing match included - sees a name that does not exist. (A trailing
+ *     space on an intermediate component is not stripped; refusing both keeps one rule.)
+ *   - A component containing '~' followed by an ASCII digit: the shape of an NTFS 8.3 short name
+ *     (".env" is reachable as "ENV~1", ".git" as "GIT~1", ".htaccess" as "HTACCE~1" on any volume
+ *     with short names enabled, C: by default). A short alias defeats refuse_dotfiles, the
+ *     refuse_symlinks listing match and the device-name list alike, so it is refused whether or
+ *     not any of those knobs is on. A real long name of that shape ("backup~1.txt") is refused
+ *     too - the accepted cost.
+ * Both '/' and '\\' separate components, since Windows opens either. Pure path arithmetic.
+ */
+static bool _http_service_static_has_refused_windows_component(char const *const rel_path, USize const rel_path_size) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "rel_path", (void*) rel_path);
+
+    USize cursor = 0;
+
+    while (cursor < rel_path_size) {
+        USize const segment_start = cursor;
+
+        while (cursor < rel_path_size && rel_path[cursor] != '/' && rel_path[cursor] != '\\') {
+            if (rel_path[cursor] == '~' && cursor + 1 < rel_path_size && char_is_number(rel_path[cursor + 1])) {
+                trace_log_pop();
+
+                return true;
+            }
+
+            cursor += 1;
+        }
+
+        if (cursor > segment_start && (rel_path[cursor - 1] == '.' || rel_path[cursor - 1] == ' ')) {
             trace_log_pop();
 
             return true;
         }
+
+        cursor += 1;
     }
 
     trace_log_pop();
@@ -789,7 +997,7 @@ static bool _http_service_static_serve_range(HTTP_Server_Request *const request,
 
 /*
  * Resolve an incoming request path to an on-disk file, honoring route_prefix, the directory
- * default_file, SPA fallback, and (opt-in) symlink refusal - everything serve_1/serve_2 need
+ * default_file, SPA fallback, and (opt-in) dotfile and symlink refusal - everything serve_1/serve_2 need
  * before the header-driven conditional-GET/Range decision, which is the only part that differs
  * between the two entry points. Returns false when nothing should be served, in which case the
  * caller must also report "not served" without touching file_name/out_mimetype/out_charset.
@@ -829,6 +1037,35 @@ static bool _http_service_static_resolve(HTTP_Service_Static const *const self, 
     while (rel_path_size > 0 && rel_path[0] == '/') {
         rel_path        += 1;
         rel_path_size   -= 1;
+    }
+
+#ifdef _WIN32
+    /* ':' is never legal in an NTFS name, so on Windows it can only spell an alternate data
+     * stream - "index.html:Zone.Identifier" opens the stream (a downloaded file's ReferrerUrl and
+     * HostUrl), "index.html::$DATA" the file again under a MIME type no suffix matches. A drive
+     * spelling ("C:x") is refused by the same byte; the root is always prefixed anyway. */
+    for (USize i = 0; i < rel_path_size; i += 1) {
+        if (rel_path[i] == ':') {
+            trace_log_pop();
+
+            return false;
+        }
+    }
+
+    /* An 8.3 short alias or a trailing-dot/space component anywhere in the path - the second
+     * spellings every lexical refusal below would otherwise compare against the wrong name. */
+    if (_http_service_static_has_refused_windows_component(rel_path, rel_path_size)) {
+        trace_log_pop();
+
+        return false;
+    }
+#endif // _WIN32
+
+    /* Opt-in: off by default, so zero cost unless a caller explicitly asks. */
+    if (self->refuse_dotfiles && _http_service_static_has_dotfile(rel_path, rel_path_size)) {
+        trace_log_pop();
+
+        return false;
     }
 
     /* GET .../sub/ (a trailing slash on a non-root relative path) serves sub/index.html the same
@@ -903,7 +1140,7 @@ static bool _http_service_static_resolve(HTTP_Service_Static const *const self, 
             }
         }
 
-        if (_http_service_static_is_reserved_windows_name(file_name + base_start, file_name_size - base_start)) {
+        if (_http_service_static_is_refused_windows_name(file_name + base_start, file_name_size - base_start)) {
             trace_log_pop();
 
             return false;
@@ -982,7 +1219,7 @@ static bool _http_service_static_resolve(HTTP_Service_Static const *const self, 
  * extraction are both done. Both serve_1 (legacy wsi-read headers) and serve_2 (clean
  * http_server_request_header_copy-read headers) funnel into this, so the RFC 9110 decision logic
  * - If-None-Match takes precedence over If-Modified-Since (S13.1.1), If-Range gates whether a
- * Range is honored, the 4 MiB range cap, 416 on an unsatisfiable range - exists exactly once.
+ * Range is honored, the 1 MiB range cap, 416 on an unsatisfiable range - exists exactly once.
  */
 static bool _http_service_static_serve_conditional(
     HTTP_Service_Static const *const self,
@@ -1000,8 +1237,8 @@ static bool _http_service_static_serve_conditional(
     error_check_null(LOG_METADATA, "mimetype", (void*) mimetype);
     error_check_null(LOG_METADATA, "headers", (void*) headers);
 
-    /* Conditional GET: Last-Modified + a weak ETag from size+mtime, a 304 on a
-     * matching If-None-Match, and a 304 on an If-Modified-Since that the file has not
+    /* Conditional GET: Last-Modified + a strong ETag from size+mtime, a 304 on a
+     * weakly-matching If-None-Match, and a 304 on an If-Modified-Since that the file has not
      * changed since - via datetime_from_http_try, an RFC 7231 IMF-fixdate parser. */
     USize   file_size   = 0;
     I64     mtime       = 0;
@@ -1025,7 +1262,9 @@ static bool _http_service_static_serve_conditional(
         bool not_modified = false;
 
         if (headers->if_none_match_size > 0) {
-            not_modified = etag_size > 0 && char_compare_equal_2(headers->if_none_match, headers->if_none_match_size, etag, etag_size);
+            /* WEAK comparison, list-aware, "*" honoured (RFC 9110 S13.1.2) - a cache that stored
+             * the tag as W/"..." or batches several tags still gets its 304. */
+            not_modified = etag_size > 0 && _http_service_static_if_none_match(headers->if_none_match, headers->if_none_match_size, etag, etag_size);
         }
         else if (headers->if_modified_since_size > 0) {
             /* Only consulted when If-None-Match is absent - it takes precedence per RFC 9110
@@ -1064,7 +1303,9 @@ static bool _http_service_static_serve_conditional(
     /*
      * Serve a single byte range as 206 Partial Content when the client requests one AND
      * If-Range (if present) still matches the current ETag, so a range is never served against a
-     * stale cached copy. libwebsockets is a system dependency, not vendored, and whether it was
+     * stale cached copy. If-Range uses the STRONG comparison (RFC 9110 S13.1.5): the byte-equal
+     * test below is exactly that against our strong tag, and a W/-prefixed value - which a client
+     * must not send there - never matches, so it falls back to a full 200. libwebsockets is a system dependency, not vendored, and whether it was
      * built with LWS_WITH_RANGES cannot be assumed, so this hand-rolled path runs
      * unconditionally.
      */
@@ -1180,6 +1421,7 @@ HTTP_Service_Static http_service_static_init_1(char const *const root_dir, char 
     self.default_file_size  = CHAR_STATIC_SIZE("index.html");
     self.spa_fallback       = false;
     self.max_age            = 0;
+    self.refuse_dotfiles    = false;
     self.refuse_symlinks    = false;
 
     trace_log_pop();
@@ -1231,6 +1473,7 @@ HTTP_Service_Static http_service_static_init_2(char const *const root_dir, char 
 
     self.spa_fallback       = spa_fallback;
     self.max_age            = max_age;
+    self.refuse_dotfiles    = false;
     self.refuse_symlinks    = false;
 
     trace_log_pop();

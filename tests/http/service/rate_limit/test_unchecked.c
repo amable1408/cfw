@@ -84,7 +84,7 @@ int main(void) {
     test_expect_true(&test, "blocked_2 reads a null key as blocked", http_service_rate_limit_blocked_2(&rate_limit, nullptr, nullptr));
     test_expect_false(&test, "check_2 refuses a null key", http_service_rate_limit_check_2(&rate_limit, nullptr, nullptr, nullptr));
     test_expect_u(&test, "get_remaining_2 answers no budget", 0, http_service_rate_limit_get_remaining_2(&rate_limit, nullptr, nullptr));
-    test_expect_u(&test, "get_time_left_2 answers nothing to wait for", 0, http_service_rate_limit_get_time_left_2(&rate_limit, nullptr, nullptr));
+    test_expect_u(&test, "get_time_left_2 answers the cooldown, never 0", 60, http_service_rate_limit_get_time_left_2(&rate_limit, nullptr, nullptr));
 
     http_service_rate_limit_hit_2(&rate_limit, nullptr, nullptr);
     http_service_rate_limit_reset_2(&rate_limit, nullptr, nullptr);

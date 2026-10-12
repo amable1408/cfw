@@ -7,6 +7,7 @@
 // char.h is singled out because it declares no TYPES at all: no header's API can ever name one,
 // so every chain that happens to reach it is accidental and a file using char_* owes it directly.
 #include <char/char.h>
+#include <http/query/query.h>
 
 /*==============================================================================
  * MARK: - Constants

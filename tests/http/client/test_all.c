@@ -25,7 +25,14 @@
  * idempotent, two clients on one thread staying independent, the escape_1 family
  * (unreserved/space/UTF-8/empty), escape_3 agreeing with the RFC 3986 rule on every byte
  * 0x00-0xFF (the parity pin that gated moving the family off curl_easy_escape onto
- * http_query_encode_2), and the fixture COUNTING and CLOSING on a script it cannot send.
+ * http_query_encode_2), the fixture COUNTING and CLOSING on a script it cannot send, an arena-backed
+ * Result's error text staying byte-identical after a second request on the same handle (an OWNED
+ * copy, not a view over libcurl's error buffer), an arena-backed Result whose arena refuses the error
+ * copy keeping the text on the heap, and header_add / set_user_agent refusing CR/LF while
+ * header_add_2 sends "Name: value", refuses an empty or non-token name and a CR in the value, trims
+ * OWS from the value and sends an all-SP/HTAB value as present-but-empty (never a suppression),
+ * and a User-Agent over libcurl's 8 000 000-byte input limit answering false with the module's
+ * default User-Agent (not the previous override) restored on the wire.
  *
  * No network beyond loopback; every port is OS-assigned; every wait is timeout-bounded so a
  * broken peer cannot hang the suite.
@@ -39,6 +46,7 @@
 #include <container/str/str.h>
 #include <http/client/http_client.h>
 #include <log/log.h>
+#include <memory/memory.h>
 #include <net/net.h>
 #include <test/test.h>
 
@@ -1727,6 +1735,226 @@ static void _test_timeout_zero_no_abort_checked_build(Test *const test) {
     test_case_end(test);
 }
 
+static void _test_arena_result_error_survives_next_request(Test *const test) {
+    test_case_begin(test, "an arena-backed Result's error text is an OWNED copy - byte-identical after a second request on the same handle zeroes libcurl's error buffer");
+
+    Fixture_Server failing_server = DEFAULT_INITIALIZATION;
+    failing_server.script = FIXTURE_SCRIPT_PARTIAL_CLOSE;
+    failing_server.partial_close_content_length = 1000;
+    failing_server.partial_close_send_size = 200;
+
+    if (!_start(test, &failing_server)) {
+        test_case_end(test);
+
+        return;
+    }
+
+    char url[64] = DEFAULT_INITIALIZATION;
+    _url_for(fixture_server_port(&failing_server), "/", url, sizeof(url));
+
+    HTTP_Client *client = http_client_new();
+    Arena arena = arena_init_1(64 * 1024, ARENA_TYPE_LINEAR);
+    String response = string_alloc_init_1(&arena);
+    HTTP_Client_Result first = http_client_get(client, url, &response);
+
+    fixture_server_join(&failing_server);
+    string_uninit(&failing_server.request_body);
+
+    char first_error[CURL_ERROR_SIZE] = DEFAULT_INITIALIZATION;
+    USize const first_error_size = string_get_size(&first.error);
+
+    test_expect_false(test, "the first (mid-body close) request failed at transport", first.success);
+    test_expect_true(test, "the first Result is arena-backed", first.allocator == &arena);
+    test_expect_true(test, "the first Result carries a non-empty error", first_error_size > 0);
+    test_expect_true(test, "the error text fits the snapshot buffer", first_error_size < sizeof(first_error));
+
+    if (first_error_size > 0 && first_error_size < sizeof(first_error)) {
+        memcpy(first_error, string_get_data(&first.error), first_error_size);
+    }
+
+    Fixture_Server ok_server = DEFAULT_INITIALIZATION;
+    ok_server.script = FIXTURE_SCRIPT_OK;
+
+    if (_start(test, &ok_server)) {
+        _url_for(fixture_server_port(&ok_server), "/", url, sizeof(url));
+
+        String second_response = string_init_1();
+        HTTP_Client_Result second = http_client_get(client, url, &second_response);
+
+        test_expect_true(test, "the second request on the same handle succeeded", http_client_result_is_ok(&second));
+
+        fixture_server_join(&ok_server);
+
+        test_expect_u(test, "the first Result's error size is unchanged", first_error_size, string_get_size(&first.error));
+        test_expect_true(test, "the first Result's error text is byte-identical after the second request",
+                         memcmp(first_error, string_get_data(&first.error), first_error_size) == 0);
+
+        http_client_result_uninit(&second);
+        string_uninit(&second_response);
+        string_uninit(&ok_server.request_body);
+    }
+
+    http_client_result_uninit(&first);
+    string_uninit(&response);
+    http_client_delete(&client);
+    arena_uninit(&arena, ARENA_TYPE_LINEAR);
+
+    test_case_end(test);
+}
+
+static void _test_arena_result_error_falls_back_to_heap(Test *const test) {
+    test_case_begin(test, "an arena-backed Result whose arena REFUSES the error copy keeps the diagnostic on the heap (error.allocator == nullptr), never an empty error");
+
+    Fixture_Server server = DEFAULT_INITIALIZATION;
+    server.script = FIXTURE_SCRIPT_STALL;
+
+    if (!_start(test, &server)) {
+        test_case_end(test);
+
+        return;
+    }
+
+    char url[64] = DEFAULT_INITIALIZATION;
+    _url_for(fixture_server_port(&server), "/", url, sizeof(url));
+
+    HTTP_Client *client = http_client_new();
+
+    http_client_set_timeout_ms(client, 300);
+
+    /* The REFUSED arena (byte_count 0, handler nullptr), not a filled one: a capacity-
+     * exhausted linear arena ABORTS in arena_linear_alloc under ERROR_CHECK_ENABLED, so
+     * the refused geometry is the only arena that makes string_alloc_init_static answer
+     * the empty String the heap fallback keys on. The stall times out with no body byte
+     * written, so the failure is the transport's own, not an arena-capped write. */
+    Arena  arena    = arena_init_1(0, ARENA_TYPE_LINEAR);
+    String response = string_alloc_init_1(&arena);
+
+    HTTP_Client_Result result = http_client_get(client, url, &response);
+
+    test_expect_false(test, "success is false", result.success);
+    test_expect_true(test, "status == TIMEOUT (a transport failure, not an arena-capped write)", result.status == HTTP_CLIENT_STATUS_TIMEOUT);
+    test_expect_true(test, "the Result is arena-backed, so error_set tried the arena first", result.allocator == &arena);
+    test_expect_true(test, "the error text is non-empty", string_get_size(&result.error) > 0);
+    test_expect_null(test, "the error copy took the heap fallback (error.allocator == nullptr)", (void*) result.error.allocator);
+
+    http_client_result_uninit(&result);
+
+    test_expect_u(test, "result_uninit released the heap error", 0, string_get_size(&result.error));
+
+    string_uninit(&response);
+    arena_uninit(&arena, ARENA_TYPE_LINEAR);
+    http_client_delete(&client);
+    fixture_server_join(&server);
+    string_uninit(&server.request_body);
+
+    test_case_end(test);
+}
+
+static void _test_header_injection_refused_and_header_add_2(Test *const test) {
+    test_case_begin(test, "loopback: header_add / set_user_agent refuse CR/LF; header_add_2 sends \"Name: value\" and refuses a bad name or a CR value");
+
+    Fixture_Server server = DEFAULT_INITIALIZATION;
+    server.script = FIXTURE_SCRIPT_OK;
+
+    if (!_start(test, &server)) {
+        test_case_end(test);
+
+        return;
+    }
+
+    char url[64] = DEFAULT_INITIALIZATION;
+    _url_for(fixture_server_port(&server), "/", url, sizeof(url));
+
+    HTTP_Client *client = http_client_new();
+
+    test_expect_false(test, "header_add with an embedded CRLF is refused", http_client_header_add(client, "X-A: 1\r\nX-B: 2"));
+    test_expect_false(test, "set_user_agent with an embedded LF is refused", http_client_set_user_agent(client, "evil/1.0\nX-UA-Injected: 1"));
+    test_expect_true(test, "header_add_2 happy path is accepted", http_client_header_add_2(client, "X-Name", "v"));
+    test_expect_true(test, "header_add_2 with an empty value is accepted", http_client_header_add_2(client, "X-Empty", ""));
+    test_expect_false(test, "header_add_2 with an empty name is refused", http_client_header_add_2(client, "", "v"));
+    test_expect_false(test, "header_add_2 with a space in the name is refused", http_client_header_add_2(client, "X Name", "v"));
+    test_expect_false(test, "header_add_2 with a CR in the value is refused", http_client_header_add_2(client, "X-Cr", "a\rX-Cr-Injected: 1"));
+    test_expect_true(test, "header_add_2 with an all-SP value is accepted", http_client_header_add_2(client, "X-Space", " "));
+    test_expect_true(test, "header_add_2 Accept with an all-HTAB value is accepted", http_client_header_add_2(client, "Accept", "\t"));
+    test_expect_true(test, "header_add_2 with an OWS-padded value is accepted", http_client_header_add_2(client, "X-Trim", "  v  "));
+    test_expect_true(test, "header_add with a plain line is still accepted", http_client_header_add(client, "X-Plain: ok"));
+
+    String response = string_init_1();
+    HTTP_Client_Result result = http_client_get(client, url, &response);
+
+    test_expect_true(test, "the request succeeded", http_client_result_is_ok(&result));
+
+    fixture_server_join(&server);
+
+    test_expect_null(test, "the peer never saw X-A", (void*) strstr(server.request_headers, "X-A"));
+    test_expect_null(test, "the peer never saw X-B", (void*) strstr(server.request_headers, "X-B"));
+    test_expect_null(test, "the peer never saw the injected User-Agent line", (void*) strstr(server.request_headers, "X-UA-Injected"));
+    test_expect_true(test, "the refused User-Agent left the default in place", strstr(server.request_headers, "User-Agent: cfw-http-client/") != nullptr);
+    test_expect_true(test, "the peer saw header_add_2's \"X-Name: v\"", strstr(server.request_headers, "X-Name: v") != nullptr);
+    test_expect_true(test, "the peer saw the empty-valued X-Empty header", strstr(server.request_headers, "X-Empty:") != nullptr);
+    test_expect_null(test, "the peer never saw the refused \"X Name\"", (void*) strstr(server.request_headers, "X Name"));
+    test_expect_null(test, "the peer never saw the refused X-Cr header", (void*) strstr(server.request_headers, "X-Cr"));
+    test_expect_true(test, "the peer saw the plain header_add line", strstr(server.request_headers, "X-Plain: ok") != nullptr);
+    test_expect_true(test, "the all-SP X-Space reached the peer present and empty", strstr(server.request_headers, "X-Space:") != nullptr);
+    test_expect_true(test, "the all-HTAB Accept did not suppress libcurl's own Accept", strstr(server.request_headers, "Accept:") != nullptr);
+    test_expect_true(test, "the OWS-padded value was trimmed to \"X-Trim: v\"", strstr(server.request_headers, "X-Trim: v\r\n") != nullptr);
+
+    http_client_result_uninit(&result);
+    string_uninit(&response);
+    http_client_delete(&client);
+    string_uninit(&server.request_body);
+
+    test_case_end(test);
+}
+
+static void _test_user_agent_over_libcurl_limit_restores_default(Test *const test) {
+    test_case_begin(test, "loopback: a User-Agent over libcurl's 8 000 000-byte input limit is refused (false) and the module default goes out, not the previous override");
+
+    Fixture_Server server = DEFAULT_INITIALIZATION;
+    server.script = FIXTURE_SCRIPT_OK;
+
+    if (!_start(test, &server)) {
+        test_case_end(test);
+
+        return;
+    }
+
+    char url[64] = DEFAULT_INITIALIZATION;
+    _url_for(fixture_server_port(&server), "/", url, sizeof(url));
+
+    HTTP_Client *client = http_client_new();
+
+    /* One byte over CURL_MAX_INPUT_LENGTH (8 000 000): libcurl answers
+     * CURLE_BAD_FUNCTION_ARGUMENT on every release, no out-of-memory needed. The
+     * prior override matters: on the tree's libcurl 8.22 a refused set keeps the old
+     * value, so seeing the DEFAULT on the wire proves the restore, not libcurl. */
+    USize const oversized_length = 8000001;
+    char *const oversized = (char*) memory_alloc(oversized_length + 1);
+    memory_set(oversized, oversized_length, 'a');
+
+    test_expect_true(test, "a normal override is accepted first", http_client_set_user_agent(client, "previous-agent/1.0"));
+    test_expect_false(test, "the over-limit User-Agent is refused", http_client_set_user_agent(client, oversized));
+
+    memory_free(oversized);
+
+    String response = string_init_1();
+    HTTP_Client_Result result = http_client_get(client, url, &response);
+
+    test_expect_true(test, "the request after the refusal succeeded", http_client_result_is_ok(&result));
+
+    fixture_server_join(&server);
+
+    test_expect_true(test, "the peer saw the module default User-Agent", strstr(server.request_headers, "User-Agent: cfw-http-client/") != nullptr);
+    test_expect_null(test, "the peer never saw the previous override", (void*) strstr(server.request_headers, "previous-agent/1.0"));
+
+    http_client_result_uninit(&result);
+    string_uninit(&response);
+    http_client_delete(&client);
+    string_uninit(&server.request_body);
+
+    test_case_end(test);
+}
+
 /* ── entry point ──────────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -1774,6 +2002,10 @@ int main(void) {
     _test_perform_resets_active_response_and_postfields(&test);
     _test_refused_arena_response_write_reports_truncation(&test);
     _test_timeout_zero_no_abort_checked_build(&test);
+    _test_arena_result_error_survives_next_request(&test);
+    _test_arena_result_error_falls_back_to_heap(&test);
+    _test_header_injection_refused_and_header_add_2(&test);
+    _test_user_agent_over_libcurl_limit_restores_default(&test);
 
     test_suite_end(&test);
 

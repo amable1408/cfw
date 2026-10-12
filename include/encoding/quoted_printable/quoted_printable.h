@@ -6,7 +6,7 @@
  *           encoding for mostly-text data.
  *  @author  CFW
  *  @date    2026-09-06
- *  @version 0.1.0
+ *  @version 0.2.0
  *  @license MIT (see LICENSE file)
  *
  *  General-purpose Quoted-Printable encoder for the framework. It is the
@@ -75,7 +75,9 @@
  *      encoding needs. The capacity is checked BEFORE each write, so a short
  *      buffer can never be overrun; on refusal the output contents are
  *      unspecified and encoded_size is untouched. Size the buffer with
- *      encoding_quoted_printable_encode_size, which answers the EXACT count.
+ *      encoding_quoted_printable_encode_size, which answers the EXACT count,
+ *      or, for a stack buffer, with
+ *      ENCODING_QUOTED_PRINTABLE_ENCODE_SIZE_MAX(input_size), an upper bound.
  *    - encoding_quoted_printable_encode_2 answers false when the String
  *      allocator refuses to grow; the sink then holds a TRUNCATED prefix of the
  *      encoding and must not be sent.
@@ -118,6 +120,13 @@
  * MARK: - Macros
  *============================================================================*/
 
+/** @brief Upper bound on encoding_quoted_printable_encode_size(..., byte_count), for sizing a fixed
+ * buffer: exact for all-escaped input except at a positive multiple of 25 bytes (then 3 over), looser
+ * for text - encode_size is the exact answer. A soft-broken line holds at least 25
+ * input bytes, so breaks <= byte_count / 25. Computes in USize and wraps once 3n + 3n/25
+ * passes USIZE_MAX, i.e. above about USIZE_MAX / 3.12. */
+#define ENCODING_QUOTED_PRINTABLE_ENCODE_SIZE_MAX(byte_count) ((3 * (USize) (byte_count)) + 3 * ((USize) (byte_count) / ((ENCODING_QUOTED_PRINTABLE_LINE_MAX_LENGTH - 1) / 3)))
+
 /** @brief Characters an encoded line may hold, soft break included (RFC 2045). */
 #define ENCODING_QUOTED_PRINTABLE_LINE_MAX_LENGTH 76
 
@@ -131,7 +140,10 @@
  *                        terminator needed).
  * @param input_size      Length of input in bytes; 0 is legal.
  * @param output          Destination buffer; NOT NUL-terminated by this call.
- * @param output_capacity Capacity of output in characters.
+ * @param output_capacity Capacity of output in characters: at least
+ *                        encode_size(input, input_size), or
+ *                        ENCODING_QUOTED_PRINTABLE_ENCODE_SIZE_MAX(input_size)
+ *                        for a fixed buffer.
  * @param encoded_size    Receives the written character count on success;
  *                        untouched on refusal.
  * @return RESULT_SUCCESS, or RESULT_CATEGORY_ARGUMENT when output_capacity is

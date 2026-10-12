@@ -3,7 +3,7 @@
  *  --------------------------------------------------------------------------
  *  @file    http_client.h
  *  @brief   Blocking HTTP client wrapper over libcurl, behind an opaque, reusable handle.
- *  @version 0.3.0
+ *  @version 0.4.0
  *  @license MIT (see LICENSE file)
  *
  *  General-purpose (no project coupling). Wraps one libcurl easy handle per
@@ -22,6 +22,9 @@
  *     budget) so a hostile or misbehaving server cannot exhaust memory
  *   - Per-handle request headers and per-handle last-response headers/status -
  *     no state shared between two clients on the same thread
+ *   - Header-injection refusal: a request header or User-Agent carrying CR/LF is
+ *     refused (false + WARN), never forwarded to libcurl's verbatim writer;
+ *     http_client_header_add_2 also validates the name as an RFC 9110 token
  *   - URL escaping (char* or String), percent-encoded by http/query - one
  *     encoder in the tree, not a second copy behind curl_easy_escape
  *
@@ -65,7 +68,10 @@
  *
  * Memory Management:
  *   Create a client with http_client_new and release it with http_client_delete.
- *   Each request answers an owned-error HTTP_Client_Result; release it with
+ *   Each request answers an owned-error HTTP_Client_Result on every branch (heap or
+ *   arena-backed): its `error` text is a copy, never a view over the handle's libcurl
+ *   error buffer, so a Result kept past the next request on the same handle - or past
+ *   http_client_delete - still reads its own text. Release it with
  *   http_client_result_uninit. A request writes its body into the caller-owned
  *   `response` String when one is passed, or into the handle's own body (read
  *   back with http_client_response_body) when `response` is nullptr - that body
@@ -73,6 +79,21 @@
  *   deleted. The request header list (http_client_header_add) and the last
  *   response's header list are owned by the handle and released by
  *   http_client_header_clear / http_client_delete.
+ *
+ *   Arena-backed `response`: the arena must have room for max_response_size plus
+ *   the Result's error text (which is copied into the same arena). A REFUSED arena
+ *   (one that answers no memory without aborting) degrades: the body write stops
+ *   with HTTP_CLIENT_STATUS_ERROR and the "arena refused to grow" error text, and
+ *   the error copy falls back to the heap. A live but EXHAUSTED arena does NOT
+ *   degrade - a linear arena aborts on exhaustion under error checks (the tree-wide
+ *   allocate contract), and here the size is chosen by the remote peer, so an
+ *   undersized arena is a process abort a server can trigger. "Room for the cap"
+ *   is NOT the cap itself: a fresh String on a linear arena regrows by DOUBLING
+ *   into a new borrow and the arena never reclaims the superseded buffer, so a
+ *   body near the cap can consume about 4x the cap. Either string_reserve the
+ *   response to max_response_size + 1 once before the request (then the cap plus
+ *   the error text is enough), size the arena for about 4x the cap, lower the cap
+ *   with http_client_set_max_response_size, or use a heap-backed `response`.
  *
  * Defaults:
  *   TLS peer + host verification ON; no CA override (system trust store); redirects
@@ -84,7 +105,9 @@
  *   over TLS falls back to 1.1 (HTTP/3 is never attempted - see the compatibility
  *   note below); HTTP auth method ANY; no cookie jar unless the caller manages
  *   cookies itself via http_client_get_handle; User-Agent "cfw-http-client/<linked
- *   libcurl version>" (override with http_client_set_user_agent).
+ *   libcurl version>" (override with http_client_set_user_agent); proxy: libcurl's
+ *   environment defaults (http_proxy / https_proxy / ALL_PROXY / NO_PROXY) apply until
+ *   http_client_set_proxy is called - pass "" to force a direct connection.
  *
  * Redirects and credentials:
  *   A custom header added through http_client_header_add (including a hand-rolled
@@ -127,19 +150,20 @@
  * Dependencies:
  *   - <curl/curl.h>, <pthread.h>, <container/string/string.h>,
  *     <http/query/query.h>
- *   - <http/query/query.h>: the escape family's percent-encoder. Included here
- *     rather than in the .c per the tree's "includes live in the header"
- *     convention; it pulls only arena/str/string, so no cycle and no new
- *     third-party dependency. Every makefile that compiles http_client.c must
- *     also compile include/http/query/query.c.
+ *   - <http/query/query.h>: the escape family's percent-encoder
+ *     (http_query_encode_2), included by http_client.c only - no declaration in
+ *     this header names a query symbol. It pulls only arena/str/string, so no
+ *     cycle and no new third-party dependency. Every makefile that compiles
+ *     http_client.c must also compile include/http/query/query.c.
  *   - <pthread.h>: pthread_once/pthread_once_t gate the process-wide
- *     curl_global_init in the .c. Needed on both platforms this tree builds
- *     for - MinGW ships a full winpthreads-backed <pthread.h> on Windows,
- *     glibc's is native on Linux - so unlike thread/thread.h (which drops to
- *     Win32 primitives on OS_WINDOWS) this module takes the same header on
- *     every target. Not exposed by this header: no public type here names a
- *     pthread type; it is included here (not the .c) per the tree's "includes
- *     live in the header" convention.
+ *     curl_global_init, included by http_client.c only - no public type here
+ *     names a pthread type. Needed on both platforms this tree builds for -
+ *     MinGW ships a full winpthreads-backed <pthread.h> on Windows, glibc's is
+ *     native on Linux - so unlike thread/thread.h (which drops to Win32
+ *     primitives on OS_WINDOWS) this module takes the same header on every
+ *     target.
+ *   - <curl/curl.h> and <container/string/string.h> are the header's own
+ *     includes: CURL, CURLcode, struct curl_slist and String are named by the API.
  *
  * See http_client.c for implementation details.
  * ============================================================================
@@ -148,10 +172,8 @@
 #define HTTP_CLIENT_H
 
 #include <curl/curl.h>
-#include <pthread.h>
 
 #include <container/string/string.h>
-#include <http/query/query.h>
 
 #if !CURL_AT_LEAST_VERSION(7, 85, 0)
 #error "http/client requires libcurl >= 7.85 (CURLOPT_REDIR_PROTOCOLS_STR)"
@@ -315,11 +337,41 @@ void http_client_global_uninit(void);
 HTTP_Client_Result http_client_head(HTTP_Client *const self, char const *const url, String *const response);
 
 /**
- * @brief Add a request header to this handle's header list.
+ * @brief Add a raw request header line to this handle's header list.
+ *
+ * The raw-line form: use it for libcurl's special spellings ("Name;" sends an
+ * empty-valued header, "Name:" suppresses a header libcurl would add itself). For
+ * an ordinary header prefer http_client_header_add_2, which also validates the name.
+ *
+ * libcurl sends the line verbatim, so a `header` containing any '\r' or '\n' (an
+ * injected second header line) is REFUSED as a value: nothing is appended, a WARN
+ * is logged, and false is answered - never an abort.
  * @param self HTTP client handle.
  * @param header Full header line ("Name: value").
+ * @return true when the line was appended; false when it carried CR/LF or libcurl
+ *         could not allocate the list node (the list built so far is kept either way).
  */
-void http_client_header_add(HTTP_Client *const self, char const *const header);
+bool http_client_header_add(HTTP_Client *const self, char const *const header);
+
+/**
+ * @brief Build "name: value" and add it to this handle's header list.
+ *
+ * VALUE refusals (WARN logged, nothing appended, false answered - never an abort):
+ * an empty name, a name holding any byte outside RFC 9110 tchar (ALPHA, DIGIT and
+ * !#$%&'*+-.^_`|~ - so a space, ':' or CR/LF is refused), and a value containing
+ * '\r' or '\n'. Leading and trailing SP/HTAB (RFC 9110 OWS) are trimmed from the
+ * value, so ("X", "  v  ") sends "X: v". An empty value is legal, and so is one that is
+ * all SP/HTAB - it trims to empty: either is handed to libcurl as "name;" (its
+ * empty-value spelling), so the peer sees "name:" - a bare "name:" (or "name:" followed
+ * only by blanks) would instead tell libcurl to suppress that header, including one
+ * libcurl adds itself (e.g. Accept).
+ * @param self HTTP client handle.
+ * @param name Header field name (an RFC 9110 token).
+ * @param value Header field value.
+ * @return true when the header was appended; false on a refusal or when libcurl
+ *         could not allocate the list node.
+ */
+bool http_client_header_add_2(HTTP_Client *const self, char const *const name, char const *const value);
 
 /**
  * @brief Clear this handle's request header list.
@@ -519,6 +571,12 @@ void http_client_set_max_response_size(HTTP_Client *const self, USize const max_
 
 /**
  * @brief Set an HTTP proxy for this handle (CURLOPT_PROXY).
+ *
+ * Until this is called, libcurl's environment defaults apply: http_proxy,
+ * https_proxy, ALL_PROXY and NO_PROXY (and their upper-case forms where libcurl
+ * reads them) route the handle through whatever proxy the process inherited. A
+ * caller with an SSRF guard, a pinned CA or a loopback fixture should pass "" to
+ * force a direct connection (crawler/fetch does exactly that).
  * @param self HTTP client handle.
  * @param url Proxy URL, or "" to force a direct connection (overriding any
  *        proxy environment variable).
@@ -536,10 +594,27 @@ void http_client_set_timeout_ms(HTTP_Client *const self, USize const timeout_ms)
 
 /**
  * @brief Set the User-Agent header (CURLOPT_USERAGENT).
+ *
+ * libcurl writes the User-Agent line verbatim, so a `user_agent` containing any
+ * '\r' or '\n' is REFUSED as a value: the previous User-Agent stays, a WARN is
+ * logged, and false is answered - never an abort.
+ *
+ * libcurl itself can also refuse the string: one longer than its
+ * CURL_MAX_INPUT_LENGTH (8 000 000 bytes) is refused deterministically
+ * (CURLE_BAD_FUNCTION_ARGUMENT), and the copy can fail (CURLE_OUT_OF_MEMORY).
+ * On libcurl 7.85 through the 8.1x line the previous User-Agent is released
+ * BEFORE that length check and copy, so the handle would be left sending none;
+ * this function therefore re-installs the module default ("cfw-http-client/<linked
+ * libcurl version>", as set by http_client_new) after a libcurl refusal, logs a
+ * WARN, and answers false. Re-installing the default is deterministic for the
+ * length refusal and best-effort under out-of-memory.
  * @param self HTTP client handle.
  * @param user_agent User-Agent string.
+ * @return true when installed; false when it carried CR/LF (nothing changed) or
+ *         libcurl refused it (over 8 000 000 bytes, or out of memory) - the
+ *         handle's User-Agent is then the module default, not the previous one.
  */
-void http_client_set_user_agent(HTTP_Client *const self, char const *const user_agent);
+bool http_client_set_user_agent(HTTP_Client *const self, char const *const user_agent);
 
 /**
  * @brief Set TLS peer and host verification. ON by default; only turn off for a

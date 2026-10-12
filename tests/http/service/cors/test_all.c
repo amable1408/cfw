@@ -42,6 +42,20 @@ static char* _block(String const *const block) {
     return _block_text;
 }
 
+/** @brief Whether the origin list's LAST entry is exactly `expected` - the stored form, not
+ *  the spelling handed to origin_add. */
+static bool _origin_last_is(HTTP_Service_CORS const *const cors, char const *const expected) {
+    USize const size = al_str_get_size(&cors->origins);
+
+    if (size == 0) {
+        return false;
+    }
+
+    Str const *const last = al_str_at(&cors->origins, size - 1);
+
+    return char_compare_equal_2(str_get_data(last), str_get_size(last), expected, char_length(expected));
+}
+
 /*==============================================================================
  * MARK: - Raw client
  *============================================================================*/
@@ -292,6 +306,75 @@ static void _test_origin_case_and_refusals(Test *const test) {
     test_case_end(test);
 }
 
+static void _test_origin_shape(Test *const test) {
+    test_case_begin(test, "origins: anything not shaped scheme://host[:port] is refused at add, \"*\" and \"null\" exempt");
+
+    HTTP_Service_CORS cors = DEFAULT_INITIALIZATION;
+
+    test_expect_true(test, "init_1 succeeds", http_service_cors_init_1(&cors));
+
+    /* Each of these stored fine before and then matched no browser's Origin, ever. */
+    test_expect_false(test, "a trailing slash is refused", http_service_cors_origin_add(&cors, "https://example.com/"));
+    test_expect_false(test, "a missing scheme is refused", http_service_cors_origin_add(&cors, "example.com"));
+    test_expect_false(test, "a path is refused", http_service_cors_origin_add(&cors, "https://a/b"));
+    test_expect_false(test, "a non-digit port is refused", http_service_cors_origin_add(&cors, "https://a:x"));
+    test_expect_false(test, "an empty host is refused", http_service_cors_origin_add(&cors, "https://"));
+    test_expect_false(test, "an empty port is refused", http_service_cors_origin_add(&cors, "https://a:"));
+    test_expect_false(test, "an unclosed IPv6 literal is refused", http_service_cors_origin_add(&cors, "http://[::1"));
+    test_expect_u(test, "none of the misshapen origins reached the list", 0, al_str_get_size(&cors.origins));
+
+    test_expect_true(test, "a port is accepted", http_service_cors_origin_add(&cors, "https://a:8443"));
+    test_expect_true(test, "a localhost dev origin is accepted", http_service_cors_origin_add(&cors, "http://localhost:3000"));
+    test_expect_true(test, "and the port-carrying entry matches a browser's Origin", http_service_cors_origin_allowed_1(&cors, "https://a:8443"));
+    test_expect_true(test, "a bracketed IPv6 literal host is accepted", http_service_cors_origin_add(&cors, "http://[::1]:3000"));
+    test_expect_true(test, "\"null\" is exempt from the shape rule", http_service_cors_origin_add(&cors, "null"));
+    test_expect_true(test, "\"*\" is exempt from the shape rule", http_service_cors_origin_add(&cors, "*"));
+
+    http_service_cors_uninit(&cors);
+
+    test_case_end(test);
+}
+
+static void _test_origin_port(Test *const test) {
+    test_case_begin(test, "origins: a special scheme's default port is stored stripped; a leading-zero or out-of-range port is refused");
+
+    HTTP_Service_CORS cors = DEFAULT_INITIALIZATION;
+
+    test_expect_true(test, "init_1 succeeds", http_service_cors_init_1(&cors));
+
+    /* A browser's Origin is a plain integer in 1..65535, so each of these could only ever
+     * store a dead entry. */
+    test_expect_false(test, "a leading-zero port is refused", http_service_cors_origin_add(&cors, "http://h:08080"));
+    test_expect_false(test, "a port above 65535 is refused", http_service_cors_origin_add(&cors, "https://h:99999"));
+    test_expect_false(test, "port 0 is refused", http_service_cors_origin_add(&cors, "http://h:0"));
+    test_expect_u(test, "none of the bad ports reached the list", 0, al_str_get_size(&cors.origins));
+
+    test_expect_true(test, "https on :443 stores", http_service_cors_origin_add(&cors, "https://example.com:443"));
+    test_expect_true(test, "and is stored without its default port", _origin_last_is(&cors, "https://example.com"));
+    test_expect_true(test, "so the browser's port-less Origin matches it", http_service_cors_origin_allowed_1(&cors, "https://example.com"));
+
+    String block = http_service_cors_headers_create(&cors, "https://example.com");
+
+    test_expect_string_contains(test, "and the echo is exactly what the browser sent", _block(&block), "Access-Control-Allow-Origin: https://example.com\r\n");
+
+    string_uninit(&block);
+
+    test_expect_true(test, "http on :80 stores", http_service_cors_origin_add(&cors, "http://h:80"));
+    test_expect_true(test, "and is stored as http://h", _origin_last_is(&cors, "http://h"));
+    test_expect_true(test, "https on :80 stores", http_service_cors_origin_add(&cors, "https://h:80"));
+    test_expect_true(test, "and keeps :80, which is not https's default", _origin_last_is(&cors, "https://h:80"));
+    test_expect_true(test, "http on :443 stores", http_service_cors_origin_add(&cors, "http://h:443"));
+    test_expect_true(test, "and keeps :443, which is not http's default", _origin_last_is(&cors, "http://h:443"));
+    test_expect_true(test, "an IPv6 host on :80 stores", http_service_cors_origin_add(&cors, "http://[::1]:80"));
+    test_expect_true(test, "and is stored as http://[::1]", _origin_last_is(&cors, "http://[::1]"));
+    test_expect_true(test, "the highest port is accepted", http_service_cors_origin_add(&cors, "http://h:65535"));
+    test_expect_true(test, "and kept verbatim", _origin_last_is(&cors, "http://h:65535"));
+
+    http_service_cors_uninit(&cors);
+
+    test_case_end(test);
+}
+
 static void _test_wildcard_and_credentials(Test *const test) {
     test_case_begin(test, "the wildcard origin is refused under credentials, and works without them");
 
@@ -302,6 +385,13 @@ static void _test_wildcard_and_credentials(Test *const test) {
     test_expect_u(test, "and nothing was stored", 0, al_str_get_size(&credentialed.origins));
     test_expect_false(test, "so no origin is silently allowed", http_service_cors_origin_allowed_1(&credentialed, "https://a.test"));
 
+    /* The browser HONORS null + credentials, and any page can earn a null Origin by
+     * sandboxing itself - the credentialed case is a live read, not a dead entry. */
+    test_expect_false(test, "origin_add(null) is REFUSED while credentials are on", http_service_cors_origin_add(&credentialed, "null"));
+    test_expect_false(test, "in any case", http_service_cors_origin_add(&credentialed, "NULL"));
+    test_expect_u(test, "and still nothing was stored", 0, al_str_get_size(&credentialed.origins));
+    test_expect_false(test, "so a sandboxed page is not allowed", http_service_cors_origin_allowed_1(&credentialed, "null"));
+
     http_service_cors_uninit(&credentialed);
 
     HTTP_Service_CORS open = DEFAULT_INITIALIZATION;
@@ -309,6 +399,9 @@ static void _test_wildcard_and_credentials(Test *const test) {
     test_expect_true(test, "init_2 without credentials succeeds", http_service_cors_init_2(&open, false, 600));
     test_expect_true(test, "origin_add(*) stores", http_service_cors_origin_add(&open, "*"));
     test_expect_true(test, "any origin is allowed", http_service_cors_origin_allowed_1(&open, "https://anything.test"));
+    test_expect_true(test, "origin_add(null) stores without credentials", http_service_cors_origin_add(&open, "null"));
+    test_expect_true(test, "and so does NULL, as the same entry", http_service_cors_origin_add(&open, "NULL"));
+    test_expect_u(test, "both spellings are one entry beside *", 2, al_str_get_size(&open.origins));
 
     String block = http_service_cors_headers_create(&open, "https://anything.test");
 
@@ -723,6 +816,8 @@ I32 main(void) {
     _test_defaults(&test);
     _test_origin_exact(&test);
     _test_origin_case_and_refusals(&test);
+    _test_origin_shape(&test);
+    _test_origin_port(&test);
     _test_wildcard_and_credentials(&test);
     _test_headers_create(&test);
     _test_headers_allowed_parsing(&test);

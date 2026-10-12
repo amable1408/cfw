@@ -1,6 +1,6 @@
 /*
  * cors.h - HTTP CORS service for the C Libraries Framework
- * @version 0.3.2
+ * @version 0.4.0
  *
  * Builds and validates Cross-Origin Resource Sharing policy data for browser
  * API requests. Application code owns reading request headers and writing the
@@ -10,7 +10,7 @@
  *   - Allowed origin, method, header, and exposed-header lists.
  *   - Credential-aware origin validation: a wildcard origin is REFUSED at add time
  *     while credentials are allowed, instead of storing fine and then rejecting every
- *     request with no signal.
+ *     request with no signal, and so is "null", which the browser would honor.
  *   - Preflight validation and response generation, including the reflected
  *     Access-Control-Allow-Methods / -Headers a credentialed preflight needs. Every line
  *     is SIZE-ACCOUNTED - Vary, Allow-Origin, Allow-Credentials and Expose-Headers as much
@@ -29,7 +29,9 @@
  *       // Memory Management: false means this instance does not exist - fail startup.
  *   }
  *
- *   http_service_cors_origin_add(&cors, "https://traymon.com");
+ *   if (!http_service_cors_origin_add(&cors, "https://example.com")) {
+ *       // Refused - a malformed value, see Error Handling. The WARN names why.
+ *   }
  *
  *   // ... inside a route callback, with `request` and `response` in hand:
  *   // 320, not 256: a legal Origin reaches 267 bytes (scheme 8 + host 253 + port 6), and a
@@ -47,15 +49,16 @@
  *       http_server_request_custom_header_copy(request, "Access-Control-Request-Method", method, sizeof(method));
  *       http_server_request_custom_header_copy(request, "Access-Control-Request-Headers", headers, sizeof(headers));
  *
- *       if (http_service_cors_preflight_allowed_1(&cors, origin, method, headers)) {
- *           String block = http_service_cors_preflight_create(&cors, origin, method, headers, false);
+ *       // Unconditionally, NOT only when preflight_allowed_1 says yes: a refused preflight
+ *       // still owes the Vary line preflight_create always writes, and the browser enforces
+ *       // the Allow-* lines it does (or does not) find.
+ *       String block = http_service_cors_preflight_create(&cors, origin, method, headers, false);
  *
- *           if (!string_empty(&block)) {
- *               http_server_response_header_add_raw(response, string_get_data(&block), string_get_size(&block));
- *           }
- *
- *           string_uninit(&block);
+ *       if (!string_empty(&block)) {
+ *           http_server_response_header_add_raw(response, string_get_data(&block), string_get_size(&block));
  *       }
+ *
+ *       string_uninit(&block);
  *
  *       http_server_response_send_empty(response, HTTP_SERVER_STATUS_CODE_NO_CONTENT);
  *   }
@@ -84,10 +87,24 @@
  *   - "null" (sandboxed iframes, file:// documents, some redirects) matches only when it
  *     was added literally. That is a deliberate footgun: "null" is not one origin, it is
  *     every opaque origin at once, so adding it opens the API to any page that can put
- *     itself in a sandbox. Add it only for a development host.
+ *     itself in a sandbox. Add it only for a development host. Under allow_credentials it
+ *     is refused outright: the browser honors `null` + credentials where it refuses `*` +
+ *     credentials, so it would be a credentialed read for any page that can sandbox itself.
  *   - An origin carrying a space, a comma, a control byte (CR and LF included), DEL, or any
  *     byte above 0x7E is refused at add time, so no list entry can ever carry a header
- *     break. That one sentence is the whole rule; the WARN and the docs say it the same way.
+ *     break.
+ *   - An origin must also be SHAPED like one: scheme "://" host [":" port] and nothing after -
+ *     "*" and "null" exempt. "https://example.com/" (a trailing slash), "example.com" (no
+ *     scheme), "https://example.com/app" (a path) and "https://a:" (an empty port) are refused
+ *     at add time with a WARN rather than stored as an entry a browser's Origin can never
+ *     match. A bracketed IPv6 literal host ("http://[::1]:3000") is accepted. A port is a
+ *     plain integer in 1..65535: a leading zero (":08080", and ":0" itself) or a value above
+ *     65535 is refused the same way. A special scheme's DEFAULT port is stored stripped -
+ *     ":80" from http and ws, ":443" from https and wss - because a browser's Origin omits
+ *     it, so "https://example.com:443" is stored, matched and echoed as
+ *     "https://example.com"; any other port, and any port on another scheme, is kept
+ *     verbatim. These two bullets are the whole rule; the WARN and the docs say it the same
+ *     way.
  *   - http_service_cors_exposed_header_add("*") stores and emits
  *     Access-Control-Expose-Headers: * unchanged, credentials or not. Under credentials a
  *     browser reads that as a header literally NAMED "*" and exposes nothing - the same
@@ -98,7 +115,7 @@
  *   - Public functions validate non-null pointers.
  *   - Every add answers bool: true when the entry is in the list after the call (including
  *     when it already was), false when it was refused - an empty or malformed value, a
- *     wildcard origin under credentials, or an allocator that declined the copy. A false
+ *     wildcard or null origin under credentials, or an allocator that declined the copy. A false
  *     leaves the list unchanged; it never aborts. Network-derived and config-derived text
  *     alike must be able to be rejected without ending the process.
  *   - An empty origin, method, or header is a legal VALUE, answered false, never an abort.
@@ -147,7 +164,9 @@
 
 #include <arena/arena.h>
 #include <container/arrayList/al_str.h>
+#include <container/str/str.h>
 #include <container/string/string.h>
+#include <types.h>
 
 /*==============================================================================
  * MARK: - Constants
@@ -170,7 +189,9 @@ typedef struct {
     /** @brief Optional arena used by owned values and returned strings. */
     Arena *allocator;
 #endif // ARENA_IMPLEMENTATION
-    /** @brief Whether credentialed browser requests are allowed. */
+    /** @brief Whether credentialed browser requests are allowed. Set at init_2/alloc_init_2 and read by every
+     *         origin_add: flipping it AFTER an add skips the wildcard/null refusal that add performed, so it is
+     *         init-only. */
     bool allow_credentials;
     /** @brief Whether a Private Network Access preflight is answered affirmatively. */
     bool allow_private_network;
@@ -330,6 +351,9 @@ bool http_service_cors_method_allowed_2(HTTP_Service_CORS const *const self, cha
  *         it was refused, leaving the list unchanged. "*" is refused (with a WARN) while
  *         allow_credentials is set: a wildcard origin and credentials are mutually
  *         exclusive in the browser, so storing it would silently deny every request.
+ *         "null" (any case) is refused with it, because the browser HONORS null +
+ *         credentials. A special scheme's default port is stripped before storing (see
+ *         Origin semantics).
  */
 bool http_service_cors_origin_add(HTTP_Service_CORS *const self, char const *const origin);
 

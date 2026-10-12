@@ -1,13 +1,22 @@
 #include <http/client/http_client.h>
 
+#include <pthread.h>
+
+#include <char/char.h>
+#include <http/query/query.h>
+
 #define _HTTP_CLIENT_CONNECT_TIMEOUT_DEFAULT_MS   2000
+#define _HTTP_CLIENT_HEADER_EMPTY_VALUE_SEPARATOR ";"
+#define _HTTP_CLIENT_HEADER_LINE_BREAKS           "\r\n"
+#define _HTTP_CLIENT_HEADER_NAME_SYMBOLS          "!#$%&'*+-.^_`|~"
+#define _HTTP_CLIENT_HEADER_SEPARATOR             ": "
 #define _HTTP_CLIENT_RESPONSE_BODY_INITIAL_SIZE   8192
 #define _HTTP_CLIENT_RESPONSE_HEADER_BYTES_MAX    (256ULL * 1024ULL)
 #define _HTTP_CLIENT_RESPONSE_HEADER_LINES_MAX    256
-#define _HTTP_CLIENT_RESPONSE_SIZE_DEFAULT         (16ULL * 1024ULL * 1024ULL)
+#define _HTTP_CLIENT_RESPONSE_SIZE_DEFAULT        (16ULL * 1024ULL * 1024ULL)
 #define _HTTP_CLIENT_STATUS_PREFIX                "HTTP/"
-#define _HTTP_CLIENT_STATUS_PREFIX_SIZE            5
-#define _HTTP_CLIENT_TIMEOUT_DEFAULT_MS            20000
+#define _HTTP_CLIENT_STATUS_PREFIX_SIZE           5
+#define _HTTP_CLIENT_TIMEOUT_DEFAULT_MS           20000
 
 /* Per-handle state. CURLOPT_WRITEDATA/HEADERDATA point at `self` for the life of
  * the handle (set once in http_client_new), so the write/header callbacks reach
@@ -89,18 +98,101 @@ static void _http_client_result_error_set(HTTP_Client_Result *const self, char c
     string_uninit(&self->error);
 
 #ifdef ARENA_IMPLEMENTATION
+    /* An OWNED copy, never string_alloc_init_4's VIEW: `error` is usually the handle's
+     * error_buffer, which the next request on this handle zeroes and http_client_delete
+     * frees - a view would leave a kept Result reading "" or freed memory. The text is
+     * never empty, so an empty answer means the arena refused; fall back to the heap
+     * rather than lose the diagnostic (string_uninit releases either kind). */
     if (!memory_empty(self->allocator)) {
-        self->error = string_alloc_init_4((char*) error, char_length(error), self->allocator);
+        self->error = string_alloc_init_static(error, char_length(error), self->allocator);
 
-        trace_log_pop();
+        if (!string_empty(&self->error)) {
+            trace_log_pop();
 
-        return;
+            return;
+        }
     }
 #endif // ARENA_IMPLEMENTATION
 
-    self->error = string_init_static((char*) error, char_length(error));
+    self->error = string_init_static(error, char_length(error));
 
     trace_log_pop();
+}
+
+/* libcurl sends a custom header and the User-Agent verbatim, "%s\r\n", with no filter
+ * (CURLOPT_HTTPHEADER man page; lib/http.c Curl_add_custom_headers) - one embedded CR or
+ * LF in caller data is a second, injected header line. */
+static bool _http_client_line_break_has(char const *const data) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "data", (void*) data);
+
+    bool const found = char_find_first_1(data, _HTTP_CLIENT_HEADER_LINE_BREAKS) != CHAR_NPOS;
+
+    trace_log_pop();
+
+    return found;
+}
+
+/* RFC 9110 field-name = token = 1*tchar; tchar is ALPHA / DIGIT / one of
+ * _HTTP_CLIENT_HEADER_NAME_SYMBOLS. A LOCAL check on purpose: http/headers'
+ * http_headers_token_valid_2 says the same, but including it here would grow the
+ * published closure of every http/client consumer by a whole module for ten lines. */
+static bool _http_client_header_name_valid(char const *const name) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "name", (void*) name);
+
+    USize const symbols_size = sizeof(_HTTP_CLIENT_HEADER_NAME_SYMBOLS) - 1;
+    bool valid = name[0] != '\0';
+
+    for (USize index = 0; valid && name[index] != '\0'; index += 1) {
+        valid = char_is_alpha(name[index]) ||
+                char_is_number(name[index]) ||
+                char_find_first_2(&name[index], 1, _HTTP_CLIENT_HEADER_NAME_SYMBOLS, symbols_size) != CHAR_NPOS;
+    }
+
+    trace_log_pop();
+
+    return valid;
+}
+
+/* RFC 9110 OWS = *( SP / HTAB ): the only whitespace that may surround a field value,
+ * and none of it is part of the value. */
+static bool _http_client_header_whitespace_is(char const character) {
+    trace_log_push(LOG_METADATA);
+
+    bool const whitespace = character == ' ' || character == '\t';
+
+    trace_log_pop();
+
+    return whitespace;
+}
+
+/* curl_slist_append returns null WITHOUT freeing the list it was given: assigning that
+ * null straight back would drop every header added so far. On failure the new header
+ * is lost and a WARN says so; the list stays. `header` is already vetted by the caller. */
+static bool _http_client_header_append(HTTP_Client *const self, char const *const header) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+    error_check_null(LOG_METADATA, "header", (void*) header);
+
+    struct curl_slist *const appended = curl_slist_append(self->headers, header);
+
+    if (memory_empty((void*) appended)) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_client_header_add: curl_slist_append failed, header dropped");
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    self->headers = appended;
+
+    trace_log_pop();
+
+    return true;
 }
 
 /* Clamps a USize down to LONG_MAX before a (long) cast - libcurl's *_MS and
@@ -200,8 +292,10 @@ static USize _http_client_write_callback(char *const contents, USize const size,
     }
 
     /* An arena-backed active_response can silently refuse to grow (string_add_2's
-     * documented refusal on a full arena) rather than abort - the append is then a
-     * no-op and size stays put. Detect that here rather than trusting the call: a
+     * documented refusal on a REFUSED arena) rather than abort - the append is then a
+     * no-op and size stays put. A live but EXHAUSTED arena is not this path: it aborts
+     * inside the append (the tree-wide allocate contract; see the header's Memory
+     * Management). Detect the refusal here rather than trusting the call: a
      * blind size += size_total would tell curl the write succeeded while the bytes
      * were actually dropped. */
     USize const size_before = string_get_size(self->active_response);
@@ -626,25 +720,85 @@ HTTP_Client_Result http_client_head(HTTP_Client *const self, char const *const u
     return result;
 }
 
-void http_client_header_add(HTTP_Client *const self, char const *const header) {
+bool http_client_header_add(HTTP_Client *const self, char const *const header) {
     trace_log_push(LOG_METADATA);
 
     error_check_null(LOG_METADATA, "self", (void*) self);
     error_check_null(LOG_METADATA, "header", (void*) header);
 
-    /* curl_slist_append returns null WITHOUT freeing the list it was given:
-     * assigning that null straight back would drop every header added so far.
-     * On failure the new header is lost and a WARN says so; the list stays. */
-    struct curl_slist *const appended = curl_slist_append(self->headers, header);
+    // A VALUE refusal, never an error_check: the line is caller (often third-party) data.
+    if (_http_client_line_break_has(header)) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_client_header_add: header contains CR/LF, refused");
 
-    if (memory_empty((void*) appended)) {
-        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_client_header_add: curl_slist_append failed, header dropped");
+        trace_log_pop();
+
+        return false;
     }
-    else {
-        self->headers = appended;
-    }
+
+    bool const added = _http_client_header_append(self, header);
 
     trace_log_pop();
+
+    return added;
+}
+
+bool http_client_header_add_2(HTTP_Client *const self, char const *const name, char const *const value) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+    error_check_null(LOG_METADATA, "name", (void*) name);
+    error_check_null(LOG_METADATA, "value", (void*) value);
+
+    // VALUE refusals: an empty or non-token name, or a CR/LF in the value (a valid
+    // token already excludes CR/LF from the name).
+    if (!_http_client_header_name_valid(name)) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_client_header_add_2: header name is empty or not an RFC 9110 token, refused");
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    if (_http_client_line_break_has(value)) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_client_header_add_2: header value contains CR/LF, refused");
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    // Leading/trailing OWS is trimmed first (RFC 9110: not part of the value). libcurl reads
+    // "Name:" with nothing but blanks after the colon as "suppress this header", and spells an
+    // empty-valued header "Name;" - so a value that is empty OR all SP/HTAB takes the ';' form,
+    // or header_add_2(self, "Accept", "\t") would silently REMOVE libcurl's own Accept.
+    USize value_start = 0;
+    USize value_end = char_length(value);
+
+    while (value_start < value_end && _http_client_header_whitespace_is(value[value_start])) {
+        value_start += 1;
+    }
+
+    while (value_end > value_start && _http_client_header_whitespace_is(value[value_end - 1])) {
+        value_end -= 1;
+    }
+
+    USize const name_size = char_length(name);
+    USize const value_size = value_end - value_start;
+    char const *const separator = value_size == 0 ? _HTTP_CLIENT_HEADER_EMPTY_VALUE_SEPARATOR : _HTTP_CLIENT_HEADER_SEPARATOR;
+    USize const separator_size = char_length(separator);
+    String line = string_init_2(name_size + separator_size + value_size + CHAR_END_CHARACTER);
+
+    string_add_last_2(&line, name, name_size);
+    string_add_last_2(&line, separator, separator_size);
+    string_add_last_2(&line, &value[value_start], value_size);
+
+    bool const added = _http_client_header_append(self, string_get_data(&line));
+
+    string_uninit(&line);
+
+    trace_log_pop();
+
+    return added;
 }
 
 void http_client_header_clear(HTTP_Client *const self) {
@@ -990,15 +1144,40 @@ void http_client_set_timeout_ms(HTTP_Client *const self, USize const timeout_ms)
     trace_log_pop();
 }
 
-void http_client_set_user_agent(HTTP_Client *const self, char const *const user_agent) {
+bool http_client_set_user_agent(HTTP_Client *const self, char const *const user_agent) {
     trace_log_push(LOG_METADATA);
 
     error_check_null(LOG_METADATA, "self", (void*) self);
     error_check_null(LOG_METADATA, "user_agent", (void*) user_agent);
 
-    curl_easy_setopt(self->curl, CURLOPT_USERAGENT, user_agent);
+    // A VALUE refusal: libcurl writes "User-Agent: %s\r\n" verbatim.
+    if (_http_client_line_break_has(user_agent)) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_client_set_user_agent: user agent contains CR/LF, refused");
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    // Checked, unlike the fixed options: libcurl refuses a caller string over
+    // CURL_MAX_INPUT_LENGTH (CURLE_BAD_FUNCTION_ARGUMENT) and can fail its copy
+    // (CURLE_OUT_OF_MEMORY).
+    if (curl_easy_setopt(self->curl, CURLOPT_USERAGENT, user_agent) != CURLE_OK) {
+        // libcurl 7.85 through 8.1x frees the previous value BEFORE the length check
+        // and copy (Curl_setstropt), so the handle would go out with no User-Agent at
+        // all: put the module default back, the same value http_client_new installs.
+        curl_easy_setopt(self->curl, CURLOPT_USERAGENT, string_get_data(&_http_client_version));
+
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_client_set_user_agent: user agent refused by libcurl, default restored");
+
+        trace_log_pop();
+
+        return false;
+    }
 
     trace_log_pop();
+
+    return true;
 }
 
 void http_client_set_verify_tls(HTTP_Client *const self, bool const verify_tls) {

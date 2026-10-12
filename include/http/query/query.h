@@ -3,7 +3,7 @@
  *  --------------------------------------------------------------------------
  *  @file    query.h
  *  @brief   Pure parsers and builders for URL query strings and percent-encoded values.
- *  @version 0.3.1
+ *  @version 0.3.2
  *  @license MIT (see LICENSE file)
  *
  *  General-purpose (no project coupling). Extracts a raw value for a key from a
@@ -51,6 +51,29 @@
  *      A later round moves http/service/body_parser's own hand-rolled
  *      +/percent decode onto this pair instead of keeping a second copy.
  *
+ *  Planned for 0.4.0 (deferred 2026-09-06; spec addendum 2026-10-12 - a NOTE
+ *  ONLY, none of these is declared or implemented yet):
+ *    - bool http_query_next(char const *const query, USize const query_size,
+ *          USize *const cursor, Str *const out_name, Str *const out_value);
+ *      the pair enumerator: raw VIEW slices into `query` (str_init_static),
+ *      no allocation, `cursor` advanced past each pair.
+ *    - bool http_query_find_2(char const *const query, USize const query_size,
+ *          char const *const key, USize const key_size, Str *const out_value);
+ *      a zero-allocation VIEW lookup that, unlike alloc_get, distinguishes a
+ *      present-but-empty "key=" (true, empty slice) from an absent key (false).
+ *    - USize http_query_decode_3(char *const dest, USize const dest_size,
+ *          char const *const encoded, USize const encoded_size,
+ *          bool const plus_as_space);
+ *      a caller-buffer decoder, whole-or-nothing (dest_size >= encoded_size + 1
+ *      always fits).
+ *    Why all three: the enumerator was deferred until the body_parser
+ *    de-duplication pays for it, and body_parser decodes INTO
+ *    allocator_try_borrow'd blocks that map_char_char_add then adopts - every
+ *    decoder here allocates in an Arena, so the enumerator alone would hand it
+ *    slices it still could not decode without its own copy. find_2 serves the
+ *    lookups that allocate a value only to compare or int-parse it. All three
+ *    share _http_query_find's scanner and are additive (MINOR).
+ *
  *  Usage Examples:
  *    @code
  *    #include <http/query/query.h>
@@ -82,7 +105,9 @@
  *      an empty value against a missing key. A key_size larger than the key's
  *      own NUL-terminated length is bounded by the key's real extent, never
  *      read past it. http_query_alloc_decode(_2)/form_decode(_2) refuse the
- *      same way on a null encoded pointer; a malformed "%" escape (not two
+ *      same way on a null encoded pointer ONLY: an empty encoded ("", or a
+ *      zero encoded_size) is a legal VALUE and answers an empty,
+ *      arena-allocated "" (never nullptr), the sized twins included; a malformed "%" escape (not two
  *      hex digits, or fewer than two bytes left) passes through as literal,
  *      undecoded bytes rather than refusing the whole string.
  *    - The writing side NEVER aborts: http_query_encode_1/_2,
@@ -312,7 +337,8 @@ bool http_query_form_add_2(String *const body, char const *const name, USize con
  * @param encoded Encoded value, NUL-terminated. May be null/empty.
  * @param allocator Arena the returned string is allocated in.
  * @return Arena-allocated, NUL-terminated decoded string, or nullptr on a
- *         null/empty encoded or a refused allocator. The decoded byte count
+ *         null encoded or a refused allocator. An empty encoded answers an
+ *         empty, arena-allocated "" - never nullptr. The decoded byte count
  *         can be shorter than char_length() reports when "encoded" contains
  *         "%00" - use http_query_alloc_decode_2 when that must be detected.
  */
@@ -340,7 +366,8 @@ char* http_query_alloc_decode_2(char const *const encoded, USize const encoded_s
  * @param encoded Encoded value, NUL-terminated. May be null/empty.
  * @param allocator Arena the returned string is allocated in.
  * @return Arena-allocated, NUL-terminated decoded string, or nullptr on a
- *         null/empty encoded or a refused allocator. Same "%00" truncation
+ *         null encoded or a refused allocator. An empty encoded answers an
+ *         empty, arena-allocated "" - never nullptr. Same "%00" truncation
  *         caveat as http_query_alloc_decode - use _2 when it must be detected.
  */
 char* http_query_alloc_form_decode(char const *const encoded, Arena *const allocator);

@@ -1,20 +1,64 @@
 #include <http/service/cors/cors.h>
 
-/* Implementation dependencies: cors.h's API names none of them. allocator arrives only through
- * cors.h -> al_str.h -> str.h -> char.h -> allocator.h, an ACCIDENTAL chain in which no link
- * names an Allocator. See style_guidelines.md, "Avoid Redundant Chained Includes". */
 #include <allocator/allocator.h>
+// char.h is singled out because it declares no TYPES at all: no header's API can ever name one,
+// so every chain that happens to reach it is accidental and a file using char_* owes it directly.
 #include <char/char.h>
 #include <http/headers/headers.h>
+
+/*==============================================================================
+ * MARK: - Constants
+ *============================================================================*/
+
+/** @brief Highest TCP port a serialized origin can carry. */
+static USize const _HTTP_SERVICE_CORS_PORT_MAX = 65535;
 
 /*==============================================================================
  * MARK: - Helpers
  *============================================================================*/
 
+/* One byte of an origin's scheme after its leading ALPHA: ALPHA / DIGIT / "+" / "-" / "."
+ * (RFC 3986 S3.1). */
+static bool _http_service_cors_scheme_byte(char const value) {
+    trace_log_push(LOG_METADATA);
+
+    bool const valid = char_is_alpha(value)  ||
+                       char_is_number(value) ||
+                       value == '+'          ||
+                       value == '-'          ||
+                       value == '.';
+
+    trace_log_pop();
+
+    return valid;
+}
+
+/* One byte inside a bracketed IPv6 literal host ("[::1]", "[fe80::1]"): a hex digit, ':' or
+ * '.' (the dotted IPv4 tail RFC 3986 S3.2.2 allows). */
+static bool _http_service_cors_ipv6_byte(char const value) {
+    trace_log_push(LOG_METADATA);
+
+    char const lowered = char_to_lower(value);
+    bool const valid   = char_is_number(lowered)                ||
+                         (lowered >= 'a' && lowered <= 'f')     ||
+                         lowered == ':'                         ||
+                         lowered == '.';
+
+    trace_log_pop();
+
+    return valid;
+}
+
 /* An origin is not a token ("https://host:8080"), so it gets its own rule, and it is the
- * one cors.h and the WARN both spell out: a space, a comma, a control byte (CR and LF
- * included), DEL, or any byte above 0x7E is refused. A stored entry can then never carry a
- * header break, whatever a configuration file holds. */
+ * one cors.h and the WARN both spell out. First the bytes: a space, a comma, a control byte
+ * (CR and LF included), DEL, or any byte above 0x7E is refused, so a stored entry can never
+ * carry a header break, whatever a configuration file holds. Then the SHAPE, "*" and "null"
+ * exempt: scheme "://" host [":" port], with scheme = ALPHA *(ALPHA / DIGIT / "+" / "-" / "."),
+ * a non-empty host holding none of '/', '?', '#' or ':' (a bracketed IPv6 literal such as
+ * "[::1]" is the one host that may hold ':'), and a port, when present, of digits only. A
+ * browser's Origin is exactly that shape, so "https://example.com/" (the commonest config
+ * typo), "example.com" or "https://example.com/app" could only ever store a dead entry that
+ * matches nothing - refused here instead, loudly. */
 static bool _http_service_cors_origin_valid(char const *const data, USize const data_size) {
     trace_log_push(LOG_METADATA);
 
@@ -28,9 +72,141 @@ static bool _http_service_cors_origin_valid(char const *const data, USize const 
         valid = value > 0x20 && value < 0x7F && value != ',';
     }
 
+    if (!valid                                                                   ||
+        char_compare_equal_2(data, data_size, "*", CHAR_STATIC_SIZE("*"))        ||
+        char_compare_iequal_2(data, data_size, "null", CHAR_STATIC_SIZE("null"))) {
+        trace_log_pop();
+
+        return valid;
+    }
+
+    if (!char_is_alpha(data[0])) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    USize cursor = 1;
+
+    while (cursor < data_size && _http_service_cors_scheme_byte(data[cursor])) {
+        cursor += 1;
+    }
+
+    if (data_size - cursor < CHAR_STATIC_SIZE("://")                                                    ||
+        !char_compare_equal_2(data + cursor, CHAR_STATIC_SIZE("://"), "://", CHAR_STATIC_SIZE("://"))) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    cursor += CHAR_STATIC_SIZE("://");
+
+    USize const host_start = cursor;
+
+    if (cursor < data_size && data[cursor] == '[') {
+        cursor += 1;
+
+        while (cursor < data_size && _http_service_cors_ipv6_byte(data[cursor])) {
+            cursor += 1;
+        }
+
+        if (cursor >= data_size        ||
+            data[cursor] != ']'        ||
+            cursor == host_start + 1) {
+            trace_log_pop();
+
+            return false;
+        }
+
+        cursor += 1;
+    }
+    else {
+        while (cursor < data_size    &&
+               data[cursor] != '/'   &&
+               data[cursor] != '?'   &&
+               data[cursor] != '#'   &&
+               data[cursor] != ':') {
+            cursor += 1;
+        }
+    }
+
+    if (cursor == host_start) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    if (cursor < data_size && data[cursor] == ':') {
+        cursor += 1;
+
+        USize const port_start  = cursor;
+        USize       port        = 0;
+
+        /* The value stops accumulating once past the ceiling, so a long digit run cannot
+         * wrap it back into range. */
+        while (cursor < data_size && char_is_number(data[cursor])) {
+            if (port <= _HTTP_SERVICE_CORS_PORT_MAX) {
+                port = port * 10 + (USize) (data[cursor] - '0');
+            }
+
+            cursor += 1;
+        }
+
+        /* A browser serializes the port as a plain integer in 1..65535, so a leading zero
+         * (":08080", ":0") or a value above 65535 could only store a dead entry. */
+        if (cursor == port_start                 ||
+            data[port_start] == '0'              ||
+            port > _HTTP_SERVICE_CORS_PORT_MAX) {
+            trace_log_pop();
+
+            return false;
+        }
+    }
+
     trace_log_pop();
 
-    return valid;
+    return cursor == data_size;
+}
+
+/* A browser's serialized origin OMITS a special scheme's default port, so a configured
+ * "https://example.com:443" would store an entry no Origin ever equals. Answers the size the
+ * entry keeps once that port is dropped - ":80" for http and ws, ":443" for https and wss -
+ * and the whole size when there is none to drop; every other scheme keeps its port verbatim,
+ * since the URL Standard gives only the special schemes a default. Runs on an origin
+ * _http_service_cors_origin_valid already passed, so a trailing ":80" / ":443" can only be the
+ * port: a bracketed IPv6 host ends in ']', an unbracketed one holds no ':', and a leading-zero
+ * port was refused. */
+static USize _http_service_cors_default_port_strip(char const *const data, USize const data_size) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "data", (void*) data);
+
+    USize scheme_size = 0;
+
+    while (scheme_size < data_size && data[scheme_size] != ':') {
+        scheme_size += 1;
+    }
+
+    bool const plain    = char_compare_iequal_2(data, scheme_size, "http", CHAR_STATIC_SIZE("http")) ||
+                          char_compare_iequal_2(data, scheme_size, "ws", CHAR_STATIC_SIZE("ws"));
+    bool const secure   = char_compare_iequal_2(data, scheme_size, "https", CHAR_STATIC_SIZE("https")) ||
+                          char_compare_iequal_2(data, scheme_size, "wss", CHAR_STATIC_SIZE("wss"));
+    USize      size     = data_size;
+
+    if (plain                                                                                                             &&
+        data_size > CHAR_STATIC_SIZE(":80")                                                                               &&
+        char_compare_equal_2(data + data_size - CHAR_STATIC_SIZE(":80"), CHAR_STATIC_SIZE(":80"), ":80", CHAR_STATIC_SIZE(":80"))) {
+        size = data_size - CHAR_STATIC_SIZE(":80");
+    }
+    else if (secure                                                                                                               &&
+             data_size > CHAR_STATIC_SIZE(":443")                                                                                 &&
+             char_compare_equal_2(data + data_size - CHAR_STATIC_SIZE(":443"), CHAR_STATIC_SIZE(":443"), ":443", CHAR_STATIC_SIZE(":443"))) {
+        size = data_size - CHAR_STATIC_SIZE(":443");
+    }
+
+    trace_log_pop();
+
+    return size;
 }
 
 static Str* _http_service_cors_list_find(AL_Str const *const list, char const *const data, USize const data_size) {
@@ -804,10 +980,12 @@ bool http_service_cors_origin_add(HTTP_Service_CORS *const self, char const *con
 
     USize   const   origin_size = char_length(origin);
     bool    const   wildcard    = char_compare_equal_2((char*) origin, origin_size, "*", CHAR_STATIC_SIZE("*"));
+    bool    const   null_origin = char_compare_iequal_2(origin, origin_size, "null", CHAR_STATIC_SIZE("null"));
 
     if (!_http_service_cors_origin_valid(origin, origin_size)) {
         log_message_2(LOG_LEVEL_WARN, LOG_METADATA,
-            "http_service_cors: origin refused - empty, or carrying a space, a comma, a control byte (CR and LF included), DEL, or any byte above 0x7E");
+            "http_service_cors: origin refused - empty, carrying a space, a comma, a control byte (CR and LF included), DEL, or any byte above 0x7E,"
+            " or not shaped scheme://host[:port] (no path, query, fragment or trailing slash; a port is 1-65535 with no leading zero; \"*\" and \"null\" exempt)");
 
         trace_log_pop();
 
@@ -817,17 +995,22 @@ bool http_service_cors_origin_add(HTTP_Service_CORS *const self, char const *con
     /* The footgun this module shipped with: "*" stored fine and then denied EVERY request,
      * because a wildcard origin and credentials are mutually exclusive in the browser. It
      * is refused here, loudly, instead of being discovered as a site that cannot call its
-     * own API. */
-    if (wildcard && self->allow_credentials) {
+     * own API. "null" is refused beside it for the OPPOSITE reason: the browser honors
+     * "null" + credentials, and any page can earn a "null" Origin by sandboxing itself, so a
+     * credentialed "null" entry would be a cookie-bearing read open to every site. */
+    if ((wildcard || null_origin) && self->allow_credentials) {
         log_message_2(LOG_LEVEL_WARN, LOG_METADATA,
-            "http_service_cors: the wildcard origin is refused while credentials are allowed - name each origin, or initialize with allow_credentials false");
+            "http_service_cors: the wildcard or null origin is refused while credentials are allowed - name each origin, or initialize with allow_credentials false");
 
         trace_log_pop();
 
         return false;
     }
 
-    bool const stored = _http_service_cors_list_add(self, &self->origins, origin, origin_size, true);
+    /* Stored WITHOUT a special scheme's default port, because the stored entry is what is
+     * matched and echoed, and a browser never sends ":443" on an https origin. */
+    USize const stored_size = _http_service_cors_default_port_strip(origin, origin_size);
+    bool const  stored      = _http_service_cors_list_add(self, &self->origins, origin, stored_size, true);
 
     if (stored && wildcard) {
         self->origins_wildcard = true;

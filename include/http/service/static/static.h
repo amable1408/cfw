@@ -1,6 +1,6 @@
 /*
  * static.h - HTTP static file service for the C Libraries Framework
- * @version 0.3.2
+ * @version 0.4.0
  *
  * Maps HTTP request paths to static assets on disk, resolving their MIME types,
  * validating path security, and serving the file data over HTTP.
@@ -8,10 +8,26 @@
  * Features:
  *   - Serves directory assets (HTML, CSS, JS, images, fonts).
  *   - Optional cache-control headers, honoured on both the full-file and Range (206) paths.
- *   - Conditional GET: Last-Modified + a weak ETag (size+mtime), 304 on a matching
- *     If-None-Match or (serve_2 only - see below) an unmet If-Modified-Since, Range served only
- *     when If-Range (if present) still matches.
- *   - Path traversal prevention.
+ *   - Conditional GET: Last-Modified + a strong ETag (size+mtime), 304 on an If-None-Match that
+ *     matches by the WEAK comparison RFC 9110 S13.1.2 requires there (a W/ prefix on either side
+ *     is ignored, a comma-separated list matches on any member, `*` matches any served file) or
+ *     (serve_2 only - see below) an unmet If-Modified-Since, Range served only when If-Range (if
+ *     present) still matches - by the STRONG comparison RFC 9110 S13.1.5 requires there, so a
+ *     W/-prefixed If-Range never matches and answers a full 200.
+ *   - Path traversal prevention. On Windows, refused unconditionally as well: an NTFS
+ *     alternate-data-stream (':') anywhere; any component - intermediate ones included - ending in
+ *     '.' or ' ' (Win32 strips a trailing dot, so "sub./a.txt" would open sub/a.txt); any component
+ *     containing '~' followed by a digit, the shape of an NTFS 8.3 short alias (".env" answers to
+ *     "ENV~1" on a volume with short names, C: by default), which would otherwise be a second
+ *     spelling past refuse_dotfiles, refuse_symlinks and the device list - a real long name of that
+ *     shape ("backup~1.txt") is refused too; and a reserved device name as the final component
+ *     (CON, CONIN$, CONOUT$, CLOCK$, PRN, AUX, NUL, COM1-9, LPT1-9, case-insensitive, with or
+ *     without an extension, and with any spaces or dots between the name and the extension
+ *     trimmed as Win32 trims them - "CONIN$ .txt" and "AUX .html" are refused like "con.txt"),
+ *     plus the superscript-digit COM/LPT forms in both encodings: COM or LPT followed only by
+ *     bytes >= 0x80, which covers the single cp1252 byte the ANSI APIs read (0xB9/0xB2/0xB3)
+ *     and the UTF-8 pair the wide APIs read.
+ *   - Opt-in dotfile refusal (refuse_dotfiles), `.well-known` exempt.
  *   - SPA fallback support, restricted to extension-less paths.
  *   - Arena and heap allocation.
  *
@@ -38,15 +54,32 @@
  *     pattern for this service family's optional knobs) to refuse serving a path any of whose
  *     components - not just the final one - is a symlink/junction below root_dir, at the cost of
  *     one directory listing per path component per request. Prefer this on any root the
- *     deployment does not fully control.
+ *     deployment does not fully control. On Windows each component is matched against its
+ *     listing case-insensitively (NTFS opens "LINKDIR" as "linkdir"), and the other second
+ *     spellings - a trailing dot, an 8.3 alias - never reach the listing (see Features).
  *   - Accepted risk: this is a check-then-open, not an atomic operation. A symlink swapped into
  *     the path between this check returning "clear" and the subsequent file open (TOCTOU) is not
  *     caught. Closing that gap needs an O_NOFOLLOW-equivalent open, which file/file.h does not
  *     expose today; not implemented here.
  *
+ * Dotfiles:
+ *   - Served by default, like any other asset. Set self.refuse_dotfiles = true after
+ *     construction (direct field assignment, the same pattern as refuse_symlinks) to refuse any
+ *     path whose request-relative components include one starting with '.' - `.git/`, `.env`,
+ *     `.htaccess`, `.vscode/` - at any depth. Exactly `.well-known` is exempt (ACME challenges,
+ *     assetlinks.json, security.txt). Pure path arithmetic, no file-system cost. Prefer this on
+ *     any root that is a checkout subtree or that a secret could ever be copied into.
+ *   - What it refuses is the SPELLING a request uses, not the file it reaches. On Windows the 8.3
+ *     short alias of a dotfile ("ENV~1" for ".env") does not start with '.', and is refused only
+ *     because every '~'+digit component is (see Features). It cannot see a dotfile reached under
+ *     another name - a hard link, or a symlink/junction when refuse_symlinks is off.
+ *
  * Range requests:
- *   - Capped at 4 MiB per response (_HTTP_SERVICE_STATIC_RANGE_CHUNK_MAX in static.c), so a
- *     100 MB file needs ~25 round trips. Whether libwebsockets - a system dependency, not
+ *   - Capped at 1 MiB per response (_HTTP_SERVICE_STATIC_RANGE_CHUNK_MAX in static.c), so a
+ *     100 MB file needs ~100 round trips. The cap is small because the 206 path buffers its
+ *     whole window (twice, counting send_2's LWS_PRE copy) where the 200 path streams; a
+ *     streaming send_file_range seam in http_server is deferred behind an RSS measurement.
+ *     Whether libwebsockets - a system dependency, not
  *     vendored - was built with LWS_WITH_RANGES cannot be assumed; a build
  *     that has it would let this delete the hand-rolled Range/416 path here and stream straight
  *     from disk instead. Not done in this pass; the hand-rolled path runs unconditionally.
@@ -63,15 +96,17 @@
  *     clean http_server_request_header_copy API, including If-Modified-Since (an RFC 7231
  *     IMF-fixdate parsed via datetime_from_http_try - RFC 850/asctime forms are refused, not just
  *     ignored).
- *   - serve_1 is DEPRECATED as of 0.3.1 and will be deleted in 0.4.0. It takes no request (only
+ *   - serve_1 is DEPRECATED as of 0.3.1 and will be deleted in 0.5.0. It takes no request (only
  *     a raw path), so it cannot read If-Modified-Since at all: a client sending only
  *     If-Modified-Since - `wget -N`, an IMS-only proxy - re-downloads the whole body through
  *     serve_1 where serve_2 answers 304. It still supports If-None-Match, Range, and If-Range,
  *     reading them directly off the response's underlying transport handle, which is the last
  *     raw lws_hdr_copy left in the service tier. Every production caller in this tree (28 sites
- *     across 16 files) migrated to serve_2 in the 0.3.1 pass; what remains on serve_1 is one
- *     call that serves a FIXED path rather than the request's (main.c's root route), plus the
- *     suite's unchecked build, which has no live request to hand serve_2.
+ *     across 16 files) migrated to serve_2 in the 0.3.1 pass, main.c's root route included; no
+ *     production caller remains. serve_1 is kept only for the suite's unchecked build, which
+ *     cannot reach the resolve-level refusals through serve_2 because HTTP_Server_Request is
+ *     opaque; it is deleted (retiring the last raw lws_hdr_copy) once that build runs against a
+ *     live server or resolve gains an exported seam.
  *   - Prefer serve_2 for any new integration; it is also what the Usage Example above shows.
  *
  * Thread Safety:
@@ -96,7 +131,7 @@
  *     comparison happens per candidate row, not once up front.
  *   - refuse_symlinks (see the Symlinks note) adds one directory listing per path component
  *     below root_dir, which is why it stays opt-in rather than always-on.
- *   - Range responses read at most _HTTP_SERVICE_STATIC_RANGE_CHUNK_MAX (4 MiB) into one heap
+ *   - Range responses read at most _HTTP_SERVICE_STATIC_RANGE_CHUNK_MAX (1 MiB) into one heap
  *     buffer per request; the full-file path streams through http_server_response_send_file with
  *     no module-side buffering.
  *   - A full serve costs five stat-family calls: file_exists_1 in path resolution, file_size_1
@@ -168,6 +203,16 @@ typedef struct {
      * this header for the accepted TOCTOU gap.
      */
     bool refuse_symlinks;
+    /**
+     * @brief Opt-in: refuse to serve a path any of whose request-relative components starts with '.'.
+     *
+     * Off by default (zero behaviour change: dotfiles are served like any asset). No dedicated
+     * constructor parameter - set this field directly after construction, the same pattern as
+     * refuse_symlinks. Exactly `.well-known` is exempt, the one dot-directory the web platform
+     * mandates. Costs a single scan of the request path, no file-system access. See the Dotfiles
+     * note in this header for what a spelling check cannot see.
+     */
+    bool refuse_dotfiles;
 } HTTP_Service_Static;
 
 /*==============================================================================
@@ -229,9 +274,9 @@ HTTP_Service_Static http_service_static_init_2(char const *const root_dir, char 
  * @param path Requested URL path.
  * @param path_size Size of the URL path string.
  * @return true if the static file was found and served.
- * @deprecated Since 0.3.1; scheduled for deletion in 0.4.0. Use http_service_static_serve_2,
- *             which takes the request every caller already holds. Kept only for a caller with no
- *             HTTP_Server_Request at all, or one serving a FIXED path rather than the request's.
+ * @deprecated Since 0.3.1; scheduled for deletion in 0.5.0. Use http_service_static_serve_2,
+ *             which takes the request every caller already holds. No production caller remains;
+ *             kept only until the unchecked suite can reach resolve-level refusals another way.
  * @note No HTTP_Server_Request is available here, so If-Modified-Since is never evaluated (see
  *       static.h's "serve_1 vs serve_2" note). If-None-Match, Range, and If-Range are still fully
  *       supported. Prefer serve_2 when a request is available.

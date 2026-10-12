@@ -1,6 +1,6 @@
 /*
  * rate_limit.h - HTTP rate limiting service for the C Libraries Framework
- * @version 0.3.4
+ * @version 0.3.5
  *
  * Counts requests per (rule, key) over a fixed window and refuses the ones past the rule's
  * limit. Keys are caller-defined strings, so the same service throttles by IP, by user id, by
@@ -37,6 +37,15 @@
  *   on the failures to count failures only; NEVER call allowed_* and then hit_* for the same
  *   request - that spends two units of a budget the caller believes it spent one of, halving
  *   every limit it configured.
+ *   The blocked_* + hit_* pair is two lock acquisitions, not one: each call is atomic, the pair is
+ *   not. Under concurrent callers on one key - a worker-pool server with several requests for that
+ *   key between their blocked_* and their hit_* - the failure bound is `limit + attempts in
+ *   flight`. It is exact when both calls run on one service thread - the case for a limiter used by
+ *   ONE HTTP_Server, since each HTTP_Server drives its own service thread (http_server.h Thread
+ *   Safety) - because the pair then cannot interleave. An instance shared by two servers (a plain
+ *   and a TLS listener in one process) is back on the in-flight bound. check_* is the
+ *   one-acquisition form; a refund_2 (consume with check_*, refund on success) is planned for when
+ *   a consumer moves verification off the service thread.
  *
  * Usage Example:
  *   @code
@@ -115,12 +124,16 @@
  *     true, and the condition is logged at most once per report window - throttled by time, not by
  *     an edge, since an edge is re-armed by every interleaved good request. The refused result
  *     carries limit 0 (the rule does not exist, rather than "a limit of zero") with the INSTANCE's
- *     cooldown as its retry_after. Register every rule at startup and check rule_add's answer.
+ *     cooldown as its retry_after, and get_time_left_* answers that same instance cooldown. Register
+ *     every rule at startup and check rule_add's answer.
  *   - An EMPTY OR NULL key is refused the same way (fail-CLOSED). Every client whose address could not
  *     be resolved would otherwise share one budget, so one forged header could exhaust it for
  *     all of them; and an unidentifiable caller must not be the one caller that gets a free
  *     pass. A key at or past HTTP_SERVICE_RATE_LIMIT_KEY_SIZE is refused identically - hash a
  *     long token to a short key before calling rather than having it truncated into a collision.
+ *   - On ANY refusal above, get_time_left_* answers the same wait check_* reports as its
+ *     retry_after - the rule's cooldown for an unusable key, the instance's for an unknown rule -
+ *     never 0, so the blocked_2 -> get_time_left_2 pairing never emits "Retry-After: 0".
  *   - Rule and instance limit/cooldown values must be non-zero, and this is CHECKED, not assumed:
  *     init/alloc_init answer false and rule_add answers USIZE_MAX. A zero cooldown makes every
  *     read reset the window (the limiter silently off) and a zero limit refuses everything.
@@ -136,6 +149,8 @@
  *   - Every public operation, query included, takes this instance's own mutex, and each answers
  *     from a SINGLE acquisition - check_* exists precisely so a refusal and its Retry-After
  *     cannot be read either side of another thread's window refresh.
+ *   - Atomicity is PER CALL, not per pairing: the blocked_* + hit_* bound and when it is exact
+ *     are stated once, under Counting contract. check_* is the one-acquisition form.
  *   - Instances are independent: each owns its lock, so destroying one does not affect another.
  *     The lock lives in the struct, which is why the constructors initialize in place instead of
  *     returning the service by value.
@@ -470,7 +485,9 @@ USize http_service_rate_limit_get_size(HTTP_Service_Rate_Limit *const self);
  * @brief Get the seconds left before a blocked key's default-rule window refreshes.
  * @param self Service instance.
  * @param key Caller-defined key.
- * @return Seconds until the window refreshes, or 0 when the key is not blocked.
+ * @return Seconds until the window refreshes, or 0 when the key is not blocked. On a refusal -
+ *         empty, null or oversize key - the instance's cooldown, the same wait check_1 reports as
+ *         its retry_after, never 0.
  */
 USize http_service_rate_limit_get_time_left_1(HTTP_Service_Rate_Limit *const self, char const *const key);
 
@@ -481,7 +498,9 @@ USize http_service_rate_limit_get_time_left_1(HTTP_Service_Rate_Limit *const sel
  * @param key Caller-defined key; null is refused like an empty key.
  * @return Seconds until the window refreshes, or 0 when the key is not blocked. For a key with
  *         NO record refused by the rule's spent overflow bucket, the seconds left on THAT bucket's
- *         window - the same wait check_2 reports as its retry_after. Prefer
+ *         window - the same wait check_2 reports as its retry_after. On a refusal - unknown rule,
+ *         empty, null or oversize key - the same wait check_2 reports as its retry_after (the
+ *         rule's cooldown; the instance's for an unknown rule), never 0. Prefer
  *         http_service_rate_limit_check_2, which answers this together with the verdict it
  *         belongs to instead of in a second, racing lock acquisition.
  */
