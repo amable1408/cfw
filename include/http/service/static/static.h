@@ -1,6 +1,6 @@
 /*
  * static.h - HTTP static file service for the C Libraries Framework
- * @version 0.4.0
+ * @version 0.4.1
  *
  * Maps HTTP request paths to static assets on disk, resolving their MIME types,
  * validating path security, and serving the file data over HTTP.
@@ -14,19 +14,17 @@
  *     (serve_2 only - see below) an unmet If-Modified-Since, Range served only when If-Range (if
  *     present) still matches - by the STRONG comparison RFC 9110 S13.1.5 requires there, so a
  *     W/-prefixed If-Range never matches and answers a full 200.
- *   - Path traversal prevention. On Windows, refused unconditionally as well: an NTFS
- *     alternate-data-stream (':') anywhere; any component - intermediate ones included - ending in
- *     '.' or ' ' (Win32 strips a trailing dot, so "sub./a.txt" would open sub/a.txt); any component
- *     containing '~' followed by a digit, the shape of an NTFS 8.3 short alias (".env" answers to
- *     "ENV~1" on a volume with short names, C: by default), which would otherwise be a second
- *     spelling past refuse_dotfiles, refuse_symlinks and the device list - a real long name of that
- *     shape ("backup~1.txt") is refused too; and a reserved device name as the final component
- *     (CON, CONIN$, CONOUT$, CLOCK$, PRN, AUX, NUL, COM1-9, LPT1-9, case-insensitive, with or
- *     without an extension, and with any spaces or dots between the name and the extension
- *     trimmed as Win32 trims them - "CONIN$ .txt" and "AUX .html" are refused like "con.txt"),
- *     plus the superscript-digit COM/LPT forms in both encodings: COM or LPT followed only by
- *     bytes >= 0x80, which covers the single cp1252 byte the ANSI APIs read (0xB9/0xB2/0xB3)
- *     and the UTF-8 pair the wide APIs read.
+ *   - Path traversal prevention. On Windows, refused unconditionally as well - through file/'s
+ *     OS-independent predicates, called here under _WIN32: file_path_aliased_windows on the
+ *     request-relative path (an NTFS alternate-data-stream ':' anywhere; any component,
+ *     intermediate ones included, ending in '.' or ' '; any component shaped like an NTFS 8.3
+ *     short alias - "ENV~1" for ".env", "BACKUP~1.TXT" - which would otherwise be a second
+ *     spelling past refuse_dotfiles, refuse_symlinks and the device list, while a name that can
+ *     never be an alias, "my-report~2.pdf", is served) and file_name_reserved_windows on the
+ *     final component (CON, CONIN$, CONOUT$, CLOCK$, PRN, AUX, NUL, COM1-9, LPT1-9 and the
+ *     superscript COM/LPT forms, case-insensitive, with or without an extension, with the
+ *     spaces/dots Win32 trims trimmed - "CONIN$ .txt" is refused like "con.txt"). See file.h
+ *     for the exact rules.
  *   - Opt-in dotfile refusal (refuse_dotfiles), `.well-known` exempt.
  *   - SPA fallback support, restricted to extension-less paths.
  *   - Arena and heap allocation.
@@ -71,7 +69,7 @@
  *     any root that is a checkout subtree or that a secret could ever be copied into.
  *   - What it refuses is the SPELLING a request uses, not the file it reaches. On Windows the 8.3
  *     short alias of a dotfile ("ENV~1" for ".env") does not start with '.', and is refused only
- *     because every '~'+digit component is (see Features). It cannot see a dotfile reached under
+ *     because every 8.3-shaped component is (see Features). It cannot see a dotfile reached under
  *     another name - a hard link, or a symlink/junction when refuse_symlinks is off.
  *
  * Range requests:

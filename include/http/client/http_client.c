@@ -497,6 +497,16 @@ static HTTP_Client_Result _http_client_perform(HTTP_Client *const self, char con
 
     string_clear(target);
 
+#ifdef ARENA_IMPLEMENTATION
+    /* An arena-backed response regrows by doubling into fresh borrows the arena never reclaims,
+     * so reserve the cap ONCE: an undersized arena then aborts here, at the caller's own cap,
+     * never at a size the remote peer chose. No-op on a reused String or a REFUSED arena.
+     * USIZE_MAX is excluded as well as 0: both mean "unbounded", and + 1 would wrap to 0. */
+    if (target->allocator != nullptr && self->max_response_size > 0 && self->max_response_size < USIZE_MAX) {
+        string_reserve(target, self->max_response_size + CHAR_END_CHARACTER);
+    }
+#endif // ARENA_IMPLEMENTATION
+
     self->active_response  = target;
     self->response_size    = 0;
     self->body_capped      = false;

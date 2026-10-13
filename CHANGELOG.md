@@ -61,6 +61,10 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - http/service/cors 0.4.0: `origin_add` refuses a malformed origin (it must be `scheme://host[:port]`), refuses `null` while `allow_credentials` is on (as it already refused `*`), strips a scheme's default port (`:443`, `:80`) and refuses a port that is 0, has a leading zero or exceeds 65535. A configuration that relied on any of these now gets `false` and a WARN at startup.
 - http/service/rate_limit 0.3.5: `get_time_left_*` answers the same wait `check_*` reports on a refusal, never 0, so the blocked/time-left pairing no longer emits `Retry-After: 0`.
 - encoding/quoted_printable 0.2.0: new `ENCODING_QUOTED_PRINTABLE_ENCODE_SIZE_MAX(byte_count)` for sizing a fixed buffer.
+- sync: file, http/client, http/service/static
+- file 0.5.0 (first version marker): two new OS-independent predicates for request-chosen names on a Windows-deployable server: `file_name_reserved_windows` (a component Win32 opens as a device - the reserved list with the stem trimmed the way Win32 trims it, `CON:` and `CON::$DATA` included, and COM/LPT followed only by non-ASCII bytes) and `file_path_aliased_windows` (an NTFS stream `:`, a component ending in `.` or space, or an 8.3-shaped alias). Pure byte rules; no file is opened.
+- http/service/static 0.4.1: the Windows refusals now come from `file/`'s predicates; the 8.3 rule is narrower (`my-report~2.pdf` is served again, `BACKUP~1.TXT` is still refused).
+- http/client 0.4.1: an arena-backed `response` now reserves `max_response_size + 1` from its arena at the start of every request, so an arena too small for the cap aborts at the caller's own cap before any I/O instead of at a size the remote peer chose. The default cap is 16 MiB: lower it with `http_client_set_max_response_size` before the first request on an arena-backed handle (0 or USIZE_MAX means unbounded, nothing reserved).
 
 ## 0.2.0 - release
 

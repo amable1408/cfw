@@ -1,5 +1,6 @@
 #include <test/test.h>
 
+#include <char/char.h>
 #include <container/str/str.h>
 #include <container/string/string.h>
 #include <file/file.h>
@@ -83,6 +84,91 @@ static void _test_extension(Test *const test) {
     test_case_end(test);
 }
 
+/* One spelling and the answer a Win32 predicate must give for it. The label names rows whose
+ * spelling carries non-printable bytes. */
+typedef struct {
+    char const  *label;
+    char const  *spelling;
+    bool        expected;
+} WindowsSpellingCase;
+
+/* Pure byte rules, so every row runs on every OS - no device is ever opened. */
+static void _test_windows_names(Test *const test) {
+    test_case_begin(test, "file_name_reserved_windows / file_path_aliased_windows");
+
+    static WindowsSpellingCase const devices[] = {
+        { "CONIN$ .txt (stem trim)", "CONIN$ .txt", true },
+        { "conin$ .txt (case)", "conin$ .txt", true },
+        { "AUX .html (stem trim)", "AUX .html", true },
+        { "CONIN$. .txt (stem trim)", "CONIN$. .txt", true },
+        { "CONIN$  .a.b (stem trim)", "CONIN$  .a.b", true },
+        { "nul .txt (stem trim)", "nul .txt", true },
+        { "CONOUT$ .js (stem trim)", "CONOUT$ .js", true },
+        { "CON", "CON", true },
+        { "con.txt", "con.txt", true },
+        { "prn.", "prn.", true },
+        { "COM1", "COM1", true },
+        { "lpt9.x", "lpt9.x", true },
+        { "COM + cp1252 0xB9", "COM\xB9", true },
+        { "LPT + cp1252 0xB2 .txt", "LPT\xB2.txt", true },
+        { "com + cp1252 0xB3", "com\xB3", true },
+        { "COM + UTF-8 superscript 1", "COM\xC2\xB9", true },
+        { "LPT + UTF-8 superscript 2 .txt", "LPT\xC2\xB2.txt", true },
+        { "CON:", "CON:", true },
+        { "CON:x", "CON:x", true },
+        { "CON::$DATA", "CON::$DATA", true },
+        { "con :x", "con :x", true },
+        { "CONFIG.txt", "CONFIG.txt", false },
+        { "x:CON", "x:CON", false },
+        { "console.txt", "console.txt", false },
+        { "COM0", "COM0", false },
+        { "COM10", "COM10", false },
+        { "COMX", "COMX", false },
+        { "leading space CONIN$", " CONIN$", false },
+        { "CONIN$ + tab", "CONIN$\t", false },
+        { "NUL + 0xA0 (not COM/LPT)", "NUL\xA0", false },
+        { "empty", "", false },
+        { "a", "a", false }
+    };
+
+    for (USize i = 0; i < sizeof(devices) / sizeof(devices[0]); i += 1) {
+        bool const actual = file_name_reserved_windows(devices[i].spelling, char_length(devices[i].spelling));
+
+        test_expect_bool(test, devices[i].label, devices[i].expected, actual);
+    }
+
+    static WindowsSpellingCase const paths[] = {
+        { "a:b (colon)", "a:b", true },
+        { "x::$DATA (stream)", "x::$DATA", true },
+        { "index.html:Zone.Identifier (stream)", "index.html:Zone.Identifier", true },
+        { "sub./x (intermediate dot)", "sub./x", true },
+        { "sub /x (intermediate space)", "sub /x", true },
+        { "x. (trailing dot)", "x.", true },
+        { "x  (trailing space)", "x ", true },
+        { "ENV~1 (8.3)", "ENV~1", true },
+        { "sub/GIT~1/config (8.3 intermediate)", "sub/GIT~1/config", true },
+        { "HTACCE~1 (8.3)", "HTACCE~1", true },
+        { "BACKUP~1.TXT (8.3 with extension)", "BACKUP~1.TXT", true },
+        { "a\\b./c (backslash separates)", "a\\b./c", true },
+        { "~1 (8.3-shaped stem)", "~1", true },
+        { "my-report~2.pdf (stem > 8)", "my-report~2.pdf", false },
+        { "a~b (no digit)", "a~b", false },
+        { "report~1.html (extension > 3)", "report~1.html", false },
+        { ".well-known/x", ".well-known/x", false },
+        { "normal/path.txt", "normal/path.txt", false },
+        { "empty", "", false },
+        { "a/b", "a/b", false }
+    };
+
+    for (USize i = 0; i < sizeof(paths) / sizeof(paths[0]); i += 1) {
+        bool const actual = file_path_aliased_windows(paths[i].spelling, char_length(paths[i].spelling));
+
+        test_expect_bool(test, paths[i].label, paths[i].expected, actual);
+    }
+
+    test_case_end(test);
+}
+
 int main(void) {
     LogConfig const log_config = {
         .level             = LOG_LEVEL_ERROR,
@@ -99,6 +185,7 @@ int main(void) {
     _test_metadata(&test);
     _test_empty_path_guard(&test);
     _test_extension(&test);
+    _test_windows_names(&test);
     test_suite_end(&test);
 
     return test_uninit(&test);

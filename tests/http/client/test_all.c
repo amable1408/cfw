@@ -1700,6 +1700,45 @@ static void _test_refused_arena_response_write_reports_truncation(Test *const te
     test_case_end(test);
 }
 
+static void _test_arena_response_reserves_cap_once(Test *const test) {
+    test_case_begin(test, "an arena-backed response with a body of cap - 1 bytes succeeds in an arena of exactly cap + 1 + 512 bytes - the cap is reserved once, never regrown by doubling");
+
+    Fixture_Server server = DEFAULT_INITIALIZATION;
+    server.script = FIXTURE_SCRIPT_OVERSIZED;
+    server.oversized_body_size = 65535;
+
+    if (!_start(test, &server)) {
+        test_case_end(test);
+
+        return;
+    }
+
+    char url[64] = DEFAULT_INITIALIZATION;
+    _url_for(fixture_server_port(&server), "/", url, sizeof(url));
+
+    HTTP_Client *client = http_client_new();
+
+    http_client_set_max_response_size(client, 65536);
+
+    Arena  arena    = arena_init_1(65536 + 1 + 512, ARENA_TYPE_LINEAR);
+    String response = string_alloc_init_1(&arena);
+
+    HTTP_Client_Result result = http_client_get(client, url, &response);
+
+    test_expect_true(test, "the request succeeded", http_client_result_is_ok(&result));
+    test_expect_u(test, "the whole cap - 1 byte body arrived", 65535, string_get_size(&response));
+    test_expect_true(test, "no truncation: status is not ERROR", result.status != HTTP_CLIENT_STATUS_ERROR);
+
+    http_client_result_uninit(&result);
+    string_uninit(&response);
+    arena_uninit(&arena, ARENA_TYPE_LINEAR);
+    http_client_delete(&client);
+    fixture_server_join(&server);
+    string_uninit(&server.request_body);
+
+    test_case_end(test);
+}
+
 static void _test_timeout_zero_no_abort_checked_build(Test *const test) {
     test_case_begin(test, "timeout_ms(0) and connect_timeout_ms(0) do not abort with ERROR_CHECK_ENABLED either, and forward to curl's own default");
 
@@ -1753,6 +1792,10 @@ static void _test_arena_result_error_survives_next_request(Test *const test) {
     _url_for(fixture_server_port(&failing_server), "/", url, sizeof(url));
 
     HTTP_Client *client = http_client_new();
+
+    /* The module reserves the cap in the arena up front, so the 16 MiB default would not fit 64 KiB. */
+    http_client_set_max_response_size(client, 4096);
+
     Arena arena = arena_init_1(64 * 1024, ARENA_TYPE_LINEAR);
     String response = string_alloc_init_1(&arena);
     HTTP_Client_Result first = http_client_get(client, url, &response);
@@ -2001,6 +2044,7 @@ int main(void) {
     _test_empty_string_str_payload_no_abort(&test);
     _test_perform_resets_active_response_and_postfields(&test);
     _test_refused_arena_response_write_reports_truncation(&test);
+    _test_arena_response_reserves_cap_once(&test);
     _test_timeout_zero_no_abort_checked_build(&test);
     _test_arena_result_error_survives_next_request(&test);
     _test_arena_result_error_falls_back_to_heap(&test);

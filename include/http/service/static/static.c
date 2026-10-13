@@ -574,149 +574,6 @@ static bool _http_service_static_has_dotfile(char const *const rel_path, USize c
     return false;
 }
 
-#ifdef _WIN32
-/*
- * Whether `name` (a single path COMPONENT, not a full path - the caller passes the resolved
- * file's base name) is refused on Windows. Two shapes:
- *   - A reserved device name: AUX, CLOCK$, CON, CONIN$, CONOUT$, NUL, PRN, COM1-9, LPT1-9 and
- *     the superscript-digit COM/LPT forms, matched case-insensitively and with or without a
- *     trailing extension ("nul.txt" counts, same as bare "nul"). The stem is what precedes the
- *     first '.', with its own trailing spaces and dots trimmed the way Win32 trims them before
- *     its device check ("CONIN$ .txt" and "AUX .html" open the device). The superscript forms
- *     are refused in BOTH encodings: the ANSI APIs file_exists_1 and lws call read one byte
- *     (cp1252 0xB9/0xB2/0xB3) as the device digit, the wide APIs read the UTF-8 pair, so any
- *     stem of COM or LPT followed only by bytes >= 0x80 is refused - never a real asset name. Windows
- *     resolves these specially at the filesystem-API level regardless of whatever a stat-family
- *     call like file_exists_1 reports - "nul" opens the null device (a stream that reads EOF and
- *     discards writes) and "con"/"aux"/"lpt1" open a console/serial/parallel device, none of
- *     which is the on-disk file the request appeared to name.
- *   - A name ending in ' ' or '.': Win32 strips those before the lookup, so "secret.txt." opens
- *     secret.txt - a second spelling of every asset, under a MIME type its suffix no longer
- *     names. No real NTFS name ends that way, so the spelling is refused, not normalized.
- * Checked only on Windows, since both are Win32 path semantics; static roots deployed on Linux
- * have neither to guard against. (A ':' anywhere - an NTFS alternate data stream - is refused
- * by the caller on the whole relative path, not here.)
- */
-static bool _http_service_static_is_refused_windows_name(char const *const name, USize const name_size) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "name", (void*) name);
-
-    /* The superscript-digit COM/LPT forms are not listed: the non-ASCII rule below refuses them
-     * in both their single-byte ANSI and their UTF-8 spellings. */
-    static char const *const reserved[] = {
-        "AUX", "CLOCK$", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "CON", "CONIN$", "CONOUT$",
-        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "NUL", "PRN"
-    };
-
-    /* Win32 strips trailing spaces and dots from a final path component before it looks the
-     * name up, so "nul " and "con." reach the device namespace exactly like "nul" and "con"
-     * do. Trim them first, then cut the stem at the first dot. */
-    USize trimmed_size = name_size;
-
-    while (trimmed_size > 0 && (name[trimmed_size - 1] == ' ' || name[trimmed_size - 1] == '.')) {
-        trimmed_size -= 1;
-    }
-
-    USize stem_size = trimmed_size;
-
-    for (USize i = 0; i < trimmed_size; i += 1) {
-        if (name[i] == '.') {
-            stem_size = i;
-
-            break;
-        }
-    }
-
-    /* Win32 trims the stem too before its device check: "CONIN$ .txt" and "AUX .html" open the
-     * device exactly like "CONIN$.txt" and "AUX.html" do. */
-    while (stem_size > 0 && (name[stem_size - 1] == ' ' || name[stem_size - 1] == '.')) {
-        stem_size -= 1;
-    }
-
-    bool is_reserved = false;
-
-    for (USize i = 0; i < sizeof(reserved) / sizeof(reserved[0]); i += 1) {
-        USize const reserved_size = char_length(reserved[i]);
-
-        if (stem_size == reserved_size && _http_service_static_extension_equal(name, reserved[i], reserved_size)) {
-            is_reserved = true;
-
-            break;
-        }
-    }
-
-    /* COM or LPT followed only by bytes >= 0x80: the ANSI APIs read the single cp1252 byte
-     * 0xB9/0xB2/0xB3 as the superscript device digit, the wide APIs the UTF-8 pair. */
-    if (!is_reserved && stem_size > 3 && (_http_service_static_extension_equal(name, "COM", 3) || _http_service_static_extension_equal(name, "LPT", 3))) {
-        is_reserved = true;
-
-        for (USize i = 3; i < stem_size; i += 1) {
-            if ((U8) name[i] < 0x80) {
-                is_reserved = false;
-
-                break;
-            }
-        }
-    }
-
-    trace_log_pop();
-
-    return is_reserved || trimmed_size != name_size;
-}
-
-/*
- * Whether any component of the request-relative path `rel_path` - intermediate ones included, not
- * just the base name _http_service_static_is_refused_windows_name sees - is a second Win32
- * spelling of some other on-disk name. Two shapes, refused unconditionally on Windows (nginx and
- * IIS refuse both):
- *   - A component ending in '.' or ' ': Win32 strips a trailing dot from an INTERMEDIATE
- *     component too, so "sub./a.txt" opens sub/a.txt while every lexical check - the
- *     refuse_symlinks listing match included - sees a name that does not exist. (A trailing
- *     space on an intermediate component is not stripped; refusing both keeps one rule.)
- *   - A component containing '~' followed by an ASCII digit: the shape of an NTFS 8.3 short name
- *     (".env" is reachable as "ENV~1", ".git" as "GIT~1", ".htaccess" as "HTACCE~1" on any volume
- *     with short names enabled, C: by default). A short alias defeats refuse_dotfiles, the
- *     refuse_symlinks listing match and the device-name list alike, so it is refused whether or
- *     not any of those knobs is on. A real long name of that shape ("backup~1.txt") is refused
- *     too - the accepted cost.
- * Both '/' and '\\' separate components, since Windows opens either. Pure path arithmetic.
- */
-static bool _http_service_static_has_refused_windows_component(char const *const rel_path, USize const rel_path_size) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "rel_path", (void*) rel_path);
-
-    USize cursor = 0;
-
-    while (cursor < rel_path_size) {
-        USize const segment_start = cursor;
-
-        while (cursor < rel_path_size && rel_path[cursor] != '/' && rel_path[cursor] != '\\') {
-            if (rel_path[cursor] == '~' && cursor + 1 < rel_path_size && char_is_number(rel_path[cursor + 1])) {
-                trace_log_pop();
-
-                return true;
-            }
-
-            cursor += 1;
-        }
-
-        if (cursor > segment_start && (rel_path[cursor - 1] == '.' || rel_path[cursor - 1] == ' ')) {
-            trace_log_pop();
-
-            return true;
-        }
-
-        cursor += 1;
-    }
-
-    trace_log_pop();
-
-    return false;
-}
-#endif // _WIN32
-
 /*
  * Append a snprintf-formatted header fragment into `buffer` at `*size`, refusing (leaving `*size`
  * unchanged) rather than accumulating a value that would overrun the remaining capacity. Mirrors
@@ -1040,21 +897,11 @@ static bool _http_service_static_resolve(HTTP_Service_Static const *const self, 
     }
 
 #ifdef _WIN32
-    /* ':' is never legal in an NTFS name, so on Windows it can only spell an alternate data
-     * stream - "index.html:Zone.Identifier" opens the stream (a downloaded file's ReferrerUrl and
-     * HostUrl), "index.html::$DATA" the file again under a MIME type no suffix matches. A drive
-     * spelling ("C:x") is refused by the same byte; the root is always prefixed anyway. */
-    for (USize i = 0; i < rel_path_size; i += 1) {
-        if (rel_path[i] == ':') {
-            trace_log_pop();
-
-            return false;
-        }
-    }
-
-    /* An 8.3 short alias or a trailing-dot/space component anywhere in the path - the second
-     * spellings every lexical refusal below would otherwise compare against the wrong name. */
-    if (_http_service_static_has_refused_windows_component(rel_path, rel_path_size)) {
+    /* An NTFS alternate data stream (':'), an 8.3 short alias or a trailing-dot/space component
+     * anywhere in the path - the second spellings every lexical refusal below would otherwise
+     * compare against the wrong name. Policy here, fact in file/: the predicate is OS-independent,
+     * the refusal is Windows-only because only Win32 rewrites these spellings. */
+    if (file_path_aliased_windows(rel_path, rel_path_size)) {
         trace_log_pop();
 
         return false;
@@ -1129,6 +976,9 @@ static bool _http_service_static_resolve(HTTP_Service_Static const *const self, 
     }
 
 #ifdef _WIN32
+    /* A Win32 device as the final component - request-chosen, or the config-sourced default_file
+     * a directory request appends. Opening one is the hazard ("CONIN$ .txt" blocks this thread),
+     * so the refusal precedes file_exists_1. */
     {
         USize base_start = 0;
 
@@ -1140,7 +990,7 @@ static bool _http_service_static_resolve(HTTP_Service_Static const *const self, 
             }
         }
 
-        if (_http_service_static_is_refused_windows_name(file_name + base_start, file_name_size - base_start)) {
+        if (file_name_reserved_windows(file_name + base_start, file_name_size - base_start)) {
             trace_log_pop();
 
             return false;

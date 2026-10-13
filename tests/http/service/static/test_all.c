@@ -399,6 +399,10 @@ static void _fixture_setup(void) {
     _fixture_write(_FIXTURE_ROOT "/sub/.git/config", "[core]");
     _fixture_write(_FIXTURE_ROOT "/.well-known/x", "well-known");
 
+    /* A real long name with '~'+digit that can never be an 8.3 alias (its stem is 11 bytes), so
+     * the short-name refusal is pinned not to over-reach onto it. */
+    _fixture_write(_FIXTURE_ROOT "/my-report~2.pdf", "report");
+
 #ifdef _WIN32
     /* A real NTFS alternate data stream, so the ':' refusal pin is not satisfied by a missing
      * file: without the refusal, file_exists_1 sees this stream and lws serves it. */
@@ -407,6 +411,10 @@ static void _fixture_setup(void) {
     /* A real asset whose stem merely starts like a device name ("CON"), so the device refusal
      * is pinned not to over-reach onto legitimate names. */
     _fixture_write(_FIXTURE_ROOT "/console.txt", "console");
+
+    /* A real long name that IS 8.3-shaped, so the alias refusal pin is not satisfied by a
+     * missing file: without the refusal, this file is served. */
+    _fixture_write(_FIXTURE_ROOT "/BACKUP~1.TXT", "backup");
 #endif // _WIN32
 
     _fixture_write(_FIXTURE_SPA_ROOT "/index.html", "<html>spa shell</html>");
@@ -989,6 +997,23 @@ static void _test_dotfiles(Test *const test, U16 const port) {
     test_case_end(test);
 }
 
+/*
+ * The 8.3 short-alias refusal is shape-narrow: a '~'+digit name whose stem is longer than 8 bytes
+ * (or whose extension is longer than 3) can never be a short name, so it is served on every OS.
+ */
+static void _test_tilde_name_served(Test *const test, U16 const port) {
+    test_case_begin(test, "a '~'+digit long name that cannot be an 8.3 alias is served");
+
+    _Reply reply = DEFAULT_INITIALIZATION;
+
+    if (test_expect_true(test, "my-report~2.pdf round trip", _client_round_trip(port, "GET /static/my-report~2.pdf HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply))) {
+        test_expect_u(test, "'my-report~2.pdf' (stem > 8 bytes) is served -> 200", 200, reply.status);
+        test_expect_string(test, "the my-report~2.pdf body", "report", reply.body);
+    }
+
+    test_case_end(test);
+}
+
 #ifdef _WIN32
 static void _test_ntfs_spellings_refused(Test *const test, U16 const port) {
     test_case_begin(test, "Windows: an NTFS stream (':') or a trailing dot/space spelling of a real file is refused");
@@ -1150,6 +1175,10 @@ static void _test_short_name_refused(Test *const test, U16 const port) {
         test_expect_u(test, "the 8.3 alias of .env is refused with refuse_dotfiles off too -> 404", 404, reply.status);
     }
 
+    if (test_expect_true(test, "BACKUP~1.TXT round trip", _client_round_trip(port, "GET /static/BACKUP~1.TXT HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply))) {
+        test_expect_u(test, "'BACKUP~1.TXT' (a real file, but 8.3-shaped) is refused -> 404", 404, reply.status);
+    }
+
     test_case_end(test);
 }
 #endif // _WIN32
@@ -1204,6 +1233,7 @@ int main(void) {
     _test_spa_fallback(&test, port);
     _test_symlink_refusal(&test, port);
     _test_dotfiles(&test, port);
+    _test_tilde_name_served(&test, port);
 #ifdef _WIN32
     _test_ntfs_spellings_refused(&test, port);
     _test_reserved_windows_name_refused(&test, port);

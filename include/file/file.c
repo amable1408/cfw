@@ -5,6 +5,8 @@
 #include <utime.h>
 #endif
 
+#include <char/char.h>
+
 /*
  * Can the ANSI Win32 / CRT entry points below actually ADDRESS this path?
  *
@@ -981,6 +983,73 @@ bool file_modified_3(String const *const file_name, I64 *const out) {
     return success;
 }
 
+bool file_name_reserved_windows(char const *const name, USize const name_size) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "name", (void*) name);
+
+    /* The superscript-digit COM/LPT forms are not listed: the non-ASCII rule below answers them
+     * in both their single-byte ANSI and their UTF-8 spellings. */
+    static char const *const reserved[] = {
+        "AUX", "CLOCK$", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "CON", "CONIN$", "CONOUT$",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "NUL", "PRN"
+    };
+
+    /* Win32 strips trailing spaces and dots from a component before it looks the name up, so
+     * "nul " and "con." reach the device namespace exactly like "nul" and "con" do. Trim them
+     * first, then cut the stem at the first dot - or the first ':', since Win32 reads "CON:" and
+     * "CON::$DATA" as the device too (a stream name after a device name is ignored). */
+    USize trimmed_size = name_size;
+
+    while (trimmed_size > 0 && (name[trimmed_size - 1] == ' ' || name[trimmed_size - 1] == '.')) {
+        trimmed_size -= 1;
+    }
+
+    USize stem_size = trimmed_size;
+
+    for (USize i = 0; i < trimmed_size; i += 1) {
+        if (name[i] == '.' || name[i] == ':') {
+            stem_size = i;
+
+            break;
+        }
+    }
+
+    /* Win32 trims the stem too before its device check: "CONIN$ .txt" and "AUX .html" open the
+     * device exactly like "CONIN$.txt" and "AUX.html" do. */
+    while (stem_size > 0 && (name[stem_size - 1] == ' ' || name[stem_size - 1] == '.')) {
+        stem_size -= 1;
+    }
+
+    bool is_reserved = false;
+
+    for (USize i = 0; i < sizeof(reserved) / sizeof(reserved[0]); i += 1) {
+        if (char_compare_iequal_2(name, stem_size, reserved[i], char_length(reserved[i]))) {
+            is_reserved = true;
+
+            break;
+        }
+    }
+
+    /* COM or LPT followed only by bytes >= 0x80: the ANSI APIs read the single cp1252 byte
+     * 0xB9/0xB2/0xB3 as the superscript device digit, the wide APIs the UTF-8 pair. */
+    if (!is_reserved && stem_size > 3 && (char_compare_iequal_2(name, 3, "COM", 3) || char_compare_iequal_2(name, 3, "LPT", 3))) {
+        is_reserved = true;
+
+        for (USize i = 3; i < stem_size; i += 1) {
+            if ((U8) name[i] < 0x80) {
+                is_reserved = false;
+
+                break;
+            }
+        }
+    }
+
+    trace_log_pop();
+
+    return is_reserved;
+}
+
 File* file_open_1(char const *const file_name, char const *const file_mode) {
     trace_log_push(LOG_METADATA);
 
@@ -1150,6 +1219,92 @@ File* file_open_wait_3(String const *const file_name, char const *const file_mod
     trace_log_pop();
 
     return file;
+}
+
+/*
+ * Whether one path component has the shape of an NTFS 8.3 short alias: a stem (the bytes before
+ * the first '.') of at most 8 bytes holding '~' followed by an ASCII digit, an extension of at
+ * most 3 bytes after that dot, and no space anywhere. Narrower than "contains ~digit": a stem
+ * longer than 8 bytes or an extension longer than 3 can never be a short name, so a long name
+ * like "my-report~2.pdf" is not refused for looking like one.
+ */
+static bool _file_component_short_name_shaped(char const *const component, USize const component_size) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "component", (void*) component);
+
+    USize stem_size = component_size;
+
+    for (USize i = 0; i < component_size; i += 1) {
+        if (component[i] == ' ') {
+            trace_log_pop();
+
+            return false;
+        }
+
+        if (component[i] == '.' && stem_size == component_size) {
+            stem_size = i;
+        }
+    }
+
+    USize const extension_size = stem_size < component_size ? component_size - stem_size - 1 : 0;
+
+    bool shaped = false;
+
+    if (stem_size <= 8 && extension_size <= 3) {
+        for (USize i = 0; i + 1 < stem_size; i += 1) {
+            if (component[i] == '~' && char_is_number(component[i + 1])) {
+                shaped = true;
+
+                break;
+            }
+        }
+    }
+
+    trace_log_pop();
+
+    return shaped;
+}
+
+bool file_path_aliased_windows(char const *const path, USize const path_size) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "path", (void*) path);
+
+    bool refused = false;
+    USize cursor = 0;
+
+    while (!refused && cursor < path_size) {
+        USize const component_start = cursor;
+
+        while (cursor < path_size && path[cursor] != '/' && path[cursor] != '\\') {
+            /* ':' can only spell an alternate data stream or a drive on Windows. */
+            if (path[cursor] == ':') {
+                refused = true;
+            }
+
+            cursor += 1;
+        }
+
+        USize const component_size = cursor - component_start;
+
+        /* Win32 strips a trailing dot, intermediate components included, so "sub./a.txt" opens
+         * sub/a.txt. (A trailing space on an intermediate component is not stripped; refusing
+         * both keeps one rule.) */
+        if (component_size > 0 && (path[cursor - 1] == '.' || path[cursor - 1] == ' ')) {
+            refused = true;
+        }
+
+        if (_file_component_short_name_shaped(path + component_start, component_size)) {
+            refused = true;
+        }
+
+        cursor += 1;
+    }
+
+    trace_log_pop();
+
+    return refused;
 }
 
 USize file_read_1(File *const self, void *const data, USize const data_size, USize const data_count) {

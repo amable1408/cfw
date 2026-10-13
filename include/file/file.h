@@ -1,5 +1,6 @@
 /*
  * file.h - Canonical file I/O interface for reading, writing, and managing files
+ * @version 0.5.0
  *
  * Features:
  *   - Cross-platform support (Linux, Windows)
@@ -19,6 +20,9 @@
  *     replaces an existing destination like POSIX rename(), and reports EXDEV /
  *     ERROR_NOT_SAME_DEVICE explicitly rather than silently falling back to a copy), and
  *     file_set_modified_* (pairs with the file_modified_* getter)
+ *   - Win32 spelling predicates, pure byte rules compiled on every OS: file_name_reserved_windows
+ *     (a component that names a device) and file_path_aliased_windows (a relative path that
+ *     carries a second spelling of some other name)
  *
  * Usage Examples:
  *   @code
@@ -389,6 +393,35 @@ bool file_modified_2(Str const *const file_name, I64 *const out);
 bool file_modified_3(String const *const file_name, I64 *const out);
 
 /**
+ * @brief Whether a single path COMPONENT names a Win32 device.
+ *
+ * Answers what Win32 would do to this spelling; call it on request-chosen names on ANY OS you
+ * may deploy to Windows. It is a pure byte rule - nothing is opened, so it is safe (and
+ * testable) on Linux too, and it never touches the device it is asking about. Opening one is
+ * the hazard: "CONIN$ .txt" opens the console input and blocks the caller's thread, "nul"
+ * opens a stream that reads EOF and discards writes, and neither is the on-disk file the
+ * name appeared to mean.
+ *
+ * The rule: trim the name's trailing ' ' and '.', cut the stem at the first '.' or ':' (Win32
+ * reads "CON:" and "CON::$DATA" as the device, ignoring a stream name after it), trim the
+ * stem's own trailing ' ' and '.' (Win32 trims before its device check, so "AUX .html" and
+ * "CONIN$ .txt" are devices), then match it ASCII-case-insensitively against AUX, CLOCK$,
+ * CON, CONIN$, CONOUT$, NUL, PRN, COM1-9 and LPT1-9. A stem of COM or LPT followed only by
+ * bytes >= 0x80 is a device too: the ANSI APIs read the single cp1252 byte 0xB9/0xB2/0xB3 as
+ * a superscript device digit, the wide APIs the UTF-8 pair, and no real asset is named that
+ * way. Only TRAILING ' ' and '.' are trimmed, so " CONIN$" and "CONIN$\t" answer false.
+ *
+ * Answers "is a device" ONLY. A name ending in '.' or ' ' that is not a device ("x.") answers
+ * false here; that second-spelling rule belongs to file_path_aliased_windows.
+ *
+ * @param name      One component, not a path - pass a base name (file_basename_1). Need not
+ *                  be null-terminated. Must not be nullptr.
+ * @param name_size Bytes in @p name. 0 is a legal value and answers false.
+ * @return true when Win32 would open a device for this component.
+ */
+bool file_name_reserved_windows(char const *const name, USize const name_size);
+
+/**
  * @brief Open a file (char*).
  * @param file_name File name as char*.
  * @param file_mode File mode string (e.g., "r", "w").
@@ -502,6 +535,36 @@ File* file_open_wait_2(Str const *const file_name, char const *const file_mode, 
  * @return Pointer to opened file, or nullptr when every attempt failed.
  */
 File* file_open_wait_3(String const *const file_name, char const *const file_mode, U32 const ms);
+
+/**
+ * @brief Whether a relative path carries a second Win32 spelling of some other name.
+ *
+ * Answers what Win32 would do to this spelling; call it on request-chosen paths on ANY OS you
+ * may deploy to Windows. A pure byte rule, compiled and testable everywhere. Every lexical
+ * check a caller makes afterwards (a dotfile refusal, a listing match, a device-name check)
+ * compares against the name AS SPELLED, so a spelling Win32 rewrites into another name
+ * defeats all of them at once. Three shapes answer true:
+ *   - ':' anywhere. Never legal in an NTFS name, so it can only spell an alternate data stream
+ *     ("index.html:Zone.Identifier", "x::$DATA") or a drive ("C:x").
+ *   - Any component, intermediate ones included, ending in '.' or ' '. Win32 strips a trailing
+ *     dot before the lookup, so "sub./a.txt" opens sub/a.txt and "secret.txt." opens
+ *     secret.txt. The "." and ".." components end in '.' and so answer true as well - a
+ *     caller that resolves dot segments itself must do so before asking.
+ *   - A component shaped like an NTFS 8.3 short alias: its stem (the bytes before its first
+ *     '.') is at most 8 bytes and contains '~' followed by an ASCII digit, the extension after
+ *     that dot (if any) is at most 3 bytes, and the component has no space. ".env" is reachable
+ *     as "ENV~1", ".git" as "GIT~1", ".htaccess" as "HTACCE~1" on any volume with short names
+ *     enabled. A real long name of that shape ("BACKUP~1.TXT") answers true as well - it IS a
+ *     possible alias - while a name that can never be one ("my-report~2.pdf", "report~1.html")
+ *     answers false.
+ * Both '/' and '\\' separate components, since Windows opens either. Device names are NOT
+ * checked here - see file_name_reserved_windows.
+ *
+ * @param path      Relative path. Need not be null-terminated. Must not be nullptr.
+ * @param path_size Bytes in @p path. 0 is a legal value and answers false.
+ * @return true when the path carries one of the shapes above.
+ */
+bool file_path_aliased_windows(char const *const path, USize const path_size);
 
 /**
  * @brief Read from file into buffer.
