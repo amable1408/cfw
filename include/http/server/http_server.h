@@ -4,7 +4,7 @@
  *  @file    http_server.h
  *  @brief   HTTP/1.1 server over libwebsockets: routing, request accessors and
  *           response helpers.
- *  @version 0.5.1
+ *  @version 0.5.2
  *
  *  Features:
  *    - Exact and regex route registration on one server handle.
@@ -70,7 +70,9 @@
  *      response_send_file_handle answer false on refusal and log a WARN; they never abort on
  *      caller data. The send_file_handle window (start, size) is request-derived data and is
  *      refused BY VALUE: past the file's size, or overflowing, it answers false with nothing
- *      written - never an error_check abort.
+ *      written - never an error_check abort. Its one seek (file_seek_try, no size bound) runs
+ *      before the headers, so a seek the C runtime refuses is the same by-value false, and a
+ *      file that shrank after the size query costs a short body, never the process.
  *    - http_server_run / http_server_run_tls answer a Result; a bind or TLS
  *      failure is reported, not aborted.
  *    - Peer-derived data never aborts: an over-long request URI is answered 414,
@@ -1199,7 +1201,7 @@ bool http_server_response_send_file(HTTP_Server_Response *const self, char const
  *         false (with a WARN, nothing written, the response untouched) when the headers are
  *         already sent, the handle is not a regular file, or start + size overflows or exceeds
  *         the file's size as the handle reports it, or content_type carries CR, LF or a control
- *         byte other than HTAB. A false here does NOT fail the response - the caller's own
+ *         byte other than HTAB, or the seek to @p start is refused by the C runtime. A false here does NOT fail the response - the caller's own
  *         fallback reply still goes out, exactly as send_file's refusals. The one exception is
  *         send_2's own: a header block that does not fit, or a short header write, answers
  *         false AND fails the response, exactly as send_2 does. *file stays the caller's.

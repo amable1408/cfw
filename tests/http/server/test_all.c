@@ -2369,6 +2369,18 @@ static void _test_send_file_handle(Test *const test) {
         test_expect_u(test, "and carries no body", 0, reply.body_size);
     }
 
+    /* The seek runs BEFORE the headers since 0.5.2 (file_seek_try): a window starting exactly at
+     * EOF seeks past nothing, which is legal, so it answers like any empty window. */
+    _stream_start = _STREAM_FIXTURE_SIZE;
+
+    if (test_expect_true(test, "EOF-start empty window round trip", _client_round_trip(port, _STREAM_REQUEST_CLOSE, &reply))) {
+        test_expect_true(test, "a window at start == size, size 0, is accepted (the seek to EOF is fine)", _stream_ok);
+        test_expect_u(test, "and answered 200 with no body", 200, reply.status);
+        test_expect_u(test, "no body bytes", 0, reply.body_size);
+    }
+
+    _stream_start = 0;
+
     /* HEAD: the headers a GET would produce, no body, and the keep-alive socket still serves
      * the NEXT request - the regression class is "HEAD answered twice". */
     _stream_size = _STREAM_FIXTURE_SIZE;

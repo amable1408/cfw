@@ -824,8 +824,10 @@ static bool _http_service_static_is_separator(char const character) {
 /*
  * Whether the open that just answered nullptr was refused because its final component is a link -
  * read straight off the OS error state, which file_open_nofollow_try_1 leaves as the refusal's own
- * (ELOOP from O_NOFOLLOW; ERROR_STOPPED_ON_SYMLINK from the reparse-tag check, a junction
- * included). It must run before anything that could overwrite that state, so it is not traced.
+ * (ELOOP from O_NOFOLLOW, a symlink to a directory included; ERROR_STOPPED_ON_SYMLINK from the
+ * reparse-tag check, which only a FILE link reaches - a final-component junction is a directory,
+ * refused by the open itself with ERROR_ACCESS_DENIED, so it never reads as a link here). It must
+ * run before anything that could overwrite that state, so it is not traced.
  */
 static bool _http_service_static_link_refused(void) {
 #ifdef _WIN32

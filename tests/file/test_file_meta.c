@@ -118,6 +118,10 @@ static void _test_windows_names(Test *const test) {
         { "CON:x", "CON:x", true },
         { "CON::$DATA", "CON::$DATA", true },
         { "con :x", "con :x", true },
+        { "COM1 .txt (stem trim on a numbered port)", "COM1 .txt", true },
+        { "con.txt.bak (stem cut at the FIRST dot)", "con.txt.bak", true },
+        { "LPT + UTF-8 superscript 1, no extension", "LPT\xC2\xB9", true },
+        { "x: (device false; the path rule answers true - the overlap, by design)", "x:", false },
         { "CONFIG.txt", "CONFIG.txt", false },
         { "x:CON", "x:CON", false },
         { "console.txt", "console.txt", false },
@@ -151,13 +155,23 @@ static void _test_windows_names(Test *const test) {
         { "BACKUP~1.TXT (8.3 with extension)", "BACKUP~1.TXT", true },
         { "a\\b./c (backslash separates)", "a\\b./c", true },
         { "~1 (8.3-shaped stem)", "~1", true },
+        { ". (dot segment)", ".", true },
+        { ".. (dot segment)", "..", true },
+        { "... (trailing dots)", "...", true },
+        { "a/./b (dot segment mid-path)", "a/./b", true },
+        { "//./PhysicalDrive0 (device prefix: its second component IS .)", "//./PhysicalDrive0", true },
+        { "//?/C:/x (verbatim prefix)", "//?/C:/x", true },
+        { "sub/.. (dot segment last)", "sub/..", true },
+        { "x: (the path half of the overlap pin)", "x:", true },
         { "my-report~2.pdf (stem > 8)", "my-report~2.pdf", false },
         { "a~b (no digit)", "a~b", false },
         { "report~1.html (extension > 3)", "report~1.html", false },
         { ".well-known/x", ".well-known/x", false },
         { "normal/path.txt", "normal/path.txt", false },
         { "empty", "", false },
-        { "a/b", "a/b", false }
+        { "a/b", "a/b", false },
+        { "a/b/ (trailing separator)", "a/b/", false },
+        { "a//b (empty component)", "a//b", false }
     };
 
     for (USize i = 0; i < sizeof(paths) / sizeof(paths[0]); i += 1) {

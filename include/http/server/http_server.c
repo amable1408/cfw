@@ -3327,6 +3327,19 @@ bool http_server_response_send_file_handle(HTTP_Server_Response *const self, Fil
         return false;
     }
 
+    /* ONE seek, BEFORE the header block, so its failure is a refusal like the ones above: nothing
+     * written, write_success untouched, the handle left to the caller, the fallback reply still
+     * sent. file_seek_try has no size bound - a file that shrank after file_get_size costs the
+     * stream a short read, never the process - so the only false is the C runtime refusing the
+     * offset itself. The chunks then read sequentially from here. */
+    if (!file_seek_try(*file, start, FILE_POSITION_BEGIN)) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_server_response_send_file_handle: refusing - the C runtime refused the seek; nothing was written");
+
+        trace_log_pop();
+
+        return false;
+    }
+
     if (!_http_server_response_headers_write(self, status_code, content_type, size, false)) {
         trace_log_pop();
 
@@ -3343,11 +3356,6 @@ bool http_server_response_send_file_handle(HTTP_Server_Response *const self, Fil
 
         return true;
     }
-
-    /* ONE seek; the chunks then read sequentially. start <= file_size was established
-     * above, so file_at's own (checked-build) bound holds unless the file shrank in the
-     * microseconds between the two queries. */
-    file_at(*file, start, FILE_POSITION_BEGIN);
 
     /* No stream can still be in flight here - headers_sent allows one send per response,
      * and the previous transaction's stream ended before this one was dispatched - but the

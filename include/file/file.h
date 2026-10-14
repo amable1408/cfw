@@ -1,6 +1,6 @@
 /*
  * file.h - Canonical file I/O interface for reading, writing, and managing files
- * @version 0.6.0
+ * @version 0.7.0
  *
  * Features:
  *   - Cross-platform support (Linux, Windows)
@@ -51,8 +51,8 @@
  *     file_set_modified_* all check it. A SIXTH by-path mutator added later must check it too.
  *     The refusal carries FILE_ARGUMENT_UNADDRESSABLE_PATH in its code field: ask
  *     file_result_is_unaddressable rather than comparing categories.
- *   - The check converts a non-ASCII path to UTF-16 twice, through memory_try_alloc. When THAT
- *     allocation fails the call reports RESULT_CATEGORY_MEMORY, never the unaddressable
+ *   - The check converts a non-ASCII path to UTF-16 twice, into ONE memory_try_alloc block.
+ *     When THAT allocation fails the call reports RESULT_CATEGORY_MEMORY, never the unaddressable
  *     refusal: nothing is known about the path yet, so a caller must not route it to the trash
  *     path as if the name were the problem. Either way nothing is acted on.
  *   - Why refusing and not "best effort": this was not a failure mode, it was a MIS-TARGET.
@@ -279,6 +279,7 @@ String file_align_read_to_string(char const *const file_name, U16 const padding)
  * @note The bound check no longer disturbs the stream: file_get_size answers by
  *       handle on both platforms, where the Linux branch used to seek and rewind
  *       (silently resetting the very position this call was about to seek from).
+ * @see file_seek_try for a seek that answers false instead of aborting, with no size bound.
  */
 void file_at(File *const self, USize const index, File_Position const position);
 
@@ -458,6 +459,11 @@ bool file_flush(File *const self);
  * is not followed by this call - it reports where the handle already is. Same answer shape as
  * file_final_path_1 (OS separators, on-disk casing, no `\\?\`), so the two compare directly.
  *
+ * HARD LINKS are outside this compare: both platforms answer the NAME the handle was opened
+ * through, so a hard link planted inside a root to a file outside it (same inode, different
+ * name) reports the inside name and passes a prefix check - the scope nginx's disable_symlinks
+ * has too.
+ *
  * PLATFORM ASYMMETRY: Linux answers through readlink("/proc/self/fd/N"), so it answers false
  * wherever /proc is not mounted (a minimal container, a chroot) - a caller refusing on false
  * therefore fails CLOSED there, which is the intended direction. Linux also reports a file
@@ -541,6 +547,14 @@ bool file_modified_3(String const *const file_name, I64 *const out);
  * Answers "is a device" ONLY. A name ending in '.' or ' ' that is not a device ("x.") answers
  * false here; that second-spelling rule belongs to file_path_aliased_windows.
  *
+ * FINAL component only, as Win32's own device check (RtlIsDosDeviceName) looks only at the last
+ * element: an intermediate "con/x.txt" opens nothing, since a directory named CON cannot exist -
+ * which is why file_path_aliased_windows does not look for devices.
+ *
+ * The sized (slice) signature is this pair's canonical form: pass `str.data, str.size` from a Str.
+ * A later Str / String twin, once a caller needs one, takes `_2` / `_3` and this keeps the bare
+ * name.
+ *
  * @param name      One component, not a path - pass a base name (file_basename_1). Need not
  *                  be null-terminated. Must not be nullptr.
  * @param name_size Bytes in @p name. 0 is a legal value and answers false.
@@ -590,55 +604,60 @@ File* file_open_3(String const *const file_name, char const *const file_mode);
  *
  * The opener for a path chosen by someone else. Three refusals the plain openers do not make,
  * answered by the OPEN itself, or by the handle it returned, rather than by a check by path
- * before it - except a Windows device or UNC path, for which the open IS the hazard (see the
- * third):
- *   - the final component is a symbolic link. Linux: O_NOFOLLOW, the kernel answers ELOOP.
- *     Windows: FILE_FLAG_OPEN_REPARSE_POINT, then a FILE_ATTRIBUTE_REPARSE_POINT whose tag
- *     IsReparseTagNameSurrogate - a symlink or a junction - is refused with
- *     ERROR_STOPPED_ON_SYMLINK. A reparse point that is NOT a name surrogate (a Dropbox /
- *     OneDrive cloud placeholder, a dedup or WOF-compressed file) is a file, not a link: it is
- *     re-opened WITHOUT the flag so the filter driver serves its data, and the handle returned -
- *     the one a caller then verifies with file_get_final_path - is that second handle. The
- *     re-open is a second path resolution, so it is PINNED to the first: its volume serial and
- *     128-bit file ID (FILE_ID_INFO) must equal the first handle's (a placeholder hydrated by the
- *     re-open keeps its file ID). An entry swapped between the two opens - for a symlink the unflagged re-open
- *     would follow, or for any other file - is refused with ERROR_STOPPED_ON_SYMLINK, as is a
- *     handle whose identity cannot be read.
+ * before it - except the Windows spellings refused before any open (the table below), for which
+ * the open IS the hazard:
+ *   - the final component is a FILE symbolic link. Linux: O_NOFOLLOW, the kernel answers ELOOP -
+ *     a symlink to a directory included. Windows: FILE_FLAG_OPEN_REPARSE_POINT, then a
+ *     FILE_ATTRIBUTE_REPARSE_POINT whose tag IsReparseTagNameSurrogate is refused with
+ *     ERROR_STOPPED_ON_SYMLINK. A final-component JUNCTION (or directory symlink) never reaches
+ *     that check: it is a directory, so CreateFile2 refuses it as one, with the directory's
+ *     ERROR_ACCESS_DENIED (next bullet) - refused either way, under a different code. A reparse
+ *     point that is NOT a name surrogate (a Dropbox / OneDrive cloud placeholder, a dedup or
+ *     WOF-compressed file) is a file, not a link: it is re-opened WITHOUT the flag so the filter
+ *     driver serves its data, and the handle returned - the one a caller then verifies with
+ *     file_get_final_path - is that second handle. The re-open is a second path resolution, so
+ *     it is PINNED to the first: its volume serial and 128-bit file ID (FILE_ID_INFO) must equal
+ *     the first handle's (a placeholder hydrated by the re-open keeps its file ID). An entry
+ *     swapped between the two opens - for a symlink the unflagged re-open would follow, or for
+ *     any other file - is refused with ERROR_STOPPED_ON_SYMLINK, as is a handle whose identity
+ *     cannot be read.
  *   - it is a directory. Windows: CreateFile2 without FILE_FLAG_BACKUP_SEMANTICS refuses it
  *     itself (ERROR_ACCESS_DENIED, which the attribute re-check also sets). Linux: the open
  *     succeeds, fstat says S_ISDIR, the descriptor is closed -> EISDIR.
  *   - it is not a regular file at all - a FIFO, a socket, a device. Linux: opened with
  *     O_NONBLOCK so a FIFO with no writer cannot block the caller, then fstat -> ENXIO.
- *     Windows: a device is refused BEFORE any open, on the spelling alone, since opening one
- *     can block on a console or connect to a named pipe's server. A UNC path (two leading
- *     separators, any mix of \ and /) is refused before any open - it would connect to the
- *     named host (SMB, NTLM) or to a local named pipe through the loopback; open network-share
- *     files with file_open_try_*. That rule also covers the device namespaces \\.\ and \\?\
- *     (and the bare \\. and \\?). So does a path starting with the NT \??\ (one leading
- *     separator), or whose final component file_name_reserved_windows calls a device (after any
- *     trailing separators, and with any "X:" prefix of that component dropped, so "C:nul"
- *     counts). Each answers ERROR_INVALID_HANDLE with no syscall. The cost: a real file so
- *     spelled cannot be opened through this function - a file literally named "con.txt"
- *     (creatable on Windows 11), any path written with \\?\, any file on a network share, or a
- *     one-letter file's stream named like a device ("C:\a\b:con").
- *     Anything else whose handle type is not FILE_TYPE_DISK is opened, then refused with the
+ *     Windows: a device, UNC or \??\ spelling is refused before any open (the table below);
+ *     anything else whose handle type is not FILE_TYPE_DISK is opened, then refused with the
  *     same ERROR_INVALID_HANDLE.
- *     POSIX has no such rule: "//" is an ordinary path there, opened like any other.
- *     The spelling check reads PATH alone: a relative or drive-relative path resolves against the
- *     process's current directory, which it does not inspect, so a caller opening an untrusted
- *     name joins it to an absolute root first, as http_service_static does.
  * Intermediate components are followed like any open; a caller that must refuse a linked
  * ANCESTOR compares file_get_final_path against the path it meant.
  *
  * Three refusals happen before any open:
- *   - a UNC path (two leading separators), the NT \??\ prefix, or a device final component
- *     (Windows only): ERROR_INVALID_HANDLE. Checked first.
+ *   - a UNC path (two leading separators, any mix of \ and /: it would connect to the named host
+ *     over SMB / NTLM, or to a local named pipe through the loopback; open network-share files
+ *     with file_open_try_*), which also covers the device namespaces \\.\ and \\?\ (and the
+ *     bare \\. and \\?); a path starting with the NT \??\ (one leading separator); or a final
+ *     component file_name_reserved_windows calls a device (after any trailing separators, and
+ *     with any "X:" prefix of that component dropped, so "C:nul" counts) - opening one can
+ *     block on a console or connect to a named pipe's server. Windows only:
+ *     ERROR_INVALID_HANDLE with no syscall. Checked first. The cost: a real file so spelled
+ *     cannot be opened through this function - a file literally named "con.txt" (creatable on
+ *     Windows 11), any path written with \\?\, any file on a network share spelled with two
+ *     leading separators, or a one-letter file's stream named like a device ("C:\a\b:con"). The
+ *     rule is a SPELLING rule: a mapped drive letter ("Z:\share\x") is not refused and opens
+ *     (SMB to a server the administrator chose); its final path answers "\\server\share\x".
+ *     POSIX has no such rule: "//" is an ordinary path there, opened like any other. The check
+ *     reads PATH alone: a relative or drive-relative path resolves against the process's
+ *     current directory, which it does not inspect, so a caller opening an untrusted name joins
+ *     it to an absolute root first, as http_service_static does.
  *   - a path that does not fit FILE_PATH_WIDE_MAX UTF-16 units (Windows,
  *     ERROR_FILENAME_EXCED_RANGE) or PATH_MAX bytes (Linux, ENAMETOOLONG).
  *   - invalid UTF-8 (Windows, ERROR_NO_UNICODE_TRANSLATION).
  * Two can happen after it, on Windows only, when the CRT cannot wrap the verified handle in a
- * stream: ERROR_TOO_MANY_OPEN_FILES (descriptor table full) and ERROR_NOT_ENOUGH_MEMORY (no
- * FILE); Linux keeps fdopen's own errno.
+ * stream - both answer ERROR_TOO_MANY_OPEN_FILES: the descriptor table is full
+ * (_open_osfhandle), or the CRT's stream table is (_fdopen; 512 streams by default, see
+ * _setmaxstdio - the realistic one, long before the 8192 descriptors fill). Linux keeps
+ * fdopen's own errno.
  *
  * This is the module's first WIDE opener - see Character Encoding: it can open a non-ASCII name
  * file_open_try_1 cannot.
@@ -773,7 +792,11 @@ File* file_open_wait_3(String const *const file_name, char const *const file_mod
  *   - Any component, intermediate ones included, ending in '.' or ' '. Win32 strips a trailing
  *     dot before the lookup, so "sub./a.txt" opens sub/a.txt and "secret.txt." opens
  *     secret.txt. The "." and ".." components end in '.' and so answer true as well - a
- *     caller that resolves dot segments itself must do so before asking.
+ *     caller that resolves dot segments itself must do so before asking. That is kept on
+ *     purpose, not an accident of the rule: the second component of the Win32 device prefix
+ *     "//./" (as in "//./PhysicalDrive0") IS ".", so exempting dot segments would pass the
+ *     device namespace to any caller that uses the path at position zero ("//?/C:/x", the
+ *     verbatim prefix, is caught by its ':').
  *   - A component shaped like an NTFS 8.3 short alias: its stem (the bytes before its first
  *     '.') is at most 8 bytes and contains '~' followed by an ASCII digit, the extension after
  *     that dot (if any) is at most 3 bytes, and the component has no space. ".env" is reachable
@@ -784,7 +807,8 @@ File* file_open_wait_3(String const *const file_name, char const *const file_mod
  * Both '/' and '\\' separate components, since Windows opens either. Device names are NOT
  * checked here - see file_name_reserved_windows.
  *
- * @param path      Relative path. Need not be null-terminated. Must not be nullptr.
+ * @param path      Relative path. Need not be null-terminated - the sized form, as
+ *                  file_name_reserved_windows. Must not be nullptr.
  * @param path_size Bytes in @p path. 0 is a legal value and answers false.
  * @return true when the path carries one of the shapes above.
  */
@@ -1162,9 +1186,24 @@ bool file_result_is_not_found(Result const result);
  * @param result A Result returned by this family.
  * @return true for RESULT_CATEGORY_ARGUMENT with FILE_ARGUMENT_UNADDRESSABLE_PATH; never on
  *         Linux, where every path is addressable, and never for the RESULT_CATEGORY_MEMORY the
- *         check itself reports when its conversion buffers cannot be taken.
+ *         check itself reports when its conversion buffer cannot be taken.
  */
 bool file_result_is_unaddressable(Result const result);
+
+/**
+ * @brief Seek, answering false instead of aborting - the `_try` twin of file_at.
+ *        No size query: a seek past EOF is legal and the next read answers 0, so a
+ *        file that shrank under a reader costs that reader one short read, not the
+ *        process. Fails only when the C runtime refuses the seek (an offset that does
+ *        not fit a signed 64-bit position, or a position outside File_Position); errno
+ *        says why, and on Windows GetLastError does for those two refusals only.
+ * @param self      File handle.
+ * @param index     Offset, unsigned (forward only from CURRENT/END, as file_at).
+ * @param position  Reference position.
+ * @return true when positioned; false otherwise, with the stream's position untouched.
+ * @see file_at for the checked-build bound against the file's size.
+ */
+bool file_seek_try(File *const self, USize const index, File_Position const position);
 
 /**
  * @brief Set a file's last-modified time by path, from Unix epoch seconds (char*).

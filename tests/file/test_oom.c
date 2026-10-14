@@ -1,5 +1,6 @@
 #ifdef _WIN32
 #include <platform/windows/windows.h>
+#include <process/process.h>
 #else
 #include <fcntl.h>
 #include <signal.h>
@@ -15,7 +16,7 @@
 #include <result.h>
 #include <test/test.h>
 
-/* Fault injection for file's documented out-of-memory contracts (file.h 0.6.0).
+/* Fault injection for file's documented out-of-memory contracts (file.h 0.7.0).
  *
  * WHY A SEPARATE BINARY. A recover contract ("returns MEMORY / an empty buffer when the
  * allocation fails") never executes in an ordinary suite - the allocation never fails. This
@@ -49,13 +50,15 @@
  * DOCUMENTED ABORT CONTRACTS. They are only live under ERROR_CHECK_ENABLED, which this binary
  * refuses (see the #error). On Linux each is probed in a forked child whose memory_alloc wrapper
  * EMULATES the checked build - a refused allocation reaching the aborting twin calls abort() -
- * with an unarmed control child first, so the death is attributable to the injection. On
- * Windows there is no fork: the String readers would dereference the nullptr the twin returns
- * here and take the harness with them, so those probes print a SKIPPED line instead; the _2/_3
- * wrapper sites are still covered in-process by the twin count in the degradation section.
+ * with an unarmed control child first, so the death is attributable to the injection. Windows
+ * has no fork, so there the child is a RE-EXEC of this binary through process/ (`--probe <row>
+ * <armed>`) emulating the same abort, and the parent reads its exit through
+ * process_outcome_aborted (0xC0000409 under the UCRT, 3 under msvcrt). The _2/_3 wrapper sites
+ * are additionally covered in-process by the twin count in the degradation section.
  *
  * SINGLE-THREADED BY REQUIREMENT. The ledger and the injector are plain statics; nothing linked
- * here spawns a thread. A binary that grows one needs a ThreadMutex around the ledger.
+ * here spawns a thread (process_run starts its stdin writer only for a non-empty input, and the
+ * probes feed none). A binary that grows one needs a ThreadMutex around the ledger.
  *
  * RUNNING: from tests/file (.\oom.exe). The fixtures live in cfw_file_oom/ under the system temp
  * directory (the current directory when that cannot be entered) and are removed at the end. */
@@ -78,6 +81,8 @@
 #define _TEST_DIRECTORY "cfw_file_oom"
 #define _TEST_EPOCH_SECONDS 1000000000
 #define _TEST_EXIT_ARMED_DEFECT 111
+// A re-exec child asked for a probe row the table does not have.
+#define _TEST_EXIT_BAD_PROBE 112
 #define _TEST_LABEL_SIZE 192
 #define _TEST_LEDGER_CAPACITY 4096
 // Name buffers: every generated fixture name is shorter than this.
@@ -116,11 +121,14 @@
 #define _TEST_NAME_SET_MODIFIED2 25
 #define _TEST_NAME_SET_MODIFIED3 27
 // The abort probes' fixtures, and file_align_read_to_string's vector width there.
+// The re-exec switch (Windows): `oom.exe --probe <row> <armed>`.
+#define _TEST_PROBE_ARGUMENT "--probe"
 #define _TEST_PROBE_COPY_DESTINATION "probe_copy_destination.txt"
 #define _TEST_PROBE_PADDING 32
 #define _TEST_PROBE_REMOVE "probe_remove.txt"
 #define _TEST_PROBE_REPLACE_DESTINATION "probe_replace.txt"
 #define _TEST_PROBE_SOURCE "probe_source.txt"
+#define _TEST_PROBE_TIMEOUT_MS 30000
 
 /*==============================================================================
  * MARK: - Allocation Ledger
@@ -1024,7 +1032,7 @@ static void _test_raw_readers_degrade_to_empty(Test *const test) {
 }
 
 /* _file_path_addressable (Windows): the one Windows conversion helper that allocates - two
- * UTF-16 copies of a non-ASCII path, through memory_try_alloc - and "this predicate only ever
+ * UTF-16 copies of a non-ASCII path, in ONE memory_try_alloc block - and "this predicate only ever
  * fails closed" - and, since a refused buffer says nothing about the NAME, reports
  * RESULT_CATEGORY_MEMORY rather than the unaddressable refusal whose remedy is the trash path.
  * Reachable only when the UTF-8 and code-page readings have the SAME length, which for a
@@ -1049,39 +1057,38 @@ static void _test_addressable_conversion_fails_closed(Test *const test) {
             "and one UTF-16 unit, so the lengths always differ and _file_path_addressable refuses before its allocation.\n", (unsigned) GetACP());
     }
     else {
+        // ONE block holds both readings: the UTF-8 one, then the code-page one, each `units` long.
         int const units   = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name, -1, nullptr, 0);
-        USize const bytes = (USize) units * sizeof(WCHAR);
+        USize const bytes = (USize) 2 * (USize) units * sizeof(WCHAR);
 
         test_expect_true(test, "the fixture is written", _fixture_write(name, _TEST_CONTENT_WRAPPER, 'u'));
 
-        /* Ordinal 1 refuses the first copy (the second is still taken, then released); ordinal 2
-         * serves the first and refuses the second - both mixed exits of the release block. */
-        for (USize ordinal = 1; ordinal <= 2; ordinal += 1) {
-            char const *const row = ordinal == 1 ? "first buffer refused" : "second buffer refused";
-            Window const window   = _window_open();
+        // The single block is the only allocation, so refusing it is the only failure exit.
+        char const *const row = "the conversion block refused";
+        Window const window   = _window_open();
 
-            _test_arm(bytes, ordinal);
+        _test_arm(bytes, 1);
 
-            Result const result = file_remove_1(name);
-            USize const fired   = _fail_refused;
+        Result const result = file_remove_1(name);
+        USize const fired   = _fail_refused;
 
-            _test_disarm();
+        _test_disarm();
 
-            test_expect_u(test, _label(row, "the conversion buffer was refused"), 1, fired);
-            test_expect_true(test, _label(row, "reported as RESULT_CATEGORY_MEMORY"), result_category(result) == RESULT_CATEGORY_MEMORY);
-            test_expect_false(test, _label(row, "never as the unaddressable refusal"), file_result_is_unaddressable(result));
-            test_expect_true(test, _label(row, "fail closed: the file was not removed"), _fixture_matches(name, _TEST_CONTENT_WRAPPER, 'u'));
-            test_expect_u(test, _label(row, "the other buffer was taken"), 1, _window_records(window, bytes));
-            test_expect_u(test, _label(row, "and released"), 0, _window_live_any(window));
-        }
+        test_expect_u(test, _label(row, "the conversion block was refused"), 1, fired);
+        test_expect_true(test, _label(row, "reported as RESULT_CATEGORY_MEMORY"), result_category(result) == RESULT_CATEGORY_MEMORY);
+        test_expect_false(test, _label(row, "never as the unaddressable refusal"), file_result_is_unaddressable(result));
+        test_expect_true(test, _label(row, "fail closed: the file was not removed"), _fixture_matches(name, _TEST_CONTENT_WRAPPER, 'u'));
+        test_expect_u(test, _label(row, "no second block was taken"), 0, _window_records(window, bytes));
+        test_expect_u(test, _label(row, "and nothing is left live"), 0, _window_live_any(window));
 
-        // Positive anchor: unarmed, the same call takes both buffers, finds the name addressable and removes it.
+        // Positive anchor: unarmed, the same call takes the one block, finds the name addressable and removes it.
         Window const control = _window_open();
         Result const removed = file_remove_1(name);
 
         test_expect_true(test, "anchor: unarmed, the removal succeeds", result_is_success(removed));
-        test_expect_u(test, "anchor: through both conversion buffers", 2, _window_records(control, bytes));
-        test_expect_u(test, "anchor: both released", 0, _window_live_any(control));
+        test_expect_u(test, "anchor: through exactly one conversion block", 1, _window_records(control, bytes));
+        test_expect_u(test, "anchor: no half-size block either (one block, not two)", 0, _window_records(control, bytes / 2));
+        test_expect_u(test, "anchor: released", 0, _window_live_any(control));
 
         // Cleanup only for a failed anchor: a passing one already removed the fixture.
         remove(name);
@@ -1636,7 +1643,73 @@ static void _probe_expect_abort(Test *const test, ProbeRow const *const row) {
     test_expect_true(test, _label(row->name, "the unarmed control runs to completion"), WIFEXITED(statuses[0]) && WEXITSTATUS(statuses[0]) == 0);
     test_expect_true(test, _label(row->name, "the refused allocation aborts (SIGABRT)"), WIFSIGNALED(statuses[1]) && WTERMSIG(statuses[1]) == SIGABRT);
 }
+#else
+/* No fork() on Windows, so the containment is a RE-EXEC: this binary runs itself through
+ * process/ with `--probe <row> <armed>` (see main), and the child emulates the checked build's
+ * memory_alloc exactly as the forked Linux child does. The child inherits the working directory,
+ * so it finds the fixtures the parent wrote. Same two-run shape: the unarmed control must exit 0
+ * before the armed child's abort is attributable to the refused allocation. */
+static void _probe_expect_abort(Test *const test, ProbeRow const *const row, USize const index) {
+    // The image's own path: argv[0] can be relative, and the fixture directory is not its home.
+    char self_path[MAX_PATH + CHAR_END_CHARACTER] = DEFAULT_INITIALIZATION;
+    DWORD const self_size                          = GetModuleFileNameA(nullptr, self_path, MAX_PATH);
+    char row_text[_TEST_NAME_SIZE]                 = DEFAULT_INITIALIZATION;
+
+    snprintf(row_text, sizeof(row_text), "%llu", (unsigned long long) index);
+
+    if (!test_expect_true(test, _label(row->name, "the harness resolves its own image"), self_size > 0 && self_size < MAX_PATH)) {
+        return;
+    }
+
+    ProcessOutcome outcomes[2] = DEFAULT_INITIALIZATION;
+    Result results[2]          = DEFAULT_INITIALIZATION;
+
+    for (USize armed = 0; armed < 2; armed += 1) {
+        char const *const argv[] = { self_path, _TEST_PROBE_ARGUMENT, row_text, armed == 1 ? "1" : "0", nullptr };
+        // stderr discarded: the runtime's abort message is not the transcript's business.
+        ProcessSpec const spec = { .argv = argv, .stderr_mode = PROCESS_STDERR_DISCARD, .timeout_milliseconds = _TEST_PROBE_TIMEOUT_MS };
+
+        // Flushed so the child's transcript and this one cannot interleave mid-line.
+        fflush(nullptr);
+
+        results[armed] = process_run(spec, &outcomes[armed]);
+    }
+
+    test_expect_true(test, _label(row->name, "both children were spawned"), result_is_success(results[0]) && result_is_success(results[1]));
+    test_expect_true(test, _label(row->name, "the unarmed control runs to completion"), process_outcome_succeeded(&outcomes[0]));
+    test_expect_true(test, _label(row->name, "the refused allocation aborts (0xC0000409 / 3)"), process_outcome_aborted(&outcomes[1]));
+
+    process_outcome_uninit(&outcomes[0]);
+    process_outcome_uninit(&outcomes[1]);
+}
 #endif // __linux__
+
+/* The re-exec child (Windows): run probe ROW with the checked build's memory_alloc emulated, armed
+ * or not, and exit the way the forked Linux child does - 0 for a healthy control, and
+ * _TEST_EXIT_ARMED_DEFECT when an armed probe survived the refused allocation. */
+static int _probe_child(char const *const row_text, char const *const armed_text) {
+    USize const row  = char_to_numbers_uint_1(row_text);
+    bool const armed = char_compare_equal_1(armed_text, "1");
+
+    if (row >= sizeof(_probes) / sizeof(_probes[0])) {
+        return _TEST_EXIT_BAD_PROBE;
+    }
+
+    LogConfig const log_config = {
+        .level             = LOG_LEVEL_WARN,
+        .stream            = LOG_STREAM_STDOUT,
+        .timestamp_enabled = false,
+        .autoflush         = true
+    };
+
+    log_init(log_config);
+
+    _production_abort = true;
+
+    _probes[row].probe(armed);
+
+    return armed ? _TEST_EXIT_ARMED_DEFECT : 0; // the armed child reaching here is the defect.
+}
 
 static void _test_abort_contracts(Test *const test) {
     test_case_begin(test, "documented abort contracts end the process (checked build emulated)");
@@ -1646,17 +1719,14 @@ static void _test_abort_contracts(Test *const test) {
     for (USize i = 0; i < sizeof(_probes) / sizeof(_probes[0]); i += 1) {
 #ifdef __linux__
         _probe_expect_abort(test, &_probes[i]);
+#else
+        _probe_expect_abort(test, &_probes[i], i);
+#endif // __linux__
 
         // A control child's copy or replace changed the disk; reset for the next row.
         remove(_TEST_PROBE_COPY_DESTINATION);
         remove(_TEST_PROBE_REPLACE_DESTINATION);
         _fixture_write(_TEST_PROBE_REMOVE, _TEST_CONTENT_PROBE, 'y');
-#else
-        // The _2/_3 and temp-name rows are still pinned in-process by the degradation section's
-        // twin count; the reader rows have no in-process twin at all.
-        log_message_1(LOG_LEVEL_WARN, "SKIPPED: abort probe %s (%s) - no fork() on Windows to contain the death, and in this unchecked build the twin returns nullptr "
-            "instead of aborting (a String reader would then dereference it).\n", _probes[i].name, _probes[i].contract);
-#endif // __linux__
     }
 
     remove(_TEST_PROBE_SOURCE);
@@ -1684,7 +1754,12 @@ static void _test_ledger_invariants(Test *const test) {
  * MARK: - Runner
  *============================================================================*/
 
-int main(void) {
+int main(int argc, char **argv) {
+    // The re-exec child (see _probe_expect_abort) never initializes the harness.
+    if (argc == 4 && char_compare_equal_1(argv[1], _TEST_PROBE_ARGUMENT)) {
+        return _probe_child(argv[2], argv[3]);
+    }
+
     /* MinGW's crtexe startup object is linked INTO this binary, so its argv copy (two mallocs,
      * measured: argc + 1 pointers, then the program path) reaches the wrapper before main runs.
      * Not traffic of anything under test - counting starts here. */

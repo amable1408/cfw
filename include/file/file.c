@@ -10,6 +10,11 @@
 
 #include <char/char.h>
 
+/* How many readings _file_path_addressable takes of one path: its UTF-8 reading and its
+ * code-page reading, which must agree before the path is trusted to a narrow Win32 call.
+ * Defined here, beside its only user, because this helper precedes the private macro block. */
+#define _FILE_PATH_READING_COUNT 2
+
 /*
  * Can the ANSI Win32 / CRT entry points below actually ADDRESS this path?
  *
@@ -34,11 +39,11 @@
  *
  * THREE ANSWERS, not two, and the third is why this returns a Result rather than a bool:
  * RESULT_SUCCESS when the path can be acted on; ARGUMENT with FILE_ARGUMENT_UNADDRESSABLE_PATH
- * when the two readings genuinely differ; MEMORY when the two conversion buffers could not be
- * taken. The bool this used to return folded the last into the second, so a transient
- * out-of-memory reached the caller as the one ARGUMENT refusal file.h gives a remedy for - and a
- * delete tool would have sent a perfectly addressable file to the trash path because the
- * process was briefly short of memory. Every answer but SUCCESS still fails closed: nothing is
+ * when the two readings genuinely differ; MEMORY when the conversion block (one, holding both
+ * readings) could not be taken. The bool this used to return folded the last into the second,
+ * so a transient out-of-memory reached the caller as the one ARGUMENT refusal file.h gives a
+ * remedy for - and a delete tool would have sent a perfectly addressable file to the trash path
+ * because the process was briefly short of memory. Every answer but SUCCESS still fails closed: nothing is
  * acted on.
  */
 static Result _file_path_addressable(char const *const path) {
@@ -82,18 +87,11 @@ static Result _file_path_addressable(char const *const path) {
         return unaddressable;
     }
 
-    WCHAR *const as_utf8 = (WCHAR*) memory_try_alloc((USize) utf8_size * sizeof(WCHAR));
-    WCHAR *const as_acp  = (WCHAR*) memory_try_alloc((USize) acp_size * sizeof(WCHAR));
+    // ONE block for both readings (the sizes are equal by now): the code-page half starts where
+    // the UTF-8 half ends, so there is a single allocation to refuse and a single one to free.
+    WCHAR *const as_utf8 = (WCHAR*) memory_try_alloc((USize) _FILE_PATH_READING_COUNT * (USize) utf8_size * sizeof(WCHAR));
 
-    if (memory_empty(as_utf8) || memory_empty(as_acp)) {
-        if (!memory_empty(as_utf8)) {
-            memory_free(as_utf8);
-        }
-
-        if (!memory_empty(as_acp)) {
-            memory_free(as_acp);
-        }
-
+    if (memory_empty(as_utf8)) {
         /* Refused rather than assumed safe - but as MEMORY, not as unaddressable: nothing is
          * known about this path yet, and a retry with memory to spare may well act on it. */
         trace_log_pop();
@@ -101,7 +99,8 @@ static Result _file_path_addressable(char const *const path) {
         return result_make(RESULT_CATEGORY_MEMORY, 0, 0);
     }
 
-    bool addressable = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, as_utf8, utf8_size) > 0
+    WCHAR *const as_acp = as_utf8 + utf8_size;
+    bool addressable    = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, as_utf8, utf8_size) > 0
         && MultiByteToWideChar(CP_ACP, 0, path, -1, as_acp, acp_size) > 0;
 
     for (int i = 0; addressable && i < utf8_size; i += 1) {
@@ -109,7 +108,6 @@ static Result _file_path_addressable(char const *const path) {
     }
 
     memory_free(as_utf8);
-    memory_free(as_acp);
 
     trace_log_pop();
 
@@ -1799,9 +1797,12 @@ static File* _file_open_nofollow(char const *const path, USize const path_size) 
     File *const file = _fdopen(descriptor, "rb");
 
     if (memory_empty((void*) file)) {
-        // _close closes the HANDLE too - the descriptor owns it now.
+        /* _close closes the HANDLE too - the descriptor owns it now. The realistic cause is the
+         * CRT's stream table (512 by default, _setmaxstdio) running out long before the 8192-entry
+         * descriptor table _open_osfhandle fills, so the code is the table-full one, not a memory
+         * one - the same answer the descriptor failure above gives. */
         _close(descriptor);
-        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        SetLastError(ERROR_TOO_MANY_OPEN_FILES);
     }
 #else
     char narrow[PATH_MAX] = DEFAULT_INITIALIZATION;
@@ -2913,6 +2914,39 @@ bool file_result_is_unaddressable(Result const result) {
     return result_is_error(result)
         && result_category(result) == RESULT_CATEGORY_ARGUMENT
         && result_code(result) == (U16) FILE_ARGUMENT_UNADDRESSABLE_PATH;
+}
+
+bool file_seek_try(File *const self, USize const index, File_Position const position) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+
+    /* The runtime takes a SIGNED 64-bit offset: an index above I64_MAX would reach it as a
+     * negative one, a backward seek nobody asked for. A position outside the enum would reach
+     * the UCRT's invalid-parameter handler, which ends the process - the one outcome a _try
+     * twin exists to avoid. Both are refused here with the code the runtime itself uses for a
+     * bad argument, and the stream is not touched. */
+    if (index > (USize) I64_MAX || (U32) position > (U32) FILE_POSITION_END) {
+#ifdef _WIN32
+        SetLastError(ERROR_INVALID_PARAMETER);
+#endif // _WIN32
+        errno = EINVAL;
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    // No size query: a seek past EOF is legal, and the next read answers 0.
+#ifdef _WIN32
+    bool const positioned = _fseeki64(self, (long long) index, position) == 0;
+#else
+    bool const positioned = fseeko(self, (off_t) index, position) == 0;
+#endif // _WIN32
+
+    trace_log_pop();
+
+    return positioned;
 }
 
 Result file_set_modified_1(char const *const path, I64 const seconds) {

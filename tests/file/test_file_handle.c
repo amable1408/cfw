@@ -491,9 +491,18 @@ static void _test_nofollow_links(Test *const test) {
         return;
     }
 
-    File *file = file_open_nofollow_try_1(_ROOT "/dirlink");
+    File *file          = file_open_nofollow_try_1(_ROOT "/dirlink");
+    I64 const dir_error = _last_error();
 
     test_expect_null(test, "a link to a directory as the final component -> nullptr", file);
+#ifdef _WIN32
+    /* A junction IS a directory: without BACKUP_SEMANTICS CreateFile2 refuses it as one before the
+     * reparse tag is ever read, so it answers the directory's code, not the link's. */
+    test_expect_i(test, "a junction answers ERROR_ACCESS_DENIED (the directory refusal), not ERROR_STOPPED_ON_SYMLINK", ERROR_ACCESS_DENIED, dir_error);
+#else
+    // O_NOFOLLOW refuses the final-component link before the target's type is looked at.
+    test_expect_i(test, "a symlink to a directory answers ELOOP (the link refusal), not EISDIR", ELOOP, dir_error);
+#endif // _WIN32
 
     _close_if_open(&file);
 

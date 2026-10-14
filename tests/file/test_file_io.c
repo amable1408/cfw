@@ -320,6 +320,55 @@ static void _test_file_at_seek_contract(Test *const test) {
     test_case_end(test);
 }
 
+static void _test_seek_try_contract(Test *const test) {
+    test_case_begin(test, "file: file_seek_try positions like file_at, seeks past EOF without a bound, and refuses an offset the runtime would read as negative");
+
+    char const *const path = "file_io_seek_try.txt";
+    char const *const content = "0123456789ABCDEFGHIJ";
+
+    test_expect_true(test, "the fixture is written", _write_fixture(path, content));
+
+    File *file = file_open_try_1(path, "rb");
+
+    if (!test_expect_true(test, "the fixture opens", !memory_empty((void*) file))) {
+        remove(path);
+
+        test_case_end(test);
+
+        return;
+    }
+
+    char at_twelve[4] = DEFAULT_INITIALIZATION;
+
+    test_expect_true(test, "a BEGIN seek to 12 answers true", file_seek_try(file, 12, FILE_POSITION_BEGIN));
+    test_expect_u(test, "and the read that follows starts there", 3, file_read_1(file, at_twelve, sizeof(char), 3));
+    test_expect_true(test, "with the expected slice", char_equal_2(at_twelve, 3, content + 12, 3));
+
+    // No size bound: a reader whose file shrank under it still positions, and reads nothing.
+    char past_end[4] = DEFAULT_INITIALIZATION;
+
+    test_expect_true(test, "a seek past EOF answers true (no size query)", file_seek_try(file, 1000, FILE_POSITION_BEGIN));
+    test_expect_u(test, "and the next read answers 0", 0, file_read_1(file, past_end, sizeof(char), 3));
+
+    clearerr(file);
+
+    // The refusal leaves the stream where it was: 5 + the 2 bytes read = 7.
+    char before[4] = DEFAULT_INITIALIZATION;
+    char after[4]  = DEFAULT_INITIALIZATION;
+
+    test_expect_true(test, "a BEGIN seek to 5 answers true", file_seek_try(file, 5, FILE_POSITION_BEGIN));
+    test_expect_u(test, "two bytes are read from 5", 2, file_read_1(file, before, sizeof(char), 2));
+    test_expect_false(test, "an index of I64_MAX + 1 is refused (it would reach the runtime negative)", file_seek_try(file, (USize) I64_MAX + 1, FILE_POSITION_BEGIN));
+    test_expect_false(test, "a position outside File_Position is refused, not handed to the runtime", file_seek_try(file, 0, (File_Position) (FILE_POSITION_END + 1)));
+    test_expect_u(test, "the read after the refusal still answers", 3, file_read_1(file, after, sizeof(char), 3));
+    test_expect_true(test, "and continues at 7: the position is untouched", char_equal_2(after, 3, content + 7, 3));
+
+    file_close(&file);
+    remove(path);
+
+    test_case_end(test);
+}
+
 static void _test_read_2_clamps_to_str_size(Test *const test) {
     test_case_begin(test, "file: file_read_2 clamps an oversized data_count to the Str's own size rather than writing past it");
 
@@ -451,6 +500,7 @@ int main(void) {
     _test_flush_makes_bytes_visible(&test);
     _test_get_size_preserves_position(&test);
     _test_file_at_seek_contract(&test);
+    _test_seek_try_contract(&test);
     _test_read_2_clamps_to_str_size(&test);
     _test_read_4_clamps_to_capacity_and_stays_a_c_string(&test);
     _test_get_size_zero_byte_file(&test);
