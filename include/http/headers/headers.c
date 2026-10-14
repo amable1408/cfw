@@ -186,17 +186,35 @@ static void _http_headers_content_disposition_filename_add(String *const self, c
  * MARK: - Security Helpers
  *============================================================================*/
 
-static void _http_headers_security_header_add(String *const headers, char const *const name, String const *const value) {
+static void _http_headers_security_header_add(String *const headers, char const *const name, char const *const field_name, String const *const value) {
     trace_log_push(LOG_METADATA);
 
     error_check_null(LOG_METADATA, "headers", (void*) headers);
     error_check_null(LOG_METADATA, "name", (void*) name);
+    error_check_null(LOG_METADATA, "field_name", (void*) field_name);
     error_check_null(LOG_METADATA, "value", (void*) value);
 
     if (string_empty(value)) {
         trace_log_pop();
 
         return;
+    }
+
+    /* The policy Strings are public fields, so a value written after init never met the
+     * init-time check. The scan is bounded by the String's size, not by a terminator. */
+    char const *const data = string_get_data(value);
+    USize const       size = string_get_size(value);
+
+    for (USize i = 0; i < size; i += 1) {
+        unsigned char const byte = (unsigned char) data[i];
+
+        if (byte < 0x20 || byte == 0x7F) {
+            log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_headers_security_create_2: %s contains a control byte; omitting its header", field_name);
+
+            trace_log_pop();
+
+            return;
+        }
     }
 
     _http_headers_string_add(headers, name);
@@ -748,15 +766,15 @@ String http_headers_security_create_2(HTTP_Headers_Security const *const self) {
 
     String headers = _http_headers_string_init(self->allocator);
 
-    _http_headers_security_header_add(&headers, "Content-Security-Policy: ", &self->content_security_policy);
+    _http_headers_security_header_add(&headers, "Content-Security-Policy: ", "content_security_policy", &self->content_security_policy);
 
     if (self->content_type_options) {
         _http_headers_string_add(&headers, "X-Content-Type-Options: nosniff\r\n");
     }
 
-    _http_headers_security_header_add(&headers, "X-Frame-Options: ", &self->frame_options);
-    _http_headers_security_header_add(&headers, "Referrer-Policy: ", &self->referrer_policy);
-    _http_headers_security_header_add(&headers, "Permissions-Policy: ", &self->permissions_policy);
+    _http_headers_security_header_add(&headers, "X-Frame-Options: ", "frame_options", &self->frame_options);
+    _http_headers_security_header_add(&headers, "Referrer-Policy: ", "referrer_policy", &self->referrer_policy);
+    _http_headers_security_header_add(&headers, "Permissions-Policy: ", "permissions_policy", &self->permissions_policy);
 
     if (self->cross_origin_opener_policy) {
         _http_headers_string_add(&headers, "Cross-Origin-Opener-Policy: same-origin\r\n");

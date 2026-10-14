@@ -6,6 +6,8 @@
 #include <http/query/query.h>
 
 #define _HTTP_CLIENT_CONNECT_TIMEOUT_DEFAULT_MS   2000
+#define _HTTP_CLIENT_ERROR_ARENA_UNBOUNDED        "an arena-backed response needs a max_response_size cap; set one with http_client_set_max_response_size or pass a heap-backed response"
+#define _HTTP_CLIENT_ERROR_ARENA_UNDERSIZED       "response arena cannot hold max_response_size + 1 bytes; lower it with http_client_set_max_response_size"
 #define _HTTP_CLIENT_HEADER_EMPTY_VALUE_SEPARATOR ";"
 #define _HTTP_CLIENT_HEADER_LINE_BREAKS           "\r\n"
 #define _HTTP_CLIENT_HEADER_NAME_SYMBOLS          "!#$%&'*+-.^_`|~"
@@ -100,13 +102,24 @@ static void _http_client_result_error_set(HTTP_Client_Result *const self, char c
 #ifdef ARENA_IMPLEMENTATION
     /* An OWNED copy, never string_alloc_init_4's VIEW: `error` is usually the handle's
      * error_buffer, which the next request on this handle zeroes and http_client_delete
-     * frees - a view would leave a kept Result reading "" or freed memory. The text is
-     * never empty, so an empty answer means the arena refused; fall back to the heap
-     * rather than lose the diagnostic (string_uninit releases either kind). */
+     * frees - a view would leave a kept Result reading "" or freed memory.
+     *
+     * The arena is ASKED, never borrowed from with an aborting call: it is the response's
+     * own arena, and it may be FULL - the failure being reported can be exactly that it
+     * could not hold the cap. string_alloc_init_1 borrows nothing; reserving size +
+     * CHAR_END_CHARACTER first leaves the append nothing to grow. A false answer (a full
+     * or refused arena) falls back to the heap rather than lose the diagnostic, and the
+     * unreserved String it leaves behind holds no memory (string_uninit releases either
+     * kind of answer). */
     if (!memory_empty(self->allocator)) {
-        self->error = string_alloc_init_static(error, char_length(error), self->allocator);
+        USize const size = char_length(error);
+        String owned = string_alloc_init_1(self->allocator);
 
-        if (!string_empty(&self->error)) {
+        if (string_try_reserve(&owned, size + CHAR_END_CHARACTER)) {
+            string_add_last_2(&owned, error, size);
+
+            self->error = owned;
+
             trace_log_pop();
 
             return;
@@ -291,13 +304,13 @@ static USize _http_client_write_callback(char *const contents, USize const size,
         return 0;
     }
 
-    /* An arena-backed active_response can silently refuse to grow (string_add_2's
-     * documented refusal on a REFUSED arena) rather than abort - the append is then a
-     * no-op and size stays put. A live but EXHAUSTED arena is not this path: it aborts
-     * inside the append (the tree-wide allocate contract; see the header's Memory
-     * Management). Detect the refusal here rather than trusting the call: a
-     * blind size += size_total would tell curl the write succeeded while the bytes
-     * were actually dropped. */
+    /* An arena-backed active_response never grows here: _http_client_perform refuses one
+     * with no cap and reserves cap + CHAR_END_CHARACTER up front for one with a cap, and
+     * the cap check above keeps every append inside that reservation. Should an append
+     * still come up short (string_add_2's documented refusal on a REFUSED arena is a
+     * no-op that leaves size put), detect it here rather than trusting the call: a blind
+     * size += size_total would tell curl the write succeeded while the bytes were
+     * actually dropped. */
     USize const size_before = string_get_size(self->active_response);
 
     string_add_last_2(self->active_response, contents, size_total);
@@ -474,6 +487,34 @@ static void _http_client_default_options_set(HTTP_Client *const self) {
     trace_log_pop();
 }
 
+/* Never leave the handle holding a pointer into a caller's stack/local String
+ * (active_response) or a caller's payload buffer (POSTFIELDS) past the end of a
+ * request: a raw-handle consumer (http_client_get_handle) driving
+ * curl_easy_perform itself, without going through this module's request
+ * functions again, must not have curl read or write through either. Every exit
+ * of _http_client_perform runs this - including a request refused before any
+ * I/O, whose caller (POST/PUT) has already installed POSTFIELDS. */
+static void _http_client_handle_rest(HTTP_Client *const self) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+
+    self->active_response = nullptr;
+
+    curl_easy_setopt(self->curl, CURLOPT_POSTFIELDS, (char*) nullptr);
+    curl_easy_setopt(self->curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t) 0);
+
+    /* CURLOPT_POSTFIELDS "implies CURLOPT_POST" per libcurl's own docs - the
+     * setopt above flips the handle's internal method to POST regardless of the
+     * nullptr pointer value, so without this line every handle that has ever
+     * POSTed or PUT sits in POST mode afterward. Rest it as GET so the NEXT
+     * request's own method setup (HTTPGET/POST/CUSTOMREQUEST/NOBODY) starts from
+     * a known state instead of one that depends on this handle's history. */
+    curl_easy_setopt(self->curl, CURLOPT_HTTPGET, 1L);
+
+    trace_log_pop();
+}
+
 /* Shared perform path for every request method: the caller has already set the
  * method-specific options (HTTPGET/POST+POSTFIELDS/CUSTOMREQUEST/NOBODY) on
  * self->curl. Builds the Result from the CURLcode and response status, and
@@ -498,12 +539,40 @@ static HTTP_Client_Result _http_client_perform(HTTP_Client *const self, char con
     string_clear(target);
 
 #ifdef ARENA_IMPLEMENTATION
-    /* An arena-backed response regrows by doubling into fresh borrows the arena never reclaims,
-     * so reserve the cap ONCE: an undersized arena then aborts here, at the caller's own cap,
-     * never at a size the remote peer chose. No-op on a reused String or a REFUSED arena.
-     * USIZE_MAX is excluded as well as 0: both mean "unbounded", and + 1 would wrap to 0. */
-    if (target->allocator != nullptr && self->max_response_size > 0 && self->max_response_size < USIZE_MAX) {
-        string_reserve(target, self->max_response_size + CHAR_END_CHARACTER);
+    /* An arena-backed response is settled BEFORE any I/O, so no remote peer ever chooses how
+     * much of the arena it takes. With no cap (0 or USIZE_MAX, both "unbounded") the body
+     * would grow chunk by chunk through an aborting reserve, so the request is REFUSED. With
+     * a cap, the cap is reserved ONCE - a String regrows by doubling into fresh borrows the
+     * arena never reclaims - and an arena that cannot hold it (exhausted or refused) answers
+     * a named error here instead of ending the process. A reused String that already holds
+     * the cap reserves nothing. Nothing has run yet: no option set, no transfer; `code`
+     * stays CURLE_OK because libcurl never did. The handle's last-response status and
+     * headers are cleared, since this request received no response. */
+    char const *refusal = nullptr;
+
+    if (!memory_empty(target->allocator)) {
+        if (self->max_response_size == 0 || self->max_response_size == USIZE_MAX) {
+            refusal = _HTTP_CLIENT_ERROR_ARENA_UNBOUNDED;
+        }
+        else if (!string_try_reserve(target, self->max_response_size + CHAR_END_CHARACTER)) {
+            refusal = _HTTP_CLIENT_ERROR_ARENA_UNDERSIZED;
+        }
+    }
+
+    if (!memory_empty(refusal)) {
+        self->response_status = 0;
+
+        _http_client_response_headers_reset(self);
+
+        result.status = HTTP_CLIENT_STATUS_ERROR;
+
+        _http_client_result_error_set(&result, refusal);
+
+        _http_client_handle_rest(self);
+
+        trace_log_pop();
+
+        return result;
     }
 #endif // ARENA_IMPLEMENTATION
 
@@ -553,23 +622,7 @@ static HTTP_Client_Result _http_client_perform(HTTP_Client *const self, char con
         _http_client_result_error_set(&result, error);
     }
 
-    /* Never leave the handle holding a pointer into a caller's stack/local String
-     * (active_response) or a caller's payload buffer (POSTFIELDS) past the end of
-     * this call: a raw-handle consumer (http_client_get_handle) driving
-     * curl_easy_perform itself, without going through this module's request
-     * functions again, must not have curl read or write through either. */
-    self->active_response = nullptr;
-
-    curl_easy_setopt(self->curl, CURLOPT_POSTFIELDS, (char*) nullptr);
-    curl_easy_setopt(self->curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t) 0);
-
-    /* CURLOPT_POSTFIELDS "implies CURLOPT_POST" per libcurl's own docs - the
-     * setopt above flips the handle's internal method to POST regardless of the
-     * nullptr pointer value, so without this line every handle that has ever
-     * POSTed or PUT sits in POST mode afterward. Rest it as GET so the NEXT
-     * request's own method setup (HTTPGET/POST/CUSTOMREQUEST/NOBODY) starts from
-     * a known state instead of one that depends on this handle's history. */
-    curl_easy_setopt(self->curl, CURLOPT_HTTPGET, 1L);
+    _http_client_handle_rest(self);
 
     trace_log_pop();
 

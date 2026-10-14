@@ -1,13 +1,21 @@
 /*
  * static.h - HTTP static file service for the C Libraries Framework
- * @version 0.4.1
+ * @version 0.5.0
  *
  * Maps HTTP request paths to static assets on disk, resolving their MIME types,
  * validating path security, and serving the file data over HTTP.
  *
  * Features:
  *   - Serves directory assets (HTML, CSS, JS, images, fonts).
- *   - Optional cache-control headers, honoured on both the full-file and Range (206) paths.
+ *   - Open once, verify the handle, serve from the handle: every request is ONE nofollow open
+ *     (file_open_nofollow_try_1), size and mtime are read from that handle, and the 200 and the
+ *     206 alike are streamed from it by http_server_response_send_file_handle. Nothing re-opens
+ *     the file by name after it was verified, so the bytes on the wire are the bytes of the file
+ *     that passed the checks.
+ *   - Symlink/junction refusal ON by default (refuse_symlinks; see Symlinks below).
+ *   - Non-ASCII asset names are served on Windows: the opener is wide, so the UTF-8 name the URI
+ *     decodes to ("caf%C3%A9.txt") opens the file it names.
+ *   - Optional cache-control headers, honoured on the full-file, Range (206) and 304 paths.
  *   - Conditional GET: Last-Modified + a strong ETag (size+mtime), 304 on an If-None-Match that
  *     matches by the WEAK comparison RFC 9110 S13.1.2 requires there (a W/ prefix on either side
  *     is ignored, a comma-separated list matches on any member, `*` matches any served file) or
@@ -45,20 +53,61 @@
  *   - Missing files or directory traversal attempts fail gracefully.
  *   - An over-long root_dir/route_prefix/default_file is truncated to fit (never a buffer
  *     overrun) and logs LOG_LEVEL_WARN at construction time - see http_service_static_init_1/_2.
+ *   - A root_dir with no resolvable final path at construction logs LOG_LEVEL_WARN once (see
+ *     Symlinks). A request refused because it reaches a link logs LOG_LEVEL_WARN naming the
+ *     file - distinct from a plain miss, which logs nothing. A request refused because the link
+ *     check cannot run at all - that unresolved root, or a platform that cannot name an open
+ *     handle's path - logs NO per-request line: the first such refusal logs one LOG_LEVEL_WARN
+ *     per process naming the real cause, and every later one is refused silently.
  *
  * Symlinks:
- *   - Followed by default, like a plain fopen would. Set self.refuse_symlinks = true after
- *     construction (there is no separate setter; direct field assignment is the established
- *     pattern for this service family's optional knobs) to refuse serving a path any of whose
- *     components - not just the final one - is a symlink/junction below root_dir, at the cost of
- *     one directory listing per path component per request. Prefer this on any root the
- *     deployment does not fully control. On Windows each component is matched against its
- *     listing case-insensitively (NTFS opens "LINKDIR" as "linkdir"), and the other second
- *     spellings - a trailing dot, an 8.3 alias - never reach the listing (see Features).
- *   - Accepted risk: this is a check-then-open, not an atomic operation. A symlink swapped into
- *     the path between this check returning "clear" and the subsequent file open (TOCTOU) is not
- *     caught. Closing that gap needs an O_NOFOLLOW-equivalent open, which file/file.h does not
- *     expose today; not implemented here.
+ *   - REFUSED BY DEFAULT since 0.5.0 (BEHAVIOUR CHANGE - through 0.4.x links were followed unless
+ *     refuse_symlinks was set). A file reached through a symlink or a junction ANYWHERE below
+ *     root_dir - the final component or any directory on the way - answers "not served" (a 404
+ *     from the caller), and that includes a link whose target is INSIDE root_dir (a
+ *     `shared/assets -> ../shared` layout), not only one that escapes. Before upgrading a
+ *     deployment, check its served tree ONCE for links it relies on: on Linux
+ *     `find -H <root> -type l` (-H, because plain find does not descend into a root that is
+ *     itself a link - the legal `current -> releases/N` layout - and reports only the root); on
+ *     Windows `dir /AL /S <root>`, counting only the entries marked <SYMLINK>, <SYMLINKD> or
+ *     <JUNCTION> (/AL also lists cloud placeholders - Dropbox, OneDrive - which are not links and
+ *     keep serving). Every link found stops being served. A tree that needs them sets
+ *     self.refuse_symlinks = false after construction (direct field assignment, the established
+ *     pattern for this service family's knobs) and accepts what following means.
+ *   - How it is enforced, and why it is closed: the file is opened nofollow, so a link in the
+ *     FINAL component is refused by the open itself (O_NOFOLLOW; on Windows a reparse point that
+ *     is a name surrogate - symlink or junction), and the open never reaches a link's target - a
+ *     link to a FIFO or a device would make the OPEN the hazard. The open still follows a linked
+ *     ANCESTOR, like any open, so the handle's FINAL PATH (file_get_final_path - where its
+ *     bytes physically live) is then compared with root_dir's final path (taken once at
+ *     construction) + the request-relative name; any difference refuses. The bytes served come
+ *     from that same handle, so a link swapped in at ANY moment serves nothing: before the open,
+ *     the open or the compare sees it; after the open, the handle already points at the original
+ *     file and the swap changes nothing on the wire. There is no check-then-open window.
+ *   - Windows compares case-insensitively, ASCII only: a request spelled in a different case
+ *     than the file on disk is served as before when the letters are ASCII, but a NON-ASCII case
+ *     variant ("DONNÉES" for "données") is refused - the fail-closed direction, and a browser
+ *     requests the href's exact casing. Empty and "." path segments are skipped on both sides.
+ *   - A root_dir that is ITSELF a link stays legal: its final path is the target, and requests
+ *     compare below the target. A root_dir that does not exist (or cannot be resolved) when the
+ *     service is constructed refuses every request while refuse_symlinks is on; construction
+ *     logs one WARN, and the first such refusal one more naming the root (once per process,
+ *     never per request) - create the root first, then construct.
+ *   - With refuse_symlinks off, a final-component link is followed by resolving its target and
+ *     opening THAT nofollow (the target must itself be a regular file); that second resolution is
+ *     the check-then-open an operator accepts by turning the refusal off.
+ *   - Where Linux has no /proc mounted (a minimal container, a chroot) the handle's final path
+ *     cannot be read, and refuse_symlinks refuses every request there - fail closed, with one
+ *     WARN per process naming /proc, not a link; see file_get_final_path.
+ *
+ * Pipelining (LIMIT, since 0.5.0 - a behaviour change like the Symlinks one):
+ *   - Every 200 and 206 inherits http_server_response_send_file_handle's LIMIT: a request
+ *     pipelined behind it on the same HTTP/1.1 connection (or a stray CRLF) closes the connection
+ *     and cuts the body short, where through 0.4.x the 200 went through lws_serve_http_file,
+ *     which buffers such a request until the body is done; static has no knob to keep that path.
+ *     Browsers never pipeline, and neither do reverse proxies. The stream also has a minimum read
+ *     rate - a reader that takes no HTTP_SERVER_FILE_CHUNK_SIZE chunk within http_server's
+ *     per-chunk content timeout is dropped - see that function's Doxygen for both.
  *
  * Dotfiles:
  *   - Served by default, like any other asset. Set self.refuse_dotfiles = true after
@@ -73,14 +122,14 @@
  *     another name - a hard link, or a symlink/junction when refuse_symlinks is off.
  *
  * Range requests:
- *   - Capped at 1 MiB per response (_HTTP_SERVICE_STATIC_RANGE_CHUNK_MAX in static.c), so a
- *     100 MB file needs ~100 round trips. The cap is small because the 206 path buffers its
- *     whole window (twice, counting send_2's LWS_PRE copy) where the 200 path streams; a
- *     streaming send_file_range seam in http_server is deferred behind an RSS measurement.
- *     Whether libwebsockets - a system dependency, not
- *     vendored - was built with LWS_WITH_RANGES cannot be assumed; a build
- *     that has it would let this delete the hand-rolled Range/416 path here and stream straight
- *     from disk instead. Not done in this pass; the hand-rolled path runs unconditionally.
+ *   - A 206 is streamed from the handle in HTTP_SERVER_FILE_CHUNK_SIZE chunks with no
+ *     module-side buffer, exactly like the 200; the window is whatever the client asked for, as
+ *     nginx and Apache serve it (the 1 MiB cap of 0.4.x is gone - `Range: bytes=0-` on a 100 MB
+ *     file is one response, not ~100). The Range/416 parsing is this module's own by design.
+ *   - A file replaced or deleted while it is being served keeps streaming the OLD bytes to the
+ *     reader that opened it (Windows: FILE_SHARE_DELETE; POSIX: unlink semantics), and a
+ *     deploy's rename-over never fails against a reader - the same promise file_replace_* makes
+ *     on the writer's side.
  *   - Multi-range requests (a comma in the Range value) are not split into a multipart/byteranges
  *     response; they fall back to a full 200, which is RFC 9110-compliant (a server may always
  *     ignore Range) but wastes bandwidth for that one shape of request.
@@ -94,17 +143,20 @@
  *     clean http_server_request_header_copy API, including If-Modified-Since (an RFC 7231
  *     IMF-fixdate parsed via datetime_from_http_try - RFC 850/asctime forms are refused, not just
  *     ignored).
- *   - serve_1 is DEPRECATED as of 0.3.1 and will be deleted in 0.5.0. It takes no request (only
- *     a raw path), so it cannot read If-Modified-Since at all: a client sending only
- *     If-Modified-Since - `wget -N`, an IMS-only proxy - re-downloads the whole body through
- *     serve_1 where serve_2 answers 304. It still supports If-None-Match, Range, and If-Range,
- *     reading them directly off the response's underlying transport handle, which is the last
- *     raw lws_hdr_copy left in the service tier. Every production caller in this tree (28 sites
- *     across 16 files) migrated to serve_2 in the 0.3.1 pass, main.c's root route included; no
- *     production caller remains. serve_1 is kept only for the suite's unchecked build, which
- *     cannot reach the resolve-level refusals through serve_2 because HTTP_Server_Request is
- *     opaque; it is deleted (retiring the last raw lws_hdr_copy) once that build runs against a
- *     live server or resolve gains an exported seam.
+ *   - serve_1 is DEPRECATED as of 0.3.1 and will be deleted in 0.6.0 - it was scheduled for
+ *     0.5.0, but 0.5.0 was taken by the streaming seam (the handle-based open/verify/serve), and
+ *     its deletion precondition below still holds. It takes no request (only a raw path), so it
+ *     cannot read If-Modified-Since at all: a client sending only If-Modified-Since - `wget -N`,
+ *     an IMS-only proxy - re-downloads the whole body through serve_1 where serve_2 answers 304.
+ *     It still supports If-None-Match, Range, and If-Range, reading them directly off the
+ *     response's underlying transport handle, which is the last raw lws_hdr_copy left in the
+ *     service tier. Every production caller in this tree (28 sites across 16 files) migrated to
+ *     serve_2 in the 0.3.1 pass, main.c's root route included; no production caller remains.
+ *     serve_1 is kept only for the suite's unchecked build, which cannot reach the resolve- and
+ *     open-level refusals through serve_2 because HTTP_Server_Request is opaque; it is deleted
+ *     (retiring the last raw lws_hdr_copy) once that build runs against a live server or resolve
+ *     gains an exported seam. Both entry points resolve, open and verify BEFORE reading any
+ *     header, so every refusal returns having touched nothing on the response.
  *   - Prefer serve_2 for any new integration; it is also what the Usage Example above shows.
  *
  * Thread Safety:
@@ -113,40 +165,42 @@
  *     configuration object; construct and destroy from a single thread.
  *
  * Memory Management:
- *   - Every field is a fixed-size inline buffer (root_dir/route_prefix/default_file/
+ *   - Every field is a fixed-size inline buffer (root_dir/root_final/route_prefix/default_file/
  *     fallback_file) or a scalar - there is nothing heap- or arena-owned once construction
  *     returns, arena-backed alloc_init_1/_2 included, since the arena there backs only the
  *     by-value struct itself, not a separate allocation inside it. http_service_static_uninit is
  *     therefore a no-op besides its null check; it exists so callers have one symmetrical
  *     teardown call regardless of which constructor was used, and so a future field that DOES
  *     own storage has somewhere to release it without an API change.
+ *   - Per request, the one open file handle is the only resource. A 200 or 206 hands it to the
+ *     response (http_server_response_send_file_handle), which closes it when the last chunk is
+ *     written, when the client disconnects first, or when the next request on a kept-alive
+ *     connection begins; every other answer (304, 416, a refusal, a send the server declined)
+ *     closes it before serve_1/serve_2 return. No module-side body buffer exists on any path.
  *
  * Performance Characteristics:
- *   - _http_service_static_resolve is O(1) path arithmetic plus one or two file_exists_1 stats
- *     (the primary path, and the SPA fallback path when the first misses).
+ *   - _http_service_static_resolve is O(path) lexical arithmetic with no file-system access.
+ *   - A served request costs ONE nofollow open (plus one attribute query on Windows), one fstat
+ *     for size and mtime, and - under refuse_symlinks, the default - one final-path query on the
+ *     open handle; a request that misses and falls back to the SPA shell adds a second open. The
+ *     0.4.x path cost five by-path stat-family calls plus, with refuse_symlinks, one directory
+ *     listing per path component.
+ *   - root_dir's own final path is resolved once, at construction, never per request.
  *   - MIME resolution is a linear scan of the ~46-row extension table
  *     (_http_service_static_mimetype), then a single lws_get_mimetype fallback; case-insensitive
  *     comparison happens per candidate row, not once up front.
- *   - refuse_symlinks (see the Symlinks note) adds one directory listing per path component
- *     below root_dir, which is why it stays opt-in rather than always-on.
- *   - Range responses read at most _HTTP_SERVICE_STATIC_RANGE_CHUNK_MAX (1 MiB) into one heap
- *     buffer per request; the full-file path streams through http_server_response_send_file with
- *     no module-side buffering.
- *   - A full serve costs five stat-family calls: file_exists_1 in path resolution, file_size_1
- *     and file_modified_1 for the validators, then send_file's own file_exists_1 re-checking
- *     what resolution already confirmed, and libwebsockets' own fstat inside
- *     send_file. The re-check is the price of send_file's own 404 contract - it cannot tell
- *     "missing" from "streamed" without it (see http_server_response_send_file). They fold into
- *     one the day file/ grows a single stat primitive; measured as not worth a private syscall
- *     path before that exists.
+ *   - The 200 and the 206 stream from the handle one HTTP_SERVER_FILE_CHUNK_SIZE chunk per
+ *     write-readiness callback, holding at most one chunk per connection in the transport (see
+ *     http_server_response_send_file_handle) - no module-side buffer, whatever the window.
  *
  * HTTP methods:
  *   - serve_1/serve_2 do not inspect the request method; a consumer gating on GET/HEAD does so
- *     itself. A HEAD needs no gate: http_server's send path emits the headers a GET would and no
- *     body, on the full-file, 206 and 304 paths alike.
+ *     itself. A HEAD needs no gate: http_server's send paths emit the headers a GET would
+ *     (Content-Length included) and no body, on the full-file, 206 and 304 paths alike - the
+ *     streaming seam closes the handle and completes a HEAD synchronously.
  *
  * Dependencies:
- *   - arena, char, datetime, dir, file, http/headers, http/service/compression, http_server.
+ *   - arena, char, datetime, file, http/headers, http/service/compression, http_server, log.
  *
  * See static.c for implementation details.
  */
@@ -157,6 +211,13 @@
 #include <arena/arena.h>
 #include <http/server/http_server.h>
 #include <types.h>
+
+/*==============================================================================
+ * MARK: - Constants
+ *============================================================================*/
+
+/** Bytes in HTTP_Service_Static.root_final: room for an on-disk final path several times the request-path cap, since the OS may spell the root longer than the configured root_dir. */
+#define HTTP_SERVICE_STATIC_ROOT_FINAL_MAX_LENGTH (HTTP_SERVER_PATH_MAX_LENGTH * 4)
 
 /*==============================================================================
  * MARK: - Types
@@ -178,6 +239,18 @@ typedef struct {
     char root_dir[HTTP_SERVER_PATH_MAX_LENGTH];
     /** @brief Size of the root directory string. */
     U16 root_dir_size;
+    /**
+     * @brief file_final_path_1(root_dir), taken ONCE at construction: the prefix every served
+     *        handle's final path is compared against under refuse_symlinks.
+     *
+     * Empty when the root could not be resolved then (missing, unreadable, or a final path longer
+     * than this buffer) - construction logged one WARN, and refuse_symlinks refuses EVERY request
+     * (fail closed) until the service is rebuilt over an existing root. A fixed inline buffer, so
+     * the Memory Management "nothing owned" note still holds.
+     */
+    char root_final[HTTP_SERVICE_STATIC_ROOT_FINAL_MAX_LENGTH];
+    /** @brief Size of root_final; 0 when the root could not be resolved at construction. */
+    USize root_final_size;
     /** @brief URL route prefix matching static assets. */
     char route_prefix[HTTP_SERVER_PATH_MAX_LENGTH];
     /** @brief Size of the route prefix string. */
@@ -191,14 +264,13 @@ typedef struct {
     /** @brief Size of the fallback file string. */
     U8 fallback_file_size;
     /**
-     * @brief Opt-in: refuse to serve a path any of whose components is a symlink/junction.
+     * @brief Refuse to serve a file reached through a symlink or junction anywhere below root_dir.
      *
-     * Off by default (matches the historical behavior: symlinks are followed like a plain
-     * fopen). No dedicated constructor parameter - set this field directly after construction,
-     * as documented in static.h. Costs one directory listing per path COMPONENT below root_dir
-     * when enabled (dir/dir.h only exposes is_link per directory entry, not per single path), so
-     * enable it only on roots the deployment does not fully control. See the Symlinks note in
-     * this header for the accepted TOCTOU gap.
+     * ON by default since 0.5.0 (it was opt-in, and off, through 0.4.x). Set this field to false
+     * directly after construction to follow links - no dedicated constructor parameter, the same
+     * pattern as refuse_dotfiles. Costs one final-path query on the open handle per request. See
+     * the Symlinks note in this header: the check is on the handle that is served, so there is
+     * no check-then-open window.
      */
     bool refuse_symlinks;
     /**
@@ -212,6 +284,14 @@ typedef struct {
      */
     bool refuse_dotfiles;
 } HTTP_Service_Static;
+
+#ifdef HTTP_SERVICE_STATIC_TEST_HOOKS
+/**
+ * @brief Test build only: a callback handed the resolved on-disk file name at a fixed point of a
+ *        serve, so a suite can swap the file system under the request deterministically.
+ */
+typedef void (*FpHTTP_Service_Static_Test_Hook)(char const *const file_name);
+#endif // HTTP_SERVICE_STATIC_TEST_HOOKS
 
 /*==============================================================================
  * MARK: - API
@@ -249,6 +329,9 @@ HTTP_Service_Static http_service_static_alloc_init_2(
  * @note An over-long root_dir/route_prefix is truncated to fit its fixed buffer AND logs
  *       LOG_LEVEL_WARN, so a deployment serving from (or routing through) a truncated,
  *       nonexistent path gets a diagnostic rather than silence.
+ * @note refuse_symlinks is ON (since 0.5.0) and root_dir's final path is resolved here, once:
+ *       root_dir must EXIST when the service is constructed, or every request is refused (fail
+ *       closed) and this logs LOG_LEVEL_WARN. See static.h's Symlinks note.
  */
 HTTP_Service_Static http_service_static_init_1(char const *const root_dir, char const *const route_prefix);
 
@@ -260,8 +343,8 @@ HTTP_Service_Static http_service_static_init_1(char const *const root_dir, char 
  * @param spa_fallback Enable SPA fallback routing.
  * @param max_age Cache-Control max-age in seconds.
  * @return Initialized service.
- * @note See http_service_static_init_1 for the truncation-logs-WARN note; applies to
- *       default_file here too.
+ * @note See http_service_static_init_1 for the truncation-logs-WARN note (applies to
+ *       default_file here too) and for the root_dir-must-exist note.
  */
 HTTP_Service_Static http_service_static_init_2(char const *const root_dir, char const *const route_prefix, char const *const default_file, bool const spa_fallback, U32 const max_age);
 
@@ -272,9 +355,10 @@ HTTP_Service_Static http_service_static_init_2(char const *const root_dir, char 
  * @param path Requested URL path.
  * @param path_size Size of the URL path string.
  * @return true if the static file was found and served.
- * @deprecated Since 0.3.1; scheduled for deletion in 0.5.0. Use http_service_static_serve_2,
- *             which takes the request every caller already holds. No production caller remains;
- *             kept only until the unchecked suite can reach resolve-level refusals another way.
+ * @deprecated Since 0.3.1; scheduled for deletion in 0.6.0 (0.5.0 was taken by the streaming
+ *             seam). Use http_service_static_serve_2, which takes the request every caller already
+ *             holds. No production caller remains; kept only until the unchecked suite can reach
+ *             resolve- and open-level refusals another way.
  * @note No HTTP_Server_Request is available here, so If-Modified-Since is never evaluated (see
  *       static.h's "serve_1 vs serve_2" note). If-None-Match, Range, and If-Range are still fully
  *       supported. Prefer serve_2 when a request is available.
@@ -292,6 +376,25 @@ bool http_service_static_serve_1(HTTP_Service_Static const *const self, HTTP_Ser
  *       serve_2" note).
  */
 bool http_service_static_serve_2(HTTP_Service_Static const *const self, HTTP_Server_Request *const request, HTTP_Server_Response *const response);
+
+#ifdef HTTP_SERVICE_STATIC_TEST_HOOKS
+/**
+ * @brief Test build only: install (or clear, with nullptr) the hook called after the file is
+ *        opened and verified, before the body is handed to the sender.
+ * @param hook Callback, or nullptr for none (the default).
+ * @note Process-wide, not per instance, and unsynchronized: set it before the server runs or
+ *       while no request is in flight. Compiled only under HTTP_SERVICE_STATIC_TEST_HOOKS.
+ */
+void http_service_static_test_hook_after_open_set(FpHTTP_Service_Static_Test_Hook const hook);
+
+/**
+ * @brief Test build only: install (or clear, with nullptr) the hook called after the lexical
+ *        resolve, before the file is opened.
+ * @param hook Callback, or nullptr for none (the default).
+ * @note As http_service_static_test_hook_after_open_set.
+ */
+void http_service_static_test_hook_after_resolve_set(FpHTTP_Service_Static_Test_Hook const hook);
+#endif // HTTP_SERVICE_STATIC_TEST_HOOKS
 
 /**
  * @brief Release all service storage.

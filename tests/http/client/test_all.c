@@ -27,8 +27,12 @@
  * 0x00-0xFF (the parity pin that gated moving the family off curl_easy_escape onto
  * http_query_encode_2), the fixture COUNTING and CLOSING on a script it cannot send, an arena-backed
  * Result's error text staying byte-identical after a second request on the same handle (an OWNED
- * copy, not a view over libcurl's error buffer), an arena-backed Result whose arena refuses the error
- * copy keeping the text on the heap, and header_add / set_user_agent refusing CR/LF while
+ * copy, not a view over libcurl's error buffer), an arena-backed Result whose FULL live arena cannot
+ * take the error copy keeping the text on the heap (0.5.0: no abort), an arena-backed response
+ * settled before any I/O (0.5.0) - a refused or undersized arena answering the named cap error and
+ * a response with no cap (0 or USIZE_MAX) refused, with no request reaching the fixture, and a
+ * REFUSED POST/PUT still resting the handle (no POSTFIELDS into the caller's payload, method GET)
+ * for a raw-handle perform afterward - and header_add / set_user_agent refusing CR/LF while
  * header_add_2 sends "Name: value", refuses an empty or non-token name and a CR in the value, trims
  * OWS from the value and sends an all-SP/HTAB value as present-but-empty (never a suppression),
  * and a User-Agent over libcurl's 8 000 000-byte input limit answering false with the module's
@@ -40,15 +44,18 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <allocator/allocator.h>
 #include <arena/arena.h>
 #include <char/char.h>
 #include <chrono/chrono.h>
 #include <container/str/str.h>
+#include <container/string/string.h>
 #include <http/client/http_client.h>
 #include <log/log.h>
 #include <memory/memory.h>
 #include <net/net.h>
 #include <test/test.h>
+#include <types.h>
 
 #include <fixture.h>
 
@@ -1657,8 +1664,8 @@ static void _test_perform_resets_active_response_and_postfields(Test *const test
     test_case_end(test);
 }
 
-static void _test_refused_arena_response_write_reports_truncation(Test *const test) {
-    test_case_begin(test, "an arena-backed response on a REFUSED arena (handler nullptr) fails the write with WRITE_ERROR, never an abort - the Result names the truncation");
+static void _test_refused_arena_response_refused_before_io(Test *const test) {
+    test_case_begin(test, "an arena-backed response on a REFUSED arena (handler nullptr) answers the named cap error BEFORE any I/O, never an abort - the error copy takes the heap");
 
     Fixture_Server server = DEFAULT_INITIALIZATION;
     server.script = FIXTURE_SCRIPT_OK;
@@ -1674,28 +1681,215 @@ static void _test_refused_arena_response_write_reports_truncation(Test *const te
 
     HTTP_Client *client = http_client_new();
 
+    http_client_set_max_response_size(client, 4096);
+
     /* byte_count 0 is refused geometry (arena.c): handler stays nullptr while
-     * allocate/try_allocate stay set, so allocator_borrow short-circuits to
-     * nullptr on the handler check - never reaching arena_linear_alloc's own
-     * abort-on-exhaustion path. This is the "refused arena" string_add_2/
-     * string_reserve already document, not ordinary capacity exhaustion. */
+     * allocate/try_allocate stay set, so every borrow short-circuits to nullptr on
+     * the handler check. Since 0.5.0 the up-front cap reserve is a TRY: the refused
+     * arena cannot hold cap + 1, so the request stops there, before any I/O - in
+     * 0.4.x it ran and the write callback failed it with CURLE_WRITE_ERROR. The
+     * error copy cannot fit either, so it takes the heap. */
     Arena  arena    = arena_init_1(0, ARENA_TYPE_LINEAR);
     String response = string_alloc_init_1(&arena);
 
     HTTP_Client_Result result = http_client_get(client, url, &response);
 
     test_expect_false(test, "success is false", result.success);
-    test_expect_i(test, "code == CURLE_WRITE_ERROR", (ISize) CURLE_WRITE_ERROR, (ISize) result.code);
     test_expect_true(test, "status == ERROR", result.status == HTTP_CLIENT_STATUS_ERROR);
+    test_expect_i(test, "code stays CURLE_OK - libcurl never ran", (ISize) CURLE_OK, (ISize) result.code);
+    test_expect_string(test, "the error names the cap and its setter",
+                       "response arena cannot hold max_response_size + 1 bytes; lower it with http_client_set_max_response_size", string_get_data(&result.error));
+    test_expect_null(test, "the refused arena could not take the error copy, so it is on the heap", (void*) result.error.allocator);
     test_expect_u(test, "nothing was appended to the refused response", 0, string_get_size(&response));
-    test_expect_true(test, "error text names the truncation", string_get_size(&result.error) > 0);
 
     http_client_result_uninit(&result);
     string_uninit(&response);
     arena_uninit(&arena, ARENA_TYPE_LINEAR);
     http_client_delete(&client);
     fixture_server_join(&server);
+
+    test_expect_u(test, "no connection reached the fixture", 0, server.connection_count);
+    test_expect_u(test, "no request reached the fixture", 0, server.request_count);
+
     string_uninit(&server.request_body);
+
+    test_case_end(test);
+}
+
+static void _test_arena_smaller_than_cap_answers_named_error(Test *const test) {
+    test_case_begin(test, "an arena-backed response on a LIVE arena smaller than cap + 1 answers the named cap error BEFORE any I/O - 0.4.x aborted the process here");
+
+    Fixture_Server server = DEFAULT_INITIALIZATION;
+    server.script = FIXTURE_SCRIPT_OK;
+
+    if (!_start(test, &server)) {
+        test_case_end(test);
+
+        return;
+    }
+
+    char url[64] = DEFAULT_INITIALIZATION;
+    _url_for(fixture_server_port(&server), "/", url, sizeof(url));
+
+    HTTP_Client *client = http_client_new();
+
+    http_client_set_max_response_size(client, 65536);
+
+    /* A live linear arena with room for the error text but not for cap + 1: the aborting
+     * string_reserve ended the process here; string_try_reserve answers false. */
+    Arena  arena    = arena_init_1(4096, ARENA_TYPE_LINEAR);
+    String response = string_alloc_init_1(&arena);
+
+    HTTP_Client_Result result = http_client_get(client, url, &response);
+
+    test_expect_false(test, "success is false", result.success);
+    test_expect_true(test, "status == ERROR", result.status == HTTP_CLIENT_STATUS_ERROR);
+    test_expect_i(test, "code stays CURLE_OK - libcurl never ran", (ISize) CURLE_OK, (ISize) result.code);
+    test_expect_u(test, "response_code is 0 - no response was received", 0, result.response_code);
+    test_expect_string(test, "the error names the cap and its setter",
+                       "response arena cannot hold max_response_size + 1 bytes; lower it with http_client_set_max_response_size", string_get_data(&result.error));
+    test_expect_true(test, "the error copy fit the arena, so it stayed there", result.error.allocator == &arena);
+    test_expect_u(test, "the response is empty", 0, string_get_size(&response));
+
+    http_client_result_uninit(&result);
+    string_uninit(&response);
+    arena_uninit(&arena, ARENA_TYPE_LINEAR);
+    http_client_delete(&client);
+    fixture_server_join(&server);
+
+    test_expect_u(test, "no connection reached the fixture", 0, server.connection_count);
+    test_expect_u(test, "no request reached the fixture", 0, server.request_count);
+
+    string_uninit(&server.request_body);
+
+    test_case_end(test);
+}
+
+static void _test_arena_response_without_cap_refused(Test *const test) {
+    test_case_begin(test, "an arena-backed response with NO cap (0 or USIZE_MAX) is REFUSED before any I/O - the peer would choose the arena's fill");
+
+    Fixture_Server server = DEFAULT_INITIALIZATION;
+    server.script = FIXTURE_SCRIPT_OK;
+
+    if (!_start(test, &server)) {
+        test_case_end(test);
+
+        return;
+    }
+
+    char url[64] = DEFAULT_INITIALIZATION;
+    _url_for(fixture_server_port(&server), "/", url, sizeof(url));
+
+    HTTP_Client *client = http_client_new();
+    USize const caps[] = { 0, USIZE_MAX };
+
+    for (USize index = 0; index < sizeof(caps) / sizeof(caps[0]); index += 1) {
+        http_client_set_max_response_size(client, caps[index]);
+
+        Arena  arena    = arena_init_1(64 * 1024, ARENA_TYPE_LINEAR);
+        String response = string_alloc_init_1(&arena);
+
+        HTTP_Client_Result result = http_client_get(client, url, &response);
+
+        test_expect_false(test, "success is false", result.success);
+        test_expect_true(test, "status == ERROR", result.status == HTTP_CLIENT_STATUS_ERROR);
+        test_expect_i(test, "code stays CURLE_OK - libcurl never ran", (ISize) CURLE_OK, (ISize) result.code);
+        test_expect_string(test, "the error names the rule",
+                           "an arena-backed response needs a max_response_size cap; set one with http_client_set_max_response_size or pass a heap-backed response",
+                           string_get_data(&result.error));
+        test_expect_u(test, "the response is empty", 0, string_get_size(&response));
+
+        http_client_result_uninit(&result);
+        string_uninit(&response);
+        arena_uninit(&arena, ARENA_TYPE_LINEAR);
+    }
+
+    /* The same handle, still uncapped, with a HEAP response runs: the refusal is about an
+     * arena-backed target, not the cap value itself. */
+    http_client_set_max_response_size(client, 0);
+
+    String heap_response = string_init_1();
+    HTTP_Client_Result heap_result = http_client_get(client, url, &heap_response);
+
+    test_expect_true(test, "a heap-backed response with cap 0 is still unbounded and fine", http_client_result_is_ok(&heap_result));
+
+    http_client_result_uninit(&heap_result);
+    string_uninit(&heap_response);
+    http_client_delete(&client);
+    fixture_server_join(&server);
+
+    test_expect_u(test, "only the heap-backed request reached the fixture", 1, server.request_count);
+
+    string_uninit(&server.request_body);
+
+    test_case_end(test);
+}
+
+static void _test_refused_arena_post_rests_handle(Test *const test) {
+    test_case_begin(test, "a POST/PUT REFUSED before any I/O (arena-backed response, cap 0) still clears POSTFIELDS and rests the handle "
+        "as GET, so a raw-handle perform afterward never sends the caller's (since overwritten) payload");
+
+    Fixture_Server server = DEFAULT_INITIALIZATION;
+    server.script = FIXTURE_SCRIPT_OK;
+
+    if (!_start(test, &server)) {
+        test_case_end(test);
+
+        return;
+    }
+
+    char url[64] = DEFAULT_INITIALIZATION;
+    _url_for(fixture_server_port(&server), "/", url, sizeof(url));
+
+    HTTP_Client *client = http_client_new();
+
+    http_client_set_max_response_size(client, 0);
+
+    /* The caller's payload buffer: still alive below (so a regression reads defined bytes rather
+     * than freed memory), but overwritten after the refused calls - the stand-in for a buffer the
+     * caller has freed or reused. */
+    char payload[32] = "refused-payload-secret";
+    USize const payload_size = char_length(payload);
+
+    Arena  arena    = arena_init_1(64 * 1024, ARENA_TYPE_LINEAR);
+    String response = string_alloc_init_1(&arena);
+
+    HTTP_Client_Result post_result = http_client_post_1(client, url, payload, &response);
+
+    test_expect_false(test, "the arena-backed POST with cap 0 was refused", post_result.success);
+    test_expect_i(test, "the POST refusal ran no transfer", (ISize) CURLE_OK, (ISize) post_result.code);
+
+    http_client_result_uninit(&post_result);
+
+    HTTP_Client_Result put_result = http_client_put_2(client, url, payload, payload_size, &response);
+
+    test_expect_false(test, "the arena-backed PUT with cap 0 was refused", put_result.success);
+    test_expect_i(test, "the PUT refusal ran no transfer", (ISize) CURLE_OK, (ISize) put_result.code);
+
+    http_client_result_uninit(&put_result);
+    string_uninit(&response);
+    arena_uninit(&arena, ARENA_TYPE_LINEAR);
+
+    memory_set(payload, sizeof(payload) - 1, 'X');
+
+    /* A raw-handle consumer that sets ONLY the URL: without the rest on the refusal exit, the
+     * handle is still in POST mode (POST's own setopt, then PUT's POSTFIELDS) and still points
+     * POSTFIELDS at `payload` - this request would go out as a POST carrying 22 'X' bytes. */
+    CURL *const handle = http_client_get_handle(client);
+
+    curl_easy_setopt(handle, CURLOPT_URL, url);
+
+    CURLcode const rc = curl_easy_perform(handle);
+
+    fixture_server_join(&server);
+
+    test_expect_true(test, "the raw-handle request completed without crashing (no response target: WRITE_ERROR)", rc == CURLE_WRITE_ERROR);
+    test_expect_u(test, "exactly one request - the raw one - reached the fixture", 1, server.request_count);
+    test_expect_string(test, "method line was GET, not the refused POST/PUT's", "GET", server.request_method);
+    test_expect_u(test, "no payload bytes leaked into the raw-handle request", 0, string_get_size(&server.request_body));
+
+    string_uninit(&server.request_body);
+    http_client_delete(&client);
 
     test_case_end(test);
 }
@@ -1845,8 +2039,8 @@ static void _test_arena_result_error_survives_next_request(Test *const test) {
     test_case_end(test);
 }
 
-static void _test_arena_result_error_falls_back_to_heap(Test *const test) {
-    test_case_begin(test, "an arena-backed Result whose arena REFUSES the error copy keeps the diagnostic on the heap (error.allocator == nullptr), never an empty error");
+static void _test_arena_result_error_full_arena_falls_back_to_heap(Test *const test) {
+    test_case_begin(test, "an arena-backed Result whose LIVE arena is FULL keeps the error on the heap (error.allocator == nullptr) - never an abort, never an empty error");
 
     Fixture_Server server = DEFAULT_INITIALIZATION;
     server.script = FIXTURE_SCRIPT_STALL;
@@ -1862,20 +2056,34 @@ static void _test_arena_result_error_falls_back_to_heap(Test *const test) {
 
     HTTP_Client *client = http_client_new();
 
-    http_client_set_timeout_ms(client, 300);
+    USize const cap        = 1024;
+    USize const arena_size = 8192;
 
-    /* The REFUSED arena (byte_count 0, handler nullptr), not a filled one: a capacity-
-     * exhausted linear arena ABORTS in arena_linear_alloc under ERROR_CHECK_ENABLED, so
-     * the refused geometry is the only arena that makes string_alloc_init_static answer
-     * the empty String the heap fallback keys on. The stall times out with no body byte
-     * written, so the failure is the transport's own, not an arena-capped write. */
-    Arena  arena    = arena_init_1(0, ARENA_TYPE_LINEAR);
+    http_client_set_timeout_ms(client, 300);
+    http_client_set_max_response_size(client, cap);
+
+    /* The response already holds cap + 1, so the module's up-front reserve is a no-op and the
+     * request runs; then every remaining byte of the arena is taken, so the error copy meets a
+     * FULL live arena - the case where 0.4.x's aborting string_alloc_init_static ended the
+     * process under ERROR_CHECK_ENABLED. The stall times out with no body byte written, so the
+     * failure is the transport's own. */
+    Arena  arena    = arena_init_1(arena_size, ARENA_TYPE_LINEAR);
     String response = string_alloc_init_1(&arena);
+
+    test_expect_true(test, "the response reserved cap + 1 before the arena was filled", string_try_reserve(&response, cap + CHAR_END_CHARACTER));
+
+    USize filled = 0;
+
+    while (filled < arena_size && !memory_empty(allocator_try_borrow(1, &arena))) {
+        filled += 1;
+    }
+
+    test_expect_true(test, "the arena is full: not even one more byte", memory_empty(allocator_try_borrow(1, &arena)));
 
     HTTP_Client_Result result = http_client_get(client, url, &response);
 
     test_expect_false(test, "success is false", result.success);
-    test_expect_true(test, "status == TIMEOUT (a transport failure, not an arena-capped write)", result.status == HTTP_CLIENT_STATUS_TIMEOUT);
+    test_expect_true(test, "status == TIMEOUT (a transport failure, not a refusal)", result.status == HTTP_CLIENT_STATUS_TIMEOUT);
     test_expect_true(test, "the Result is arena-backed, so error_set tried the arena first", result.allocator == &arena);
     test_expect_true(test, "the error text is non-empty", string_get_size(&result.error) > 0);
     test_expect_null(test, "the error copy took the heap fallback (error.allocator == nullptr)", (void*) result.error.allocator);
@@ -1888,6 +2096,9 @@ static void _test_arena_result_error_falls_back_to_heap(Test *const test) {
     arena_uninit(&arena, ARENA_TYPE_LINEAR);
     http_client_delete(&client);
     fixture_server_join(&server);
+
+    test_expect_u(test, "the request did reach the fixture", 1, server.request_count);
+
     string_uninit(&server.request_body);
 
     test_case_end(test);
@@ -2043,11 +2254,14 @@ int main(void) {
     _test_fixture_refuses_oversized_content_type(&test);
     _test_empty_string_str_payload_no_abort(&test);
     _test_perform_resets_active_response_and_postfields(&test);
-    _test_refused_arena_response_write_reports_truncation(&test);
+    _test_refused_arena_response_refused_before_io(&test);
+    _test_arena_smaller_than_cap_answers_named_error(&test);
+    _test_arena_response_without_cap_refused(&test);
+    _test_refused_arena_post_rests_handle(&test);
     _test_arena_response_reserves_cap_once(&test);
     _test_timeout_zero_no_abort_checked_build(&test);
     _test_arena_result_error_survives_next_request(&test);
-    _test_arena_result_error_falls_back_to_heap(&test);
+    _test_arena_result_error_full_arena_falls_back_to_heap(&test);
     _test_header_injection_refused_and_header_add_2(&test);
     _test_user_agent_over_libcurl_limit_restores_default(&test);
 

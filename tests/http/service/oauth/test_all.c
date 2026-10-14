@@ -35,6 +35,8 @@
 #include <stdio.h>
 
 #include <chrono/chrono.h>
+#include <datetime/datetime.h>
+#include <http/query/query.h>
 #include <http/service/oauth/oauth.h>
 #include <test/test.h>
 

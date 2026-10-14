@@ -1,6 +1,6 @@
 /*
  * file.h - Canonical file I/O interface for reading, writing, and managing files
- * @version 0.5.0
+ * @version 0.6.0
  *
  * Features:
  *   - Cross-platform support (Linux, Windows)
@@ -23,6 +23,11 @@
  *   - Win32 spelling predicates, pure byte rules compiled on every OS: file_name_reserved_windows
  *     (a component that names a device) and file_path_aliased_windows (a relative path that
  *     carries a second spelling of some other name)
+ *   - Opening a path chosen by someone else: file_open_nofollow_try_* (read-only; refuses a
+ *     final-component link, a directory, a FIFO / socket / device - a Windows device or UNC
+ *     path by its spelling, before any open), file_final_path_*
+ *     and file_get_final_path (where a path, or an OPEN HANDLE, physically lives), and
+ *     file_get_modified (the by-handle twin of file_modified_1). None of them allocates
  *
  * Usage Examples:
  *   @code
@@ -46,6 +51,10 @@
  *     file_set_modified_* all check it. A SIXTH by-path mutator added later must check it too.
  *     The refusal carries FILE_ARGUMENT_UNADDRESSABLE_PATH in its code field: ask
  *     file_result_is_unaddressable rather than comparing categories.
+ *   - The check converts a non-ASCII path to UTF-16 twice, through memory_try_alloc. When THAT
+ *     allocation fails the call reports RESULT_CATEGORY_MEMORY, never the unaddressable
+ *     refusal: nothing is known about the path yet, so a caller must not route it to the trash
+ *     path as if the name were the problem. Either way nothing is acted on.
  *   - Why refusing and not "best effort": this was not a failure mode, it was a MIS-TARGET.
  *     The UTF-8 bytes of a non-ASCII name, read in the code page, spell a DIFFERENT name -
  *     and when the mojibake twin of a file exists (the ordinary result of a bad unzip or a
@@ -69,6 +78,12 @@
  *     send to the recycle bin is not necessarily one file_remove_1 can delete - the trash path
  *     is the one that keeps working for such names. Linux is unaffected: paths are bytes there,
  *     and the check compiles out.
+ *   - THE FIRST WIDE OPENERS: file_open_nofollow_try_* and file_final_path_1/2/3 convert the
+ *     UTF-8 path to UTF-16 with MB_ERR_INVALID_CHARS and call CreateFile2, so they are NOT
+ *     subject to the rule above - there is no code-page reading to disagree with. Invalid UTF-8
+ *     is refused (ERROR_NO_UNICODE_TRANSLATION), and a non-ASCII name file_open_try_1 cannot
+ *     reach on cp1252 opens through them. No `\\?\` prefix is added, so Win32 normalization
+ *     (trailing-dot strip, '/' -> '\\') stays in force and the spelling predicates still apply.
  *
  * Error Handling:
  *   - file_open_1/2/3 abort (through error_check_null) when the path cannot be
@@ -84,9 +99,19 @@
  *     failure to allocate an internal WORKING BUFFER aborts, it does not return. The _2/_3
  *     wrappers build a char* from their Str/String argument through char_new_3, which goes
  *     to CFW's allocator, and memory_alloc ends the process on failure under
- *     ERROR_CHECK_ENABLED. RESULT_CATEGORY_MEMORY therefore covers the sites that can
- *     genuinely report it, and is unreachable at the rest. Converting these to a try-form
- *     allocator is tracked work, not a thing this header can promise today.
+ *     ERROR_CHECK_ENABLED. Two more working buffers abort the same way: file_replace_1's
+ *     temp-name buffer (built through char_join_1), and the single-byte terminator the
+ *     whole-file readers fall back to once the content buffer itself was refused. So
+ *     file_replace_1's RESULT_CATEGORY_MEMORY return for its temp name cannot occur in a
+ *     checked build - the process ends first. RESULT_CATEGORY_MEMORY therefore covers the
+ *     sites that can genuinely report it, and is unreachable at the rest. Converting these to
+ *     a try-form allocator is tracked work, not a thing this header can promise today.
+ *   - file_open_nofollow_try_*, file_final_path_*, file_get_final_path and file_get_modified
+ *     abort only on a nullptr CONTRACT pointer; the path is data, so every other outcome is a
+ *     by-value refusal (nullptr / false) and nothing is allocated on any path. The opener leaves
+ *     the OS error state classifiable: the failing call's own (ENOENT / ERROR_FILE_NOT_FOUND
+ *     preserved, so "not there" stays distinct from "there but refused"), or the code it sets
+ *     for a refusal it makes itself - see file_open_nofollow_try_1 for the table.
  *
  * Thread Safety:
  *   - Not thread-safe unless the underlying FILE* is not shared between threads.
@@ -104,10 +129,18 @@
  *     the stream position.
  *   - file_copy_* and file_replace_* stream through a 64 KiB buffer allocated and freed per
  *     call, so a bulk copy of many small files pays that allocation each time.
+ *   - file_open_nofollow_try_* is one open + one fstat on Linux; on Windows one CreateFile2 +
+ *     one attribute query + one handle-type query (for a cloud placeholder, a second CreateFile2
+ *     and two identity queries). file_final_path_1/2/3 is three syscalls on Windows (open, query, close) and
+ *     one realpath on Linux; file_get_final_path is one. Windows keeps two FILE_PATH_WIDE_MAX
+ *     WCHAR buffers (16 KiB) on the stack for the by-path form, Linux one PATH_MAX buffer.
  *
  * Dependencies:
  *   - container/string (Str, String), result.h (Result)
- *   - sys/stat.h, unistd.h, utime.h (Linux) or platform/windows/windows.h, io.h (Windows)
+ *   - sys/stat.h, unistd.h, utime.h, fcntl.h, limits.h (Linux) or platform/windows/windows.h,
+ *     io.h, fcntl.h (Windows)
+ *   - Linux REQUIRES -D_GNU_SOURCE (or _POSIX_C_SOURCE >= 200809L) under a strict -std=cNN:
+ *     fileno, fdopen, O_NOFOLLOW, O_CLOEXEC, realpath and readlink are POSIX, not ISO C.
  *
  * See file.c for implementation details.
  */
@@ -147,6 +180,18 @@
  *        multiplied by the caller's `ms` interval.
  */
 #define FILE_OPEN_WAIT_ATTEMPTS_MAX 5
+
+/**
+ * @def FILE_PATH_WIDE_MAX
+ * @brief Windows: the UTF-16 code units, terminator included, the wide functions
+ *        (file_open_nofollow_try_*, file_final_path_*, file_get_final_path) hold a path in.
+ *
+ *        A fixed stack buffer rather than an allocation, because these run on request paths
+ *        and promise to allocate nothing. A path that does not fit - on the way in, or as the
+ *        final path on the way out - is refused by value (nullptr / false), never truncated.
+ *        Linux holds a path in PATH_MAX bytes instead and does not use this constant.
+ */
+#define FILE_PATH_WIDE_MAX 4096
 
 /**
  * @def FILE_READ_BYTES_MAX
@@ -351,6 +396,52 @@ bool file_exists_3(String const *const file_name);
 char* file_extension_1(char const *const path);
 
 /**
+ * @brief The canonical absolute path of what a path resolves to, every symlink, junction and
+ *        reparse point and every 8.3, trailing-dot or case alias resolved by the OS (char*).
+ *
+ * Linux: realpath. Windows: CreateFile2(0 access, FILE_FLAG_BACKUP_SEMANTICS so a directory
+ * opens too) + GetFinalPathNameByHandleW(FILE_NAME_NORMALIZED | VOLUME_NAME_DOS) + CloseHandle,
+ * the `\\?\` prefix stripped and `\\?\UNC\` rewritten to `\\`, UTF-16 -> UTF-8 into the caller's
+ * buffer. Separators are the OS's own ('\\' on Windows) and the casing is the on-disk one: a
+ * caller comparing against a '/'-joined path normalizes its own side, and on Windows compares
+ * case-insensitively.
+ *
+ * For a ROOT asked once at construction, not per request - the per-request question is
+ * file_get_final_path, asked of the handle that will actually be served. The path must be
+ * TRUSTED: it is opened with no device check (on Windows a pipe path connects to its server),
+ * unlike file_open_nofollow_try_1's.
+ *
+ * @param path     UTF-8 path. Must not be nullptr.
+ * @param buffer   Receives the null-terminated final path. Must not be nullptr.
+ * @param capacity Bytes in @p buffer. 0 is a legal value and answers false.
+ * @return true and @p buffer filled; false when the path cannot be resolved, is not valid UTF-8
+ *         or exceeds FILE_PATH_WIDE_MAX (Windows), or the final path does not fit @p capacity -
+ *         @p buffer is then EMPTY (when @p capacity > 0), never truncated: a truncated path can
+ *         compare equal to a prefix it is not.
+ */
+bool file_final_path_1(char const *const path, char *const buffer, USize const capacity);
+
+/**
+ * @brief The canonical absolute path of what a path resolves to (Str). See file_final_path_1.
+ * @param path     UTF-8 path as Str*; need not be null-terminated. Empty answers false with no
+ *                 syscall, and so does one carrying an embedded NUL byte. Must not be nullptr.
+ * @param buffer   Receives the null-terminated final path. Must not be nullptr.
+ * @param capacity Bytes in @p buffer. 0 is a legal value and answers false.
+ * @return As file_final_path_1.
+ */
+bool file_final_path_2(Str const *const path, char *const buffer, USize const capacity);
+
+/**
+ * @brief The canonical absolute path of what a path resolves to (String). See file_final_path_1.
+ * @param path     UTF-8 path as String*. Empty answers false with no syscall, and so does one
+ *                 carrying an embedded NUL byte. Must not be nullptr.
+ * @param buffer   Receives the null-terminated final path. Must not be nullptr.
+ * @param capacity Bytes in @p buffer. 0 is a legal value and answers false.
+ * @return As file_final_path_1.
+ */
+bool file_final_path_3(String const *const path, char *const buffer, USize const capacity);
+
+/**
  * @brief Flush buffered writes to the operating system.
  * @param self  Pointer to file handle.
  * @return True when the flush succeeded. Callers that must know the bytes left
@@ -358,6 +449,42 @@ char* file_extension_1(char const *const path);
  *         rather than rely on fclose, which reports nothing.
  */
 bool file_flush(File *const self);
+
+/**
+ * @brief The canonical absolute path of the file an OPEN HANDLE refers to - where the bytes a
+ *        read on it would come from, whatever the path it was opened by has become since.
+ *
+ * Not a path operation: nothing is re-resolved, so a component swapped for a link after the open
+ * is not followed by this call - it reports where the handle already is. Same answer shape as
+ * file_final_path_1 (OS separators, on-disk casing, no `\\?\`), so the two compare directly.
+ *
+ * PLATFORM ASYMMETRY: Linux answers through readlink("/proc/self/fd/N"), so it answers false
+ * wherever /proc is not mounted (a minimal container, a chroot) - a caller refusing on false
+ * therefore fails CLOSED there, which is the intended direction. Linux also reports a file
+ * unlinked while open with the kernel's " (deleted)" suffix, so its answer compares unequal to
+ * the path it was opened by. Windows answers through GetFinalPathNameByHandleW on the handle under the stream
+ * and needs nothing mounted.
+ *
+ * @param self     Open file. Must not be nullptr.
+ * @param buffer   Receives the null-terminated final path. Must not be nullptr.
+ * @param capacity Bytes in @p buffer. 0 is a legal value and answers false.
+ * @return true and @p buffer filled; false and an EMPTY buffer (when @p capacity > 0) when the
+ *         handle cannot be queried or the answer does not fit - never a truncated path.
+ */
+bool file_get_final_path(File *const self, char *const buffer, USize const capacity);
+
+/**
+ * @brief Last-modified time of an OPEN file as Unix epoch seconds, by handle - the twin of
+ *        file_get_size, and file_modified_1 asked of a handle instead of a path.
+ *
+ * fstat / GetFileTime on the handle; the stream position is not moved. Same epoch arithmetic as
+ * file_modified_1, so the two agree for the same file.
+ *
+ * @param self Open file. Must not be nullptr.
+ * @param out  Receives the epoch seconds on success; untouched on failure. Must not be nullptr.
+ * @return true and *@p out set; false when the handle cannot be queried.
+ */
+bool file_get_modified(File *const self, I64 *const out);
 
 /**
  * @brief Get file size in bytes.
@@ -456,6 +583,103 @@ File* file_open_2(Str const *const file_name, char const *const file_mode);
  *         against null is dead code.
  */
 File* file_open_3(String const *const file_name, char const *const file_mode);
+
+/**
+ * @brief Open an existing REGULAR file read-only, refusing to follow a link in the final
+ *        component, reporting failure instead of aborting (char*).
+ *
+ * The opener for a path chosen by someone else. Three refusals the plain openers do not make,
+ * answered by the OPEN itself, or by the handle it returned, rather than by a check by path
+ * before it - except a Windows device or UNC path, for which the open IS the hazard (see the
+ * third):
+ *   - the final component is a symbolic link. Linux: O_NOFOLLOW, the kernel answers ELOOP.
+ *     Windows: FILE_FLAG_OPEN_REPARSE_POINT, then a FILE_ATTRIBUTE_REPARSE_POINT whose tag
+ *     IsReparseTagNameSurrogate - a symlink or a junction - is refused with
+ *     ERROR_STOPPED_ON_SYMLINK. A reparse point that is NOT a name surrogate (a Dropbox /
+ *     OneDrive cloud placeholder, a dedup or WOF-compressed file) is a file, not a link: it is
+ *     re-opened WITHOUT the flag so the filter driver serves its data, and the handle returned -
+ *     the one a caller then verifies with file_get_final_path - is that second handle. The
+ *     re-open is a second path resolution, so it is PINNED to the first: its volume serial and
+ *     128-bit file ID (FILE_ID_INFO) must equal the first handle's (a placeholder hydrated by the
+ *     re-open keeps its file ID). An entry swapped between the two opens - for a symlink the unflagged re-open
+ *     would follow, or for any other file - is refused with ERROR_STOPPED_ON_SYMLINK, as is a
+ *     handle whose identity cannot be read.
+ *   - it is a directory. Windows: CreateFile2 without FILE_FLAG_BACKUP_SEMANTICS refuses it
+ *     itself (ERROR_ACCESS_DENIED, which the attribute re-check also sets). Linux: the open
+ *     succeeds, fstat says S_ISDIR, the descriptor is closed -> EISDIR.
+ *   - it is not a regular file at all - a FIFO, a socket, a device. Linux: opened with
+ *     O_NONBLOCK so a FIFO with no writer cannot block the caller, then fstat -> ENXIO.
+ *     Windows: a device is refused BEFORE any open, on the spelling alone, since opening one
+ *     can block on a console or connect to a named pipe's server. A UNC path (two leading
+ *     separators, any mix of \ and /) is refused before any open - it would connect to the
+ *     named host (SMB, NTLM) or to a local named pipe through the loopback; open network-share
+ *     files with file_open_try_*. That rule also covers the device namespaces \\.\ and \\?\
+ *     (and the bare \\. and \\?). So does a path starting with the NT \??\ (one leading
+ *     separator), or whose final component file_name_reserved_windows calls a device (after any
+ *     trailing separators, and with any "X:" prefix of that component dropped, so "C:nul"
+ *     counts). Each answers ERROR_INVALID_HANDLE with no syscall. The cost: a real file so
+ *     spelled cannot be opened through this function - a file literally named "con.txt"
+ *     (creatable on Windows 11), any path written with \\?\, any file on a network share, or a
+ *     one-letter file's stream named like a device ("C:\a\b:con").
+ *     Anything else whose handle type is not FILE_TYPE_DISK is opened, then refused with the
+ *     same ERROR_INVALID_HANDLE.
+ *     POSIX has no such rule: "//" is an ordinary path there, opened like any other.
+ *     The spelling check reads PATH alone: a relative or drive-relative path resolves against the
+ *     process's current directory, which it does not inspect, so a caller opening an untrusted
+ *     name joins it to an absolute root first, as http_service_static does.
+ * Intermediate components are followed like any open; a caller that must refuse a linked
+ * ANCESTOR compares file_get_final_path against the path it meant.
+ *
+ * Three refusals happen before any open:
+ *   - a UNC path (two leading separators), the NT \??\ prefix, or a device final component
+ *     (Windows only): ERROR_INVALID_HANDLE. Checked first.
+ *   - a path that does not fit FILE_PATH_WIDE_MAX UTF-16 units (Windows,
+ *     ERROR_FILENAME_EXCED_RANGE) or PATH_MAX bytes (Linux, ENAMETOOLONG).
+ *   - invalid UTF-8 (Windows, ERROR_NO_UNICODE_TRANSLATION).
+ * Two can happen after it, on Windows only, when the CRT cannot wrap the verified handle in a
+ * stream: ERROR_TOO_MANY_OPEN_FILES (descriptor table full) and ERROR_NOT_ENOUGH_MEMORY (no
+ * FILE); Linux keeps fdopen's own errno.
+ *
+ * This is the module's first WIDE opener - see Character Encoding: it can open a non-ASCII name
+ * file_open_try_1 cannot.
+ *
+ * The handle is binary and read-only by construction (O_RDONLY / GENERIC_READ). On Windows it
+ * is opened with FILE_SHARE_DELETE deliberately: a file deleted or replaced while being read
+ * keeps reading from the open handle - POSIX unlink semantics - instead of failing the writer's
+ * rename. Both Windows opens ask for an identification-only security QoS, so a path naming a
+ * named pipe cannot let the pipe's server impersonate the caller; they go through CreateFile2,
+ * because CreateFileW spells that QoS with the bit that also means FILE_FLAG_OPEN_NO_RECALL and
+ * would stop a placeholder's data being recalled. On Linux O_NONBLOCK stays set on the
+ * descriptor; a regular file never answers EAGAIN.
+ *
+ * CONTRACT: as file_open_try_1 - on nullptr the OS error state (errno / GetLastError) is the
+ * failing call's own, or the code named above for a refusal this function makes itself, and
+ * nothing that could overwrite it runs in between.
+ *
+ * @param path UTF-8 path. Must not be nullptr.
+ * @return A read-only binary File* the caller owns and closes with file_close, or nullptr.
+ */
+File* file_open_nofollow_try_1(char const *const path);
+
+/**
+ * @brief Open an existing regular file read-only without following a final-component link (Str).
+ *        See file_open_nofollow_try_1 for the contract.
+ * @param path UTF-8 path as Str*; need not be null-terminated. Must not be nullptr. Empty answers
+ *             nullptr with no syscall (the OS error state is not touched); one carrying an
+ *             embedded NUL byte answers nullptr with EINVAL / ERROR_INVALID_NAME, since the OS
+ *             would otherwise open the shorter name in front of it.
+ * @return As file_open_nofollow_try_1.
+ */
+File* file_open_nofollow_try_2(Str const *const path);
+
+/**
+ * @brief Open an existing regular file read-only without following a final-component link
+ *        (String). See file_open_nofollow_try_1 for the contract.
+ * @param path UTF-8 path as String*. Must not be nullptr. Empty and embedded-NUL paths answer as
+ *             in file_open_nofollow_try_2.
+ * @return As file_open_nofollow_try_1.
+ */
+File* file_open_nofollow_try_3(String const *const path);
 
 /**
  * @brief Open a file, reporting failure instead of aborting (char*).
@@ -937,7 +1161,8 @@ bool file_result_is_not_found(Result const result);
  *
  * @param result A Result returned by this family.
  * @return true for RESULT_CATEGORY_ARGUMENT with FILE_ARGUMENT_UNADDRESSABLE_PATH; never on
- *         Linux, where every path is addressable.
+ *         Linux, where every path is addressable, and never for the RESULT_CATEGORY_MEMORY the
+ *         check itself reports when its conversion buffers cannot be taken.
  */
 bool file_result_is_unaddressable(Result const result);
 

@@ -1,62 +1,12 @@
 #include <http/service/body_parser/body_parser.h>
 
+#include <char/char.h>
+#include <container/str/str.h>
+#include <http/query/query.h>
+
 /*==============================================================================
  * MARK: - Internal Helpers
  *============================================================================*/
-
-/*
- * Decodes a percent-encoded byte sequence in-place.
- * Writes decoded characters to dest. Returns number of bytes written.
- * src is a buffer of at least src_size bytes; src_size == 0 is a legal empty value
- * ("k=" in a form body) and writes only the terminator.
- */
-static USize _http_service_body_parser_url_decode(char *const dest, char const *const src, USize const src_size) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "dest", (void*) dest);
-    error_check_null(LOG_METADATA, "src", (void*) src);
-
-    if (src_size == 0) {
-        dest[0] = '\0';
-
-        trace_log_pop();
-
-        return 0;
-    }
-
-    USize write_pos = 0;
-
-    for (USize i = 0; i < src_size; ++i) {
-        if (src[i] == '+') {
-            dest[write_pos] = ' ';
-            write_pos       += 1;
-        }
-        else if (src[i] == '%' && i + 2 < src_size) {
-            U8 const hi = char_raw_to_hex(src[i + 1]);
-            U8 const lo = char_raw_to_hex(src[i + 2]);
-
-            if (hi != 0xFF && lo != 0xFF) {
-                dest[write_pos] = (char) ((hi << 4) | lo);
-                write_pos       += 1;
-                i               += 2;
-            }
-            else {
-                dest[write_pos] = src[i];
-                write_pos       += 1;
-            }
-        }
-        else {
-            dest[write_pos] = src[i];
-            write_pos       += 1;
-        }
-    }
-
-    dest[write_pos] = '\0';
-
-    trace_log_pop();
-
-    return write_pos;
-}
 
 #ifdef ARENA_IMPLEMENTATION
 static HTTP_Service_Body_Parser _http_service_body_parser_init(Arena *const allocator)
@@ -117,87 +67,90 @@ static void _http_service_body_parser_reset(HTTP_Service_Body_Parser *const self
     self->json_size = 0;
 }
 
+/*
+ * Pair boundaries come from http_query_next and decoding from http_query_decode - the
+ * percent and '+' rules live once, in http/query. next is byte-transparent over the sized
+ * payload (a raw NUL is data, a leading '?' is not stripped), which is exactly the walk this
+ * parser always made: the payload is a sized buffer that may be unterminated.
+ */
 static bool _http_service_body_parser_parse_form(HTTP_Service_Body_Parser *const self, char const *const payload, USize const payload_size) {
     trace_log_push(LOG_METADATA);
 
-    USize   pair_start  = 0;
-    bool    over_budget = false;
+    USize cursor = 0;
+    Str name = str_init_1();
+    Str value = str_init_1();
+    bool over_budget = false;
 
-    for (USize i = 0; i <= payload_size; ++i) {
-        if (i == payload_size || payload[i] == '&') {
-            char    const   *const  pair        = &payload[pair_start];
-            USize   const           pair_size   = i - pair_start;
-            /* Bounded by pair_size, never by char_length: the payload is a sized
-             * buffer that may be unterminated, and an unbounded search could match
-             * the '=' of a LATER pair. */
-            char    const   *const  eq          = pair_size == 0 ? nullptr : char_find_slice_5(pair, pair_size, 0, "=", 1);
+    while (http_query_next(payload, payload_size, &cursor, &name, &value)) {
+        char const *const name_data = str_get_data(&name);
+        USize const key_encoded_size = str_get_size(&name);
+        USize const val_encoded_size = str_get_size(&value);
 
-            if (eq != nullptr) {
-                if (self->max_pairs != 0 && map_char_char_get_size(&self->form_data) >= self->max_pairs) {
-                    over_budget = true;
+        /* A pair with no '=' ("k") is skipped before it is ever counted against max_pairs.
+         * next's contract: the value's data is nullptr exactly when the pair had no '='
+         * ("k=" answers a non-null, zero-size view). */
+        if (memory_empty(str_get_data(&value))) {
+            continue;
+        }
 
-                    break;
-                }
+        if (self->max_pairs != 0 && map_char_char_get_size(&self->form_data) >= self->max_pairs) {
+            over_budget = true;
 
-                USize const key_encoded_size = (USize) (eq - pair);
-                USize const val_encoded_size = pair_size - key_encoded_size - 1;
+            break;
+        }
 
-                /* try_borrow: both sizes come straight from the request body. */
+        /* try_borrow: both sizes come straight from the request body. */
 #ifdef ARENA_IMPLEMENTATION
-                char *const key = (char*) allocator_try_borrow(key_encoded_size + 1, self->allocator);
-                char *const val = (char*) allocator_try_borrow(val_encoded_size + 1, self->allocator);
+        char *const key = (char*) allocator_try_borrow(key_encoded_size + CHAR_END_CHARACTER, self->allocator);
+        char *const val = (char*) allocator_try_borrow(val_encoded_size + CHAR_END_CHARACTER, self->allocator);
 #else
-                char *const key = (char*) allocator_try_borrow(key_encoded_size + 1);
-                char *const val = (char*) allocator_try_borrow(val_encoded_size + 1);
+        char *const key = (char*) allocator_try_borrow(key_encoded_size + CHAR_END_CHARACTER);
+        char *const val = (char*) allocator_try_borrow(val_encoded_size + CHAR_END_CHARACTER);
 #endif // ARENA_IMPLEMENTATION
 
-                /* Skip the pair on an empty key (never a meaningful field name) or when
-                 * the allocator is drained. Both blocks are released here, val-before-key
-                 * (a LIFO stack arena pops in order); allocator_release ignores a null
-                 * pointer, but the guard still only releases the half that DID succeed,
-                 * so a decline on one side is never mistaken for one on the other. An
-                 * empty VALUE is legal past this point: url_decode(size 0) stores "". */
-                if (memory_empty(key) || memory_empty(val) || key_encoded_size == 0) {
+        /* Skip the pair on an empty key (never a meaningful field name) or when
+         * the allocator is drained. Both blocks are released here, val-before-key
+         * (a LIFO stack arena pops in order); allocator_release ignores a null
+         * pointer, but the guard still only releases the half that DID succeed,
+         * so a decline on one side is never mistaken for one on the other. An
+         * empty VALUE is legal past this point: decode(size 0) stores "". */
+        if (memory_empty(key) || memory_empty(val) || key_encoded_size == 0) {
 #ifdef ARENA_IMPLEMENTATION
-                    if (!memory_empty(val)) {
-                        allocator_release((void*) val, self->allocator);
-                    }
-
-                    if (!memory_empty(key)) {
-                        allocator_release((void*) key, self->allocator);
-                    }
-#else
-                    if (!memory_empty(val)) {
-                        allocator_release((void*) val);
-                    }
-
-                    if (!memory_empty(key)) {
-                        allocator_release((void*) key);
-                    }
-#endif // ARENA_IMPLEMENTATION
-
-                    pair_start = i + 1;
-
-                    continue;
-                }
-
-                _http_service_body_parser_url_decode(key, pair, key_encoded_size);
-                _http_service_body_parser_url_decode(val, eq + 1, val_encoded_size);
-
-                /* add() ADOPTS on success and takes nothing on a decline; a declined
-                 * add must release both blocks itself or they leak. */
-                if (!map_char_char_add(&self->form_data, key, val)) {
-#ifdef ARENA_IMPLEMENTATION
-                    allocator_release((void*) val, self->allocator);
-                    allocator_release((void*) key, self->allocator);
-#else
-                    allocator_release((void*) val);
-                    allocator_release((void*) key);
-#endif // ARENA_IMPLEMENTATION
-                }
+            if (!memory_empty(val)) {
+                allocator_release((void*) val, self->allocator);
             }
 
-            pair_start = i + 1;
+            if (!memory_empty(key)) {
+                allocator_release((void*) key, self->allocator);
+            }
+#else
+            if (!memory_empty(val)) {
+                allocator_release((void*) val);
+            }
+
+            if (!memory_empty(key)) {
+                allocator_release((void*) key);
+            }
+#endif // ARENA_IMPLEMENTATION
+
+            continue;
+        }
+
+        /* Each block is one byte larger than its encoded slice, and decoding never grows a
+         * value, so neither call can answer the too-small refusal (USIZE_MAX). */
+        http_query_decode(key, key_encoded_size + CHAR_END_CHARACTER, name_data, key_encoded_size, true);
+        http_query_decode(val, val_encoded_size + CHAR_END_CHARACTER, str_get_data(&value), val_encoded_size, true);
+
+        /* add() ADOPTS on success and takes nothing on a decline; a declined
+         * add must release both blocks itself or they leak. */
+        if (!map_char_char_add(&self->form_data, key, val)) {
+#ifdef ARENA_IMPLEMENTATION
+            allocator_release((void*) val, self->allocator);
+            allocator_release((void*) key, self->allocator);
+#else
+            allocator_release((void*) val);
+            allocator_release((void*) key);
+#endif // ARENA_IMPLEMENTATION
         }
     }
 

@@ -403,6 +403,47 @@ static void _test_child(Test *const test) {
     test_case_end(test);
 }
 
+static void _test_tracestate_hand_filled(Test *const test) {
+    test_case_begin(test, "tracestate: a hand-filled context is re-checked at header_create");
+
+    HTTP_Service_Traceparent         trace   = DEFAULT_INITIALIZATION;
+    HTTP_Service_Traceparent_Context context = DEFAULT_INITIALIZATION;
+
+    test_expect_true(test, "init_1 succeeds", http_service_traceparent_init_1(&trace));
+    test_expect_true(test, "a valid context is built", http_service_traceparent_context_parse_2(&trace, _GOLDEN, nullptr, &context));
+
+    char_copy_3(context.tracestate, HTTP_SERVICE_TRACEPARENT_TRACESTATE_CAPACITY, "a=b\r\nX-Evil: 1", 15);
+
+    String header = http_service_traceparent_header_create(&trace, &context);
+
+    test_expect_string_contains(test, "the traceparent line still ships", _block(&header), "traceparent: " _GOLDEN);
+    test_expect_false(test, "a CRLF tracestate loses its line", char_contains_1(_block(&header), "tracestate"));
+    test_expect_false(test, "and nothing is injected", char_contains_1(_block(&header), "X-Evil"));
+
+    string_uninit(&header);
+
+    memset(context.tracestate, 'a', HTTP_SERVICE_TRACEPARENT_TRACESTATE_CAPACITY);
+
+    header = http_service_traceparent_header_create(&trace, &context);
+
+    test_expect_string_contains(test, "an unterminated tracestate keeps the traceparent line", _block(&header), "traceparent: " _GOLDEN);
+    test_expect_false(test, "but loses its own line", char_contains_1(_block(&header), "tracestate"));
+
+    string_uninit(&header);
+
+    memset(context.tracestate, 0, HTTP_SERVICE_TRACEPARENT_TRACESTATE_CAPACITY);
+    char_copy_3(context.tracestate, HTTP_SERVICE_TRACEPARENT_TRACESTATE_CAPACITY, "a=b", 3);
+
+    header = http_service_traceparent_header_create(&trace, &context);
+
+    test_expect_string_contains(test, "a valid hand-filled tracestate still emits", _block(&header), "tracestate: a=b\r\n");
+
+    string_uninit(&header);
+    http_service_traceparent_uninit(&trace);
+
+    test_case_end(test);
+}
+
 static void _test_tracestate(Test *const test) {
     test_case_begin(test, "tracestate: carried verbatim, capped, and dropped with a restarted trace");
 
@@ -517,6 +558,70 @@ static void _test_header_name(Test *const test) {
 
     test_expect_string_contains(test, "the block uses the configured name", _block(&header), "x-trace: " _GOLDEN);
     test_expect_string_contains(test, "and the SPEC name for the state line", _block(&header), "tracestate: vendor=abc");
+
+    string_uninit(&header);
+    http_service_traceparent_uninit(&trace);
+
+    test_case_end(test);
+}
+
+static void _test_unterminated_arrays(Test *const test) {
+    test_case_begin(test, "public arrays: a hand-set header_name, trace_id, parent_id or tracestate is measured inside the array");
+
+    HTTP_Service_Traceparent         trace   = DEFAULT_INITIALIZATION;
+    HTTP_Service_Traceparent_Context context = DEFAULT_INITIALIZATION;
+
+    test_expect_true(test, "init_1 succeeds", http_service_traceparent_init_1(&trace));
+    test_expect_true(test, "a valid context is built", http_service_traceparent_context_parse_2(&trace, _GOLDEN, nullptr, &context));
+
+    char_copy_3(trace.header_name, HTTP_SERVICE_TRACEPARENT_HEADER_NAME_CAPACITY, "x\r\nX-Evil: 1", 13);
+
+    String header = http_service_traceparent_header_create(&trace, &context);
+
+    test_expect_u(test, "a CRLF header_name yields the empty block", 0, string_get_size(&header));
+    test_expect_false(test, "and nothing is injected", char_contains_1(_block(&header), "X-Evil"));
+
+    string_uninit(&header);
+
+    memset(trace.header_name, 'a', HTTP_SERVICE_TRACEPARENT_HEADER_NAME_CAPACITY);
+
+    header = http_service_traceparent_header_create(&trace, &context);
+
+    test_expect_u(test, "an unterminated header_name yields the empty block", 0, string_get_size(&header));
+
+    string_uninit(&header);
+
+    memset(trace.header_name, 0, HTTP_SERVICE_TRACEPARENT_HEADER_NAME_CAPACITY);
+    char_copy_3(trace.header_name, HTTP_SERVICE_TRACEPARENT_HEADER_NAME_CAPACITY, "x-trace", 7);
+
+    header = http_service_traceparent_header_create(&trace, &context);
+
+    test_expect_string_contains(test, "a clean hand-set header_name still emits", _block(&header), "x-trace: " _GOLDEN);
+
+    string_uninit(&header);
+
+    HTTP_Service_Traceparent_Context unterminated = context;
+
+    memset(unterminated.trace_id, 'a', sizeof(unterminated.trace_id));
+    memset(unterminated.tracestate, 'a', sizeof(unterminated.tracestate));
+
+    test_expect_false(test, "an unterminated trace_id is not a valid context", http_service_traceparent_context_valid(&unterminated));
+
+    header = http_service_traceparent_header_create(&trace, &unterminated);
+
+    test_expect_u(test, "unterminated trace_id and tracestate yield the empty block", 0, string_get_size(&header));
+
+    string_uninit(&header);
+
+    unterminated = context;
+
+    memset(unterminated.parent_id, 'b', sizeof(unterminated.parent_id));
+
+    test_expect_false(test, "an unterminated parent_id is not a valid context", http_service_traceparent_context_valid(&unterminated));
+
+    header = http_service_traceparent_header_create(&trace, &unterminated);
+
+    test_expect_u(test, "an unterminated parent_id yields the empty block", 0, string_get_size(&header));
 
     string_uninit(&header);
     http_service_traceparent_uninit(&trace);
@@ -717,8 +822,10 @@ I32 main(void) {
     _test_forward_compatibility(&test);
     _test_child(&test);
     _test_tracestate(&test);
+    _test_tracestate_hand_filled(&test);
     _test_flags_round_trip(&test);
     _test_header_name(&test);
+    _test_unterminated_arrays(&test);
     _test_arena(&test);
     _test_header_size_accounting(&test);
 

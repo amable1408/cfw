@@ -547,8 +547,7 @@ static bool _http_service_email_bytes_address_ok(char const *const data, USize c
     for (USize i = 0; success && i < count; i += 1) {
         U8 const c = (U8) data[i];
 
-        if (c <= 0x20 || c >= 0x7f || c == '(' || c == ')' || c == '<' || c == '>' || c == '[' || c == ']' ||
-            c == ':' || c == ';' || c == '\\' || c == ',' || c == '"') {
+        if (c <= 0x20 || c >= 0x7f || c == '(' || c == ')' || c == '<' || c == '>' || c == '[' || c == ']' || c == ':' || c == ';' || c == '\\' || c == ',' || c == '"') {
             success = false;
         }
         else if (c == '@') {
@@ -557,9 +556,9 @@ static bool _http_service_email_bytes_address_ok(char const *const data, USize c
         }
     }
 
-    success = success && at_count == 1 && at_index > 0 && at_index + 1 < count
-           && at_index <= _HTTP_SERVICE_EMAIL_ADDRESS_LOCAL_MAX_LENGTH
-           && count - at_index - 1 <= _HTTP_SERVICE_EMAIL_ADDRESS_DOMAIN_MAX_LENGTH;
+    success = success && at_count == 1 && at_index > 0 && at_index + 1 < count &&
+              at_index <= _HTTP_SERVICE_EMAIL_ADDRESS_LOCAL_MAX_LENGTH         &&
+              count - at_index - 1 <= _HTTP_SERVICE_EMAIL_ADDRESS_DOMAIN_MAX_LENGTH;
 
     trace_log_pop();
 
@@ -873,10 +872,10 @@ static bool _http_service_email_encoded_word_add(String *const payload, char con
             added = _http_service_email_string_add(payload, "\r\n ");
         }
 
-        added = added
-             && _http_service_email_string_add(payload, _HTTP_SERVICE_EMAIL_ENCODED_WORD_PREFIX)
-             && _http_service_email_string_add(payload, encoded)
-             && _http_service_email_string_add(payload, _HTTP_SERVICE_EMAIL_ENCODED_WORD_SUFFIX);
+        added = added                                                                            &&
+                _http_service_email_string_add(payload, _HTTP_SERVICE_EMAIL_ENCODED_WORD_PREFIX) &&
+                _http_service_email_string_add(payload, encoded)                                 &&
+                _http_service_email_string_add(payload, _HTTP_SERVICE_EMAIL_ENCODED_WORD_SUFFIX);
 
         index += chunk;
     }
@@ -1036,8 +1035,7 @@ static bool _http_service_email_display_name_quoting_needed(char const *const da
     for (USize i = 0; !needed && i < size; i += 1) {
         char const c = data[i];
 
-        needed = c == '(' || c == ')' || c == '<' || c == '>' || c == '@' || c == ',' || c == ';'
-              || c == ':' || c == '\\' || c == '"' || c == '.' || c == '[' || c == ']';
+        needed = c == '(' || c == ')' || c == '<' || c == '>' || c == '@' || c == ',' || c == ';' || c == ':' || c == '\\' || c == '"' || c == '.' || c == '[' || c == ']';
     }
 
     trace_log_pop();
@@ -1079,8 +1077,8 @@ static bool _http_service_email_address_payload_add(String *const payload, Strin
 
     if (!_http_service_email_bytes_ascii(data, size)) {
         bool const encoded = _http_service_email_encoded_word_add(payload, data, size) &&
-                             _http_service_email_string_add(payload, " <")           &&
-                             _http_service_email_string_add_2(payload, email)        &&
+                             _http_service_email_string_add(payload, " <")             &&
+                             _http_service_email_string_add_2(payload, email)          &&
                              _http_service_email_string_add(payload, ">");
 
         trace_log_pop();
@@ -1249,8 +1247,7 @@ static bool _http_service_email_custom_headers_add(String *const payload, AL_Str
     for (USize i = 0; added && i < al_str_get_size(list); i += 1) {
         Str const *const entry = al_str_at(list, i);
 
-        added = _http_service_email_folded_add(payload, str_get_data(entry), str_get_size(entry), 0)
-             && _http_service_email_string_add(payload, "\r\n");
+        added = _http_service_email_folded_add(payload, str_get_data(entry), str_get_size(entry), 0) && _http_service_email_string_add(payload, "\r\n");
     }
 
     trace_log_pop();
@@ -1265,12 +1262,12 @@ static bool _http_service_email_part_add(String *const payload, char const *cons
     error_check_null(LOG_METADATA, "content_type", (void*) content_type);
     error_check_null(LOG_METADATA, "body", (void*) body);
 
-    bool const added = _http_service_email_string_add(payload, "Content-Type: ")
-                    && _http_service_email_string_add(payload, content_type)
-                    && _http_service_email_string_add(payload, "; charset=utf-8\r\n")
-                    && _http_service_email_string_add(payload, "Content-Transfer-Encoding: quoted-printable\r\n\r\n")
-                    && encoding_quoted_printable_encode_2(string_get_data(body), string_get_size(body), payload)
-                    && _http_service_email_string_add(payload, "\r\n");
+    bool const added = _http_service_email_string_add(payload, "Content-Type: ")                                      &&
+                       _http_service_email_string_add(payload, content_type)                                          &&
+                       _http_service_email_string_add(payload, "; charset=utf-8\r\n")                                 &&
+                       _http_service_email_string_add(payload, "Content-Transfer-Encoding: quoted-printable\r\n\r\n") &&
+                       encoding_quoted_printable_encode_2(string_get_data(body), string_get_size(body), payload)      &&
+                       _http_service_email_string_add(payload, "\r\n");
 
     trace_log_pop();
 
@@ -1284,9 +1281,7 @@ static bool _http_service_email_boundary_add(String *const payload, char const *
     error_check_null(LOG_METADATA, "boundary", (void*) boundary);
     error_check_null(LOG_METADATA, "suffix", (void*) suffix);
 
-    bool const added = _http_service_email_string_add(payload, "--")
-                    && _http_service_email_string_add(payload, boundary)
-                    && _http_service_email_string_add(payload, suffix);
+    bool const added = _http_service_email_string_add(payload, "--") && _http_service_email_string_add(payload, boundary) && _http_service_email_string_add(payload, suffix);
 
     trace_log_pop();
 
@@ -1304,14 +1299,14 @@ static bool _http_service_email_body_add(String *const payload, HTTP_Service_Ema
     bool const has_html = !string_empty(&message->html);
 
     if (has_text && has_html) {
-        bool const added = _http_service_email_string_add(payload, "Content-Type: multipart/alternative; boundary=\"")
-                        && _http_service_email_string_add(payload, boundary)
-                        && _http_service_email_string_add(payload, "\"\r\n\r\n")
-                        && _http_service_email_boundary_add(payload, boundary, "\r\n")
-                        && _http_service_email_part_add(payload, "text/plain", &message->text)
-                        && _http_service_email_boundary_add(payload, boundary, "\r\n")
-                        && _http_service_email_part_add(payload, "text/html", &message->html)
-                        && _http_service_email_boundary_add(payload, boundary, "--\r\n");
+        bool const added = _http_service_email_string_add(payload, "Content-Type: multipart/alternative; boundary=\"") &&
+                           _http_service_email_string_add(payload, boundary)                                           &&
+                           _http_service_email_string_add(payload, "\"\r\n\r\n")                                       &&
+                           _http_service_email_boundary_add(payload, boundary, "\r\n")                                 &&
+                           _http_service_email_part_add(payload, "text/plain", &message->text)                         &&
+                           _http_service_email_boundary_add(payload, boundary, "\r\n")                                 &&
+                           _http_service_email_part_add(payload, "text/html", &message->html)                          &&
+                           _http_service_email_boundary_add(payload, boundary, "--\r\n");
 
         trace_log_pop();
 
@@ -1371,9 +1366,9 @@ static bool _http_service_email_curl_recipients_create(HTTP_Service_Email_Messag
 
     struct curl_slist *recipients = nullptr;
 
-    bool const added = _http_service_email_curl_recipients_add(&recipients, &message->to)
-                    && _http_service_email_curl_recipients_add(&recipients, &message->cc)
-                    && _http_service_email_curl_recipients_add(&recipients, &message->bcc);
+    bool const added = _http_service_email_curl_recipients_add(&recipients, &message->to) &&
+                       _http_service_email_curl_recipients_add(&recipients, &message->cc) &&
+                       _http_service_email_curl_recipients_add(&recipients, &message->bcc);
 
     if (!added) {
         curl_slist_free_all(recipients);
@@ -1399,9 +1394,7 @@ static bool _http_service_email_capture_list_add(String *const sink, AL_Str cons
     bool added = true;
 
     for (USize i = 0; added && i < al_str_get_size(list); i += 1) {
-        added = _http_service_email_string_add(sink, "RCPT TO:<")
-             && _http_service_email_str_add(sink, al_str_at(list, i))
-             && _http_service_email_string_add(sink, ">\r\n");
+        added = _http_service_email_string_add(sink, "RCPT TO:<") && _http_service_email_str_add(sink, al_str_at(list, i)) && _http_service_email_string_add(sink, ">\r\n");
     }
 
     trace_log_pop();
@@ -1443,8 +1436,7 @@ static bool _http_service_email_dot_stuffed_add(String *const sink, String const
         if (at_line_start && data[i] == '.') {
             /* Everything up to the offending byte, then the extra '.'. `start`
              * stays put so the byte itself goes out with the next run. */
-            added = _http_service_email_bytes_add(sink, data + start, i - start)
-                 && _http_service_email_bytes_add(sink, ".", CHAR_STATIC_SIZE("."));
+            added = _http_service_email_bytes_add(sink, data + start, i - start) && _http_service_email_bytes_add(sink, ".", CHAR_STATIC_SIZE("."));
 
             start = i;
         }
@@ -1490,10 +1482,10 @@ static bool _http_service_email_render_valid(HTTP_Service_Email_Render const *co
         message_id_size += 1;
     }
 
-    bool success = boundary_size > 0 && boundary_size < sizeof(render->boundary)
-                && message_id_size > 0 && message_id_size < sizeof(render->message_id)
-                && _http_service_email_bytes_header_safe(render->boundary, boundary_size)
-                && _http_service_email_bytes_header_safe(render->message_id, message_id_size);
+    bool success = boundary_size > 0 && boundary_size < sizeof(render->boundary)          &&
+                   message_id_size > 0 && message_id_size < sizeof(render->message_id)    &&
+                   _http_service_email_bytes_header_safe(render->boundary, boundary_size) &&
+                   _http_service_email_bytes_header_safe(render->message_id, message_id_size);
 
     for (USize i = 0; success && i < boundary_size; i += 1) {
         char const c = render->boundary[i];
@@ -1501,9 +1493,7 @@ static bool _http_service_email_render_valid(HTTP_Service_Email_Render const *co
         success = c != '"' && c != ' ';
     }
 
-    success = success
-           && render->message_id[0] == '<'
-           && render->message_id[message_id_size - 1] == '>';
+    success = success && render->message_id[0] == '<' && render->message_id[message_id_size - 1] == '>';
 
     for (USize i = 1; success && i + 1 < message_id_size; i += 1) {
         char const c = render->message_id[i];
@@ -1576,10 +1566,10 @@ bool http_service_email_alloc_init_2(HTTP_Service_Email *const self,
     /* Whole-or-nothing: a refused copy releases everything the constructor built
      * and leaves the caller with an untouched `self`, so a refusal can never be
      * mistaken for "configured but empty". */
-    if (!_http_service_email_string_set(&self->url, url, allocator)
-        || !_http_service_email_string_set(&self->from, from, allocator)
-        || !_http_service_email_string_set(&self->username, username, allocator)
-        || !_http_service_email_string_set(&self->password, password, allocator)) {
+    if (!_http_service_email_string_set(&self->url, url, allocator)           ||
+        !_http_service_email_string_set(&self->from, from, allocator)         ||
+        !_http_service_email_string_set(&self->username, username, allocator) ||
+        !_http_service_email_string_set(&self->password, password, allocator)) {
         http_service_email_uninit(self);
 
         trace_log_pop();
@@ -1827,15 +1817,15 @@ bool http_service_email_init_2(HTTP_Service_Email *const self, char const *const
     }
 
 #ifdef ARENA_IMPLEMENTATION
-    bool const stored = _http_service_email_string_set(&self->url, url, nullptr)
-                     && _http_service_email_string_set(&self->from, from, nullptr)
-                     && _http_service_email_string_set(&self->username, username, nullptr)
-                     && _http_service_email_string_set(&self->password, password, nullptr);
+    bool const stored = _http_service_email_string_set(&self->url, url, nullptr)           &&
+                        _http_service_email_string_set(&self->from, from, nullptr)         &&
+                        _http_service_email_string_set(&self->username, username, nullptr) &&
+                        _http_service_email_string_set(&self->password, password, nullptr);
 #else
-    bool const stored = _http_service_email_string_set(&self->url, url)
-                     && _http_service_email_string_set(&self->from, from)
-                     && _http_service_email_string_set(&self->username, username)
-                     && _http_service_email_string_set(&self->password, password);
+    bool const stored = _http_service_email_string_set(&self->url, url)           &&
+                        _http_service_email_string_set(&self->from, from)         &&
+                        _http_service_email_string_set(&self->username, username) &&
+                        _http_service_email_string_set(&self->password, password);
 #endif // ARENA_IMPLEMENTATION
 
     if (!stored) {
@@ -2271,17 +2261,15 @@ bool http_service_email_message_valid(HTTP_Service_Email const *const self, HTTP
     bool    const           has_body    = !string_empty(&message->text) || !string_empty(&message->html);
 
     bool const addresses_ok =
-        _http_service_email_string_address_ok(from)
-        && _http_service_email_address_list_ok(&message->to)
-        && _http_service_email_address_list_ok(&message->cc)
-        && _http_service_email_address_list_ok(&message->bcc)
-        && (string_empty(&message->reply_to)
-            || _http_service_email_string_address_ok(&message->reply_to));
+        _http_service_email_string_address_ok(from)        &&
+        _http_service_email_address_list_ok(&message->to)  &&
+        _http_service_email_address_list_ok(&message->cc)  &&
+        _http_service_email_address_list_ok(&message->bcc) &&
+        (string_empty(&message->reply_to)                  ||
+         _http_service_email_string_address_ok(&message->reply_to));
 
     bool const headers_ok =
-        _http_service_email_string_header_safe(from_name)
-        && _http_service_email_string_header_safe(&message->subject)
-        && _http_service_email_header_list_safe(&message->headers);
+        _http_service_email_string_header_safe(from_name) && _http_service_email_string_header_safe(&message->subject) && _http_service_email_header_list_safe(&message->headers);
 
     bool const success =
         !string_empty(from) && _http_service_email_recipient_exists(message) && has_body && addresses_ok && headers_ok;
@@ -2343,16 +2331,14 @@ bool http_service_email_payload_create_2(HTTP_Service_Email const *const self,
     String payload = _http_service_email_string_init_sized(reserve);
 #endif // ARENA_IMPLEMENTATION
 
-    bool added = _http_service_email_string_add(&payload, "From: ")
-              && _http_service_email_address_payload_add(&payload, from_name, from, CHAR_STATIC_SIZE("From: "))
-              && _http_service_email_string_add(&payload, "\r\n")
-              && _http_service_email_list_payload_add(&payload, "To: ", &message->to)
-              && _http_service_email_list_payload_add(&payload, "Cc: ", &message->cc);
+    bool added = _http_service_email_string_add(&payload, "From: ")                                             &&
+                 _http_service_email_address_payload_add(&payload, from_name, from, CHAR_STATIC_SIZE("From: ")) &&
+                 _http_service_email_string_add(&payload, "\r\n")                                               &&
+                 _http_service_email_list_payload_add(&payload, "To: ", &message->to)                           &&
+                 _http_service_email_list_payload_add(&payload, "Cc: ", &message->cc);
 
     if (added && !string_empty(&message->reply_to)) {
-        added = _http_service_email_string_add(&payload, "Reply-To: ")
-             && _http_service_email_string_add_2(&payload, &message->reply_to)
-             && _http_service_email_string_add(&payload, "\r\n");
+        added = _http_service_email_string_add(&payload, "Reply-To: ") && _http_service_email_string_add_2(&payload, &message->reply_to) && _http_service_email_string_add(&payload, "\r\n");
     }
 
     if (added && !string_empty(&message->subject)) {
@@ -2363,16 +2349,16 @@ bool http_service_email_payload_create_2(HTTP_Service_Email const *const self,
 
     datetime_format(&render->date, _HTTP_SERVICE_EMAIL_DATE_FORMAT, date, sizeof(date));
 
-    added = added
-         && _http_service_email_string_add(&payload, "Date: ")
-         && _http_service_email_string_add(&payload, date)
-         && _http_service_email_string_add(&payload, "\r\n")
-         && _http_service_email_string_add(&payload, "Message-ID: ")
-         && _http_service_email_string_add(&payload, render->message_id)
-         && _http_service_email_string_add(&payload, "\r\n")
-         && _http_service_email_string_add(&payload, "MIME-Version: 1.0\r\n")
-         && _http_service_email_custom_headers_add(&payload, &message->headers)
-         && _http_service_email_body_add(&payload, message, render->boundary);
+    added = added                                                               &&
+            _http_service_email_string_add(&payload, "Date: ")                  &&
+            _http_service_email_string_add(&payload, date)                      &&
+            _http_service_email_string_add(&payload, "\r\n")                    &&
+            _http_service_email_string_add(&payload, "Message-ID: ")            &&
+            _http_service_email_string_add(&payload, render->message_id)        &&
+            _http_service_email_string_add(&payload, "\r\n")                    &&
+            _http_service_email_string_add(&payload, "MIME-Version: 1.0\r\n")   &&
+            _http_service_email_custom_headers_add(&payload, &message->headers) &&
+            _http_service_email_body_add(&payload, message, render->boundary);
 
     /* `added` is the half a size test cannot see: an allocator that refuses
      * PART of the way through leaves a well-formed prefix - headers and no body,
@@ -2562,15 +2548,15 @@ HTTP_Service_Email_Result http_service_email_send(HTTP_Service_Email const *cons
      * in DOT-STUFFED, because that is what libcurl puts on the wire and what the
      * transcript claims to be. */
     if (self->transport_sink != nullptr) {
-        bool const captured = _http_service_email_string_add(self->transport_sink, "MAIL FROM:<")
-                           && _http_service_email_string_add_2(self->transport_sink, from)
-                           && _http_service_email_string_add(self->transport_sink, ">\r\n")
-                           && _http_service_email_capture_list_add(self->transport_sink, &message->to)
-                           && _http_service_email_capture_list_add(self->transport_sink, &message->cc)
-                           && _http_service_email_capture_list_add(self->transport_sink, &message->bcc)
-                           && _http_service_email_string_add(self->transport_sink, "DATA\r\n")
-                           && _http_service_email_dot_stuffed_add(self->transport_sink, &payload)
-                           && _http_service_email_string_add(self->transport_sink, ".\r\n");
+        bool const captured = _http_service_email_string_add(self->transport_sink, "MAIL FROM:<")       &&
+                              _http_service_email_string_add_2(self->transport_sink, from)              &&
+                              _http_service_email_string_add(self->transport_sink, ">\r\n")             &&
+                              _http_service_email_capture_list_add(self->transport_sink, &message->to)  &&
+                              _http_service_email_capture_list_add(self->transport_sink, &message->cc)  &&
+                              _http_service_email_capture_list_add(self->transport_sink, &message->bcc) &&
+                              _http_service_email_string_add(self->transport_sink, "DATA\r\n")          &&
+                              _http_service_email_dot_stuffed_add(self->transport_sink, &payload)       &&
+                              _http_service_email_string_add(self->transport_sink, ".\r\n");
 
         /* The sink is the caller's String and may be arena-backed: a refusal
          * partway leaves a TRUNCATED transcript, and reporting success on one
@@ -2839,10 +2825,10 @@ bool http_service_email_valid(HTTP_Service_Email const *const self) {
 
     error_check_null(LOG_METADATA, "self", (void*) self);
 
-    bool const success = _http_service_email_url_ok(string_get_data(&self->url), string_get_size(&self->url))
-                      && _http_service_email_string_address_ok(&self->from)
-                      && self->connect_timeout_ms > 0
-                      && self->timeout_ms > 0;
+    bool const success = _http_service_email_url_ok(string_get_data(&self->url), string_get_size(&self->url)) &&
+                         _http_service_email_string_address_ok(&self->from)                                   &&
+                         self->connect_timeout_ms > 0                                                         &&
+                         self->timeout_ms > 0;
 
     trace_log_pop();
 

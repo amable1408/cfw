@@ -3,13 +3,16 @@
  *  --------------------------------------------------------------------------
  *  @file    query.h
  *  @brief   Pure parsers and builders for URL query strings and percent-encoded values.
- *  @version 0.3.2
+ *  @version 0.4.0
  *  @license MIT (see LICENSE file)
  *
  *  General-purpose (no project coupling). Extracts a raw value for a key from a
  *  query string, percent-decodes an encoded value, and percent-ENCODES a value
  *  (or a whole application/x-www-form-urlencoded body) back. Nothing here
- *  mutates its inputs. Two tiers: the reading side allocates in the caller
+ *  mutates its inputs. Three tiers: the zero-allocation reading side
+ *  (http_query_next, http_query_find, http_query_decode) answers VIEW
+ *  slices or decodes into a caller buffer and is always available; the
+ *  allocating reading side (alloc_get, alloc_decode) copies into the caller
  *  supplied arena and so exists only under ARENA_IMPLEMENTATION; the writing
  *  side appends to a caller-owned String, needs no arena, and is always
  *  available.
@@ -48,31 +51,25 @@
  *      "%00" is never silently swallowed by a later char_length on the result.
  *    - http_query_alloc_form_decode / _2: the same decoder with the
  *      application/x-www-form-urlencoded convention layered on ("+" -> space).
- *      A later round moves http/service/body_parser's own hand-rolled
- *      +/percent decode onto this pair instead of keeping a second copy.
- *
- *  Planned for 0.4.0 (deferred 2026-09-06; spec addendum 2026-10-12 - a NOTE
- *  ONLY, none of these is declared or implemented yet):
- *    - bool http_query_next(char const *const query, USize const query_size,
- *          USize *const cursor, Str *const out_name, Str *const out_value);
- *      the pair enumerator: raw VIEW slices into `query` (str_init_static),
- *      no allocation, `cursor` advanced past each pair.
- *    - bool http_query_find_2(char const *const query, USize const query_size,
- *          char const *const key, USize const key_size, Str *const out_value);
- *      a zero-allocation VIEW lookup that, unlike alloc_get, distinguishes a
+ *    - http_query_next (0.4.0): the pair enumerator. Walks a sized query one
+ *      "name=value" pair at a time through a caller-held cursor, answering raw
+ *      (NOT decoded) VIEW slices into the query - no allocation, no copy.
+ *      http/service/body_parser's form parser walks its bodies with it.
+ *    - http_query_find (0.4.0): the zero-allocation lookup. Same match as
+ *      alloc_get, answered as a VIEW, and - unlike alloc_get - it tells a
  *      present-but-empty "key=" (true, empty slice) from an absent key (false).
- *    - USize http_query_decode_3(char *const dest, USize const dest_size,
- *          char const *const encoded, USize const encoded_size,
- *          bool const plus_as_space);
- *      a caller-buffer decoder, whole-or-nothing (dest_size >= encoded_size + 1
- *      always fits).
- *    Why all three: the enumerator was deferred until the body_parser
- *    de-duplication pays for it, and body_parser decodes INTO
- *    allocator_try_borrow'd blocks that map_char_char_add then adopts - every
- *    decoder here allocates in an Arena, so the enumerator alone would hand it
- *    slices it still could not decode without its own copy. find_2 serves the
- *    lookups that allocate a value only to compare or int-parse it. All three
- *    share _http_query_find's scanner and are additive (MINOR).
+ *      Serves the lookups that used to allocate a value only to compare or
+ *      int-parse it. Both match a key against a pair's WHOLE name (the bytes
+ *      before its first '='), never a raw prefix of the pair - see Error
+ *      Handling for the one behaviour this changed in 0.4.0.
+ *    - http_query_decode (0.4.0): the caller-buffer decoder, both conventions
+ *      behind one flag, whole-or-nothing - a dest too small for the decoded
+ *      value is refused, never silently truncated. It is THE decoder: the
+ *      alloc_decode family allocates and calls it, and body_parser decodes into
+ *      its own map-adopted blocks with it, so the percent rules exist once.
+ *    These three need no arena and are always available. Scanning lives in
+ *    http_query_next and decoding in http_query_decode; alloc_get and
+ *    alloc_decode are thin allocate-and-copy layers over them.
  *
  *  Usage Examples:
  *    @code
@@ -98,6 +95,32 @@
  *    - Contract violations - a null Str or String key handle to _3/_4, or a
  *      null out_size to decode_2/form_decode_2 - go through error_check_null,
  *      which LOGS AND ABORTS the process.
+ *    - The zero-allocation tier (0.4.0) aborts through error_check_null on its
+ *      CONTRACT pointers only: a null cursor/out_name/out_value, and a null
+ *      query, key, dest or encoded while its paired size says bytes live there.
+ *      Every size is a value: a zero-size query, key, dest or encoded may be
+ *      null. Its refusals are values too - http_query_next answers false once
+ *      no pair is left, http_query_find false for an absent key, and
+ *      http_query_decode USIZE_MAX (with dest[0] = '\0' when dest_size > 0)
+ *      for a dest that cannot hold the whole decoded value plus terminator.
+ *    - The zero-allocation tier has TWO NUL rules, chosen per function.
+ *      http_query_find reads a query up to its first NUL and skips one leading
+ *      '?' (the C-string rule alloc_get always had), so it can be handed a
+ *      fixed-capacity buffer such as http_server_request_query_copy's by its
+ *      capacity. http_query_next and http_query_decode treat every one of their
+ *      size bytes as data - a raw NUL is a byte like any other and no '?' is
+ *      skipped - so for a NUL-terminated or fixed-capacity buffer pass
+ *      char_length(buffer), not its capacity: over a zero-padded 256-byte
+ *      buffer holding "a=1", next answers value "1" followed by 252 NUL bytes.
+ *      http_server_request_query_copy answers a bool, not a length, so nothing
+ *      hands the caller that size for free.
+ *    - Key match (0.4.0, a behaviour change for alloc_get_1..5): a key matches
+ *      a pair's whole name, the bytes before the pair's first '=' (and a pair
+ *      with no '=' never matches). Through 0.3.x alloc_get matched the key's
+ *      raw bytes at a pair's start followed by '=', so a key that itself
+ *      carried '=' or '&' matched across them - "a=b" found "c" in "a=b=c",
+ *      "&b" found "1" in "a&&b=1". Both now answer absent. Keys free of '='
+ *      and '&' answer exactly as before.
  *    - Every other absence is a VALUE, refused (nullptr) rather than aborted:
  *      a null/empty query, a null/empty key (the char* forms, or an empty
  *      Str/String whose data is null), a key not present, and an empty value
@@ -151,7 +174,14 @@
  *      out/body Strings. A single String is not internally synchronized.
  *
  *  Memory Management:
- *    - Reading side: arena tier only (no heap/free-pairing API): every
+ *    - Zero-allocation tier: nothing is allocated. http_query_next and
+ *      http_query_find answer VIEW Strs (owned == false) into the caller's
+ *      query - they live exactly as long as that buffer, str_uninit on them is
+ *      a harmless no-op, and they are READ-ONLY: never hand one to Str's
+ *      in-place mutators (str_lower, str_replace_*, ...), which write through
+ *      a view and here would write into the caller's const query.
+ *      http_query_decode writes only inside dest[0..dest_size).
+ *    - Allocating reading side: arena tier only (no heap/free-pairing API): every
  *      allocation comes from the caller-supplied `allocator` and lives exactly
  *      as long as that arena; there is nothing to free or uninit here.
  *    - Writing side: nothing is allocated by this module. The caller owns the
@@ -159,7 +189,12 @@
  *      string_uninit'd by the caller as usual.
  *
  *  Performance Characteristics:
- *    - Reading side: one pass over the query and one arena allocation per call.
+ *    - Zero-allocation tier: http_query_next is one pass over the pair it
+ *      answers; http_query_find one pass over the query (plus a NUL-bounding
+ *      pass); http_query_decode one pass, or two when dest is not strictly
+ *      larger than encoded (it measures before writing so a refusal is whole).
+ *    - Allocating reading side: the matching zero-allocation pass plus one
+ *      arena allocation per call.
  *    - Writing side: one pass over the input, producing 1 or 3 output bytes per
  *      input byte; the encoded result is at most 3x the input, so a body built
  *      from N bytes of names and values costs O(N) with the String's own
@@ -171,8 +206,11 @@
  *
  *  Dependencies (Deps):
  *    - arena (arena.h); char (char_alloc_new_1/_3, char_raw_to_hex, char_length -
- *      chained transitively via container/str, not included directly here);
- *      container/str, container/string (key tiers _3/_4; on the writing side
+ *      included directly by query.c, since char.h declares no types this
+ *      header's API names);
+ *      container/str (str_init_1/str_init_3 for the VIEWs next and find
+ *      answer, str_get_data/str_get_size; the _3 key tier);
+ *      container/string (the _4 key tier; on the writing side
  *      string_add_last_2, string_reserve, and
  *      string_get_data/string_get_size/string_get_capacity - the alias guard
  *      measures the destination's whole allocation, the separator rule reads
@@ -180,7 +218,7 @@
  *      actually reached);
  *      log/tracelog/memory (trace_log_push/pop,
  *      memory_empty - chained transitively via arena -> memory -> error ->
- *      tracelog -> log, so query.c includes only query.h).
+ *      tracelog -> log; query.c adds only char.h beside query.h).
  * ============================================================================
  */
 #ifndef HTTP_QUERY_H
@@ -259,6 +297,34 @@ bool http_query_add_1(String *const out, char const *const name, char const *con
 bool http_query_add_2(String *const out, char const *const name, USize const name_size, char const *const value, USize const value_size);
 
 /**
+ * @brief Percent-decode ("%XX" -> byte) a sized value into a caller-owned buffer, whole or
+ *        not at all. The single decoder of this module: http_query_alloc_decode(_2) and
+ *        http_query_alloc_form_decode(_2) allocate and call it.
+ * @param dest          Caller buffer receiving the decoded bytes and a terminating NUL. May
+ *                      be null only when dest_size is 0. May be `encoded` itself (an
+ *                      in-place decode is safe: writing never outruns reading); any OTHER
+ *                      overlap with `encoded` is undefined.
+ * @param dest_size     Capacity of dest in bytes, terminator included. A dest_size strictly
+ *                      larger than encoded_size always fits (decoding never grows a value).
+ * @param encoded       Encoded bytes, not necessarily NUL-terminated; a raw NUL among them
+ *                      is decoded like any other byte. May be null only when encoded_size
+ *                      is 0.
+ * @param encoded_size  Length of encoded in bytes. 0 is a legal empty value. Every byte is
+ *                      data, so for a NUL-terminated or fixed-capacity buffer pass
+ *                      char_length(buffer), not its capacity.
+ * @param plus_as_space true for the application/x-www-form-urlencoded convention ('+' ->
+ *                      space; "%2B" stays a literal '+'), false for a plain query value.
+ *                      A malformed escape - '%' not followed by two hex digits, or with
+ *                      fewer than two bytes left - passes through as a literal '%'.
+ * @return The decoded byte count (which, with a decoded "%00", is larger than char_length
+ *         of the result), dest NUL-terminated at that index. USIZE_MAX when dest cannot hold
+ *         the whole decoded value plus its terminator - a dest_size of 0 included - with
+ *         dest[0] set to '\0' when dest_size > 0 and nothing else written: never a
+ *         truncated decode.
+ */
+USize http_query_decode(char *const dest, USize const dest_size, char const *const encoded, USize const encoded_size, bool const plus_as_space);
+
+/**
  * @brief Percent-encode a NUL-terminated value per RFC 3986 and APPEND it to
  *        `out`. The unreserved set (A-Z a-z 0-9 '-' '.' '_' '~') passes
  *        through; every other byte becomes "%XX" with uppercase hex digits, a
@@ -289,6 +355,33 @@ bool http_query_encode_1(String *const out, char const *const value);
  * @return Same contract as http_query_encode_1.
  */
 bool http_query_encode_2(String *const out, char const *const value, USize const value_size);
+
+/**
+ * @brief Find a key's raw (not decoded) value in a sized query string without allocating,
+ *        answering it as a VIEW slice. Same match as http_query_alloc_get_5, but a
+ *        present-but-empty "key=" is told apart from an absent key.
+ * @param query      Query bytes, not necessarily NUL-terminated. Read up to query_size or
+ *                   its first NUL, whichever comes first (the alloc_get rule), and one
+ *                   leading '?' is skipped - unlike http_query_next and http_query_decode,
+ *                   which read every byte as data. So a fixed-capacity, zero-padded buffer
+ *                   (http_server_request_query_copy's) may be passed by its capacity here.
+ *                   May be null only when query_size is 0.
+ * @param query_size Length of query in bytes; 0 finds nothing.
+ * @param key        Key to find, matched RAW (a percent-encoded name only matches its own
+ *                   encoded spelling) against a pair's WHOLE name - the bytes before the
+ *                   pair's first '=' - never a prefix of it or of the pair: "a" does not
+ *                   find "ab=1", and a key that itself contains '=' or '&' finds nothing
+ *                   ("a=b" is absent from "a=b=c", whose name is "a"). The comparison stops
+ *                   at key's own NUL, so a key_size longer than key's real extent fails
+ *                   closed and never reads past it. May be null only when key_size is 0. An
+ *                   empty key finds a pair with an empty name ("=v").
+ * @param key_size   Length of key in bytes.
+ * @param out_value  Set to a read-only VIEW of the first match's value - possibly empty, for
+ *                   "key=" - or to the EMPTY Str when the key is absent. Must be non-null.
+ * @return true when the key is present (first match wins), its value empty or not; false
+ *         when it is absent. A pair with no '=' ("key") is not a match.
+ */
+bool http_query_find(char const *const query, USize const query_size, char const *const key, USize const key_size, Str *const out_value);
 
 /**
  * @brief Append one "name=value" pair to an application/x-www-form-urlencoded
@@ -324,6 +417,55 @@ bool http_query_form_add_1(String *const body, char const *const name, char cons
  * @return Same contract as http_query_form_add_1.
  */
 bool http_query_form_add_2(String *const body, char const *const name, USize const name_size, char const *const value, USize const value_size);
+
+/**
+ * @brief Answer the next "name=value" pair of a sized query string or form body as raw
+ *        (NOT decoded) VIEW slices, advancing a caller-held cursor past it. Allocates and
+ *        copies nothing; decode a slice with http_query_decode when the decoded form is
+ *        wanted.
+ *
+ * The walk is byte-transparent, unlike find/alloc_get: every one of the query_size bytes
+ * is data - a raw NUL does not end the query, and a leading '?' is NOT skipped (it stays part
+ * of the first name; pass query + 1 to skip it). Pairs are split on '&'; empty segments ("&&",
+ * a leading or trailing '&') are skipped, never answered. Within a pair the name runs to the
+ * FIRST '=' and the value is everything after it, further '=' included ("a==b" is name "a",
+ * value "=b").
+ *
+ * Telling "k" from "k=" (contract): both answer a ZERO-SIZE value, and out_value's data is
+ * nullptr exactly when the pair had no '='. "k" answers the EMPTY Str (data nullptr); "k="
+ * answers a non-null, zero-size VIEW (pointing just past the '='). So
+ * `memory_empty(str_get_data(&value))` is THE "no '='" test (the size cannot tell the two
+ * apart), and next never normalises an empty view to nullptr. "=" alone answers an empty, non-null name and an empty,
+ * non-null value: a present pair with an empty name and an empty value.
+ *
+ * @code
+ * USize cursor = 0;
+ * Str   name   = str_init_1();
+ * Str   value  = str_init_1();
+ *
+ * while (http_query_next(body, body_size, &cursor, &name, &value)) {
+ *     // name/value are VIEWs into body: str_get_data + str_get_size, never char_length
+ * }
+ * @endcode
+ *
+ * @param query      Query or body bytes, every one of them data: a raw NUL does not end the
+ *                   walk. May be null only when query_size is 0.
+ * @param query_size Length of query in bytes. For a NUL-terminated or fixed-capacity buffer
+ *                   (http_server_request_query_copy's) pass char_length(buffer), not its
+ *                   capacity - the zero padding would otherwise be read as data.
+ * @param cursor     Position to resume from: 0 to start, then whatever the previous call
+ *                   left. Advanced past the answered pair and the '&' that ended it. When no
+ *                   pair is left it is set to query_size - or left untouched if it was already
+ *                   past query_size. Must be non-null.
+ * @param out_name   Set to a read-only VIEW of the pair's name (possibly empty, for "=v"), or
+ *                   to the EMPTY Str when no pair is left. Must be non-null.
+ * @param out_value  Set to a read-only VIEW of the pair's value (possibly empty, data still
+ *                   non-null, for "k="), or to the EMPTY Str (data nullptr) for a pair
+ *                   without '=' and when no pair is left. Must be non-null.
+ * @return true when a pair was answered; false when none is left (an empty query, an
+ *         all-'&' tail, or a cursor at or past query_size).
+ */
+bool http_query_next(char const *const query, USize const query_size, USize *const cursor, Str *const out_name, Str *const out_value);
 
 #ifdef ARENA_IMPLEMENTATION
 

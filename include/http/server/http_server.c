@@ -1,18 +1,41 @@
 #include <http/server/http_server.h>
 
+#include <http/headers/headers.h>
+
 /*==============================================================================
  * MARK: - Private Constants
  *============================================================================*/
-#define _HTTP_SERVER_CONTENT_TYPE_MAX_SIZE    256
-#define _HTTP_SERVER_FORWARDED_MAX_HOPS       32
-#define _HTTP_SERVER_FORWARDED_MAX_SIZE       1024
-#define _HTTP_SERVER_PAYLOAD_PRESIZE_MAX_SIZE 1048576
-#define _HTTP_SERVER_PEER_ADDRESS_MAX_SIZE    64
-#define _HTTP_SERVER_REQUEST_METHOD_SIZE      16
-#define _HTTP_SERVER_RESPONSE_HEADER_SIZE     2048
-#define _HTTP_SERVER_ROUTE_REGEX_MAX_SIZE     512
-#define _HTTP_SERVER_SERVICE_TIMEOUT_MS       50
-#define _HTTP_SERVER_VHOST_NAME               "cfw"
+#define _HTTP_SERVER_CONTENT_TYPE_MAX_SIZE     256
+/* How many chunk-sized windows of reader drain one per-chunk content timeout must cover.
+ * Two, not one: when the kernel takes a chunk only in part, lws keeps the tail in its buflist
+ * and drains it on the next write-readiness by itself, WITHOUT raising HTTP_WRITEABLE - so
+ * the callback that writes the next chunk, and re-arms the timer, runs later than one window
+ * of drain. Measured 2026-10-14 on WSL2 with one window (65 s): 2 of 74 readers at 1 KiB/s and
+ * 15 of 168 at 1.5 KiB/s were dropped, all at ~66 s. With two (129 s) and no TCP memory
+ * pressure, 0 of 96 and 0 of 120 were; the observed re-arm gap there is nearer one window
+ * (a re-write each time ~60 KB is acked), so two is margin, not an exact fit. */
+#define _HTTP_SERVER_FILE_STREAM_DRAIN_WINDOWS 2
+/* The slowest average rate, in bytes per second, a send_file_handle reader may take a chunk
+ * at: the per-chunk content timeout grows with the bytes just written, scaled by
+ * _HTTP_SERVER_FILE_STREAM_DRAIN_WINDOWS above, so a reader at this rate still drains them
+ * in time - 129 s for a full 64 KiB chunk. A slower one is dropped. That is the timer's
+ * arithmetic; the floor the docs state in http_server.h is the measured one. */
+#define _HTTP_SERVER_FILE_STREAM_MIN_RATE      1024
+/* The context's timeout_secs (both context builders assign it, so libwebsockets' own
+ * waits and this module's never drift apart) and the FLOOR of a streamed chunk's
+ * PENDING_TIMEOUT_HTTP_CONTENT. lws's own file serving re-arms that timeout per 4 KiB
+ * fragment; send_file_handle arms it once per 64 KiB chunk, so a chunk's window is
+ * scaled by _HTTP_SERVER_FILE_STREAM_MIN_RATE above, never this alone. */
+#define _HTTP_SERVER_FILE_STREAM_TIMEOUT_SECS  20
+#define _HTTP_SERVER_FORWARDED_MAX_HOPS        32
+#define _HTTP_SERVER_FORWARDED_MAX_SIZE        1024
+#define _HTTP_SERVER_PAYLOAD_PRESIZE_MAX_SIZE  1048576
+#define _HTTP_SERVER_PEER_ADDRESS_MAX_SIZE     64
+#define _HTTP_SERVER_REQUEST_METHOD_SIZE       16
+#define _HTTP_SERVER_RESPONSE_HEADER_SIZE      2048
+#define _HTTP_SERVER_ROUTE_REGEX_MAX_SIZE      512
+#define _HTTP_SERVER_SERVICE_TIMEOUT_MS        50
+#define _HTTP_SERVER_VHOST_NAME                "cfw"
 
 /*==============================================================================
  * MARK: - Private Types
@@ -77,15 +100,25 @@ struct HTTP_Server_Router {
     Thread              thread;
 };
 
+/** @brief A file window http_server_response_send_file_handle is streaming on one connection. */
 typedef struct {
-    char    *payload;
-    USize   payload_size;
-    USize   payload_capacity;
+    File    *file;          /* owned while non-null; closed on completion, close, or reset */
+    USize   remaining;      /* bytes of the window not yet handed to lws_write             */
+} _HTTP_Server_File_Stream;
+
+typedef struct {
+    char                        *payload;
+    USize                       payload_size;
+    USize                       payload_capacity;
     /* What the request's Content-Length declared, carried from the header callback to the
      * first body callback. The one allocation it sizes is made THERE, not on the header:
      * pre-sizing before a byte of body arrived let a header-only request commit up to the
      * presize ceiling per connection and then stall, which is slowloris with amplification. */
-    USize   payload_declared_size;
+    USize                       payload_declared_size;
+    /* The body of a send_file_handle response outlives the route that started it (the
+     * response is the dispatcher's stack object), so it lives here, with the connection:
+     * served on LWS_CALLBACK_HTTP_WRITEABLE, released by _http_server_stream_reset. */
+    _HTTP_Server_File_Stream    stream;
 } HTTP_Session;
 
 /*==============================================================================
@@ -140,18 +173,76 @@ static I32 _http_server_header_token(HTTP_Server_Header const header) {
 /**
  * @brief Reject a header name or value that could split the response.
  *
- * Refuses every C0 control byte and DEL, which covers CR and LF - the two that let a
- * caller's data close the header block early and inject a whole response of its own.
- * HTAB is refused with them: it is legal inside a folded value that nothing here emits,
- * and allowing it buys a caller nothing while widening what reaches the wire.
+ * The one control-byte check every header path shares: header_add's name and value, every
+ * sender's content type, and each line of a raw block. Refuses every C0 control byte and DEL,
+ * which covers CR and LF - the two that let a caller's data close the header block early and
+ * inject a whole response of its own. HTAB is RFC 9110 field-value whitespace and passes when
+ * tab_allowed says so; header_add refuses it, since it builds the line itself and allowing a
+ * tab there buys a caller nothing while widening what reaches the wire.
  */
-static bool _http_server_header_field_valid(char const *const value) {
-    for (USize index = 0; value[index] != '\0'; index += 1) {
+static bool _http_server_header_value_valid(char const *const value, USize const size, bool const tab_allowed) {
+    for (USize index = 0; index < size; index += 1) {
         Byte const character = (Byte) value[index];
 
-        if (character < 0x20 || character == 0x7F) {
+        if ((character < 0x20 && !(tab_allowed && character == '\t')) || character == 0x7F) {
             return false;
         }
+    }
+
+    return true;
+}
+
+/**
+ * @brief Answer whether a raw header block is a sequence of well-formed "Name: value\r\n" lines.
+ *
+ * Every line needs an RFC 9110 token name, the ": " separator, a value that passes
+ * _http_server_header_value_valid, and its own CRLF. Each refusal below is a separate shape:
+ * a bare LF or a bare CR (a line break the client honours and this check would not see as
+ * one), a block whose last line has no CRLF (the next block appended would continue it), a
+ * missing ": ", an empty or non-token name (an empty line ENDS the header block), and a
+ * control byte in a value. An empty block holds no line and is answered true.
+ */
+static bool _http_server_header_lines_valid(char const *const headers, USize const size) {
+    USize line_start = 0;
+
+    while (line_start < size) {
+        USize line_end = line_start;
+
+        while (line_end < size && headers[line_end] != '\r' && headers[line_end] != '\n') {
+            line_end += 1;
+        }
+
+        if (line_end == size) {
+            return false;
+        }
+
+        if (headers[line_end] == '\n') {
+            return false;
+        }
+
+        if (line_end + 1 == size || headers[line_end + 1] != '\n') {
+            return false;
+        }
+
+        USize colon = line_start;
+
+        while (colon < line_end && headers[colon] != ':') {
+            colon += 1;
+        }
+
+        if (!http_headers_token_valid_2(headers + line_start, colon - line_start)) {
+            return false;
+        }
+
+        if (colon + 1 >= line_end || headers[colon + 1] != ' ') {
+            return false;
+        }
+
+        if (!_http_server_header_value_valid(headers + colon + 2, line_end - colon - 2, true)) {
+            return false;
+        }
+
+        line_start = line_end + 2;
     }
 
     return true;
@@ -504,8 +595,19 @@ static void _http_server_reject_payload(HTTP_Server const *const self, struct lw
     lws_return_http_status(wsi, HTTP_SERVER_STATUS_CODE_REQ_ENTITY_TOO_LARGE, nullptr);
 }
 
+/** @brief Release a file window that is still streaming, if any. Idempotent: a released stream has no file. */
+static void _http_server_stream_reset(_HTTP_Server_File_Stream *const self) {
+    error_check_null(LOG_METADATA, "self", (void*) self);
+
+    if (!memory_empty(self->file)) {
+        file_close(&self->file);
+    }
+
+    self->remaining = 0;
+}
+
 /** @brief Release a keep-alive session's accumulated body AND the counters that describe it. */
-static void _http_server_session_reset(HTTP_Session *const self) {
+static void _http_server_payload_reset(HTTP_Session *const self) {
     if (self == nullptr) {
         return;
     }
@@ -526,6 +628,22 @@ static void _http_server_session_reset(HTTP_Session *const self) {
     self->payload_size          = 0;
     self->payload_capacity      = 0;
     self->payload_declared_size = 0;
+}
+
+/**
+ * @brief Release everything a connection's session holds: the accumulated body and a file
+ *        stream that never finished. The ONE place a send_file_handle handle is released
+ *        for a connection that did not reach its last chunk - LWS_CALLBACK_CLOSED_HTTP (a
+ *        client gone mid-stream) and the refusal paths that close the connection both come
+ *        here; the stream's own completion releases it in the WRITEABLE branch.
+ */
+static void _http_server_session_reset(HTTP_Session *const self) {
+    if (memory_empty(self)) {
+        return;
+    }
+
+    _http_server_payload_reset(self);
+    _http_server_stream_reset(&self->stream);
 }
 
 /*
@@ -780,7 +898,90 @@ static I32 _http_server_callback_http(struct lws *wsi, enum lws_callback_reasons
         }
 
         case LWS_CALLBACK_HTTP_WRITEABLE: {
-            break;
+            /* Not ours unless a send_file_handle window is in flight: lws_callback_http_dummy
+             * below services lws_serve_http_file's own fragments. */
+            if (memory_empty(session) || memory_empty(session->stream.file)) {
+                break;
+            }
+
+            /* INVARIANT: never more than one chunk in lws's output buflist per connection.
+             * lws_write on an http wsi never returns short - it buflists the unsent tail and
+             * schedules its own WRITEABLE - and a second lws_write while that tail is pending
+             * APPENDS to the buflist, which is the unbounded-residency shape a buffered body
+             * has. So: choked -> wait. Do not "simplify" this check away. */
+            if (lws_send_pipe_choked(wsi)) {
+                lws_callback_on_writable(wsi);
+
+                return 0;
+            }
+
+            /* The peer's declared send window (HTTP/2 flow control); -1 means no guidance,
+             * which is every HTTP/1 connection. A zero window is a wait, never a zero-byte
+             * write. remaining is never 0 here: an empty window completes synchronously. */
+            lws_fileofs_t const allowance = lws_get_peer_write_allowance(wsi);
+
+            if (allowance == 0) {
+                lws_callback_on_writable(wsi);
+
+                return 0;
+            }
+
+            USize want = math_min_u(session->stream.remaining, HTTP_SERVER_FILE_CHUNK_SIZE);
+
+            if (allowance > 0 && (USize) allowance < want) {
+                want = (USize) allowance;
+            }
+
+            /* One chunk on the stack per callback: nothing stays resident per connection. */
+            Byte chunk[LWS_PRE + HTTP_SERVER_FILE_CHUNK_SIZE] = DEFAULT_INITIALIZATION;
+
+            USize const got = file_read_1(session->stream.file, chunk + LWS_PRE, 1, want);
+
+            /* Truncated under the handle: the Content-Length already on the wire cannot be
+             * honoured, and closing is the only honest answer - what lws's own file serving
+             * does. A file that GREW is served to the size promised and no further. */
+            if (got != want) {
+                log_message_2(LOG_LEVEL_WARN, LOG_METADATA,
+                              "http_server: a streamed file shrank under its handle (%llu bytes short); closing the connection",
+                              (unsigned long long) (want - got));
+                _http_server_stream_reset(&session->stream);
+
+                return -1;
+            }
+
+            session->stream.remaining -= got;
+
+            bool const last = session->stream.remaining == 0;
+
+            if (lws_write(wsi, chunk + LWS_PRE, got, last ? LWS_WRITE_HTTP_FINAL : LWS_WRITE_HTTP) < 0) {
+                _http_server_stream_reset(&session->stream);
+
+                return -1;
+            }
+
+            /* Scaled to the chunk, never the fixed floor alone. lws re-arms no timeout while it
+             * drains a buflisted tail and does not call this branch until that tail is gone, so
+             * the clock started here must cover draining the WHOLE chunk just written: a fixed
+             * 20 s dropped every reader under ~3.2 KiB/s (64 KiB / 20 s). And it must cover it
+             * TWICE over (_HTTP_SERVER_FILE_STREAM_DRAIN_WINDOWS): a tail the kernel took only in
+             * part drains without a WRITEABLE, so the next re-arm lands later than one window of
+             * drain - one window dropped Linux readers at 1-1.5 KiB/s at ~66 s. The + 1
+             * rounds the division up to the next whole second. */
+            USize const timeout_secs = math_max_u(_HTTP_SERVER_FILE_STREAM_TIMEOUT_SECS, (_HTTP_SERVER_FILE_STREAM_DRAIN_WINDOWS * got) / _HTTP_SERVER_FILE_STREAM_MIN_RATE + 1);
+
+            lws_set_timeout(wsi, PENDING_TIMEOUT_HTTP_CONTENT, (I32) timeout_secs);
+
+            if (!last) {
+                lws_callback_on_writable(wsi);
+
+                return 0;
+            }
+
+            _http_server_stream_reset(&session->stream);
+
+            /* Nonzero asks for the close; a keep-alive connection stays usable for its next
+             * transaction, exactly as the SUCCESS path of LWS_CALLBACK_HTTP. */
+            return lws_http_transaction_completed(wsi);
         }
 
         case LWS_CALLBACK_HTTP_BODY: {
@@ -902,7 +1103,11 @@ static I32 _http_server_callback_http(struct lws *wsi, enum lws_callback_reasons
 
             _HTTP_Server_Dispatch_Status const result = _http_server_dispatch_request(self, wsi, method, uri_buffer, (USize) uri_buffer_size, session->payload, session->payload_size);
 
-            _http_server_session_reset(session);
+            /* The PAYLOAD only: the route may have just handed a file to send_file_handle,
+             * whose stream the session now owns and the WRITEABLE branch below serves. A
+             * full session reset here closed that handle before its first chunk, and the
+             * connection then hung on a Content-Length it could never deliver. */
+            _http_server_payload_reset(session);
 
             if (result == _HTTP_SERVER_DISPATCH_STATUS_ERROR) {
                 return -1;
@@ -923,6 +1128,15 @@ static I32 _http_server_callback_http(struct lws *wsi, enum lws_callback_reasons
         }
 
         case LWS_CALLBACK_CLOSED_HTTP: {
+            _http_server_session_reset(session);
+            break;
+        }
+
+        case LWS_CALLBACK_HTTP_DROP_PROTOCOL: {
+            /* The transaction is over and libwebsockets frees this user_space on a
+             * keep-alive rebind right after this callback (lws_bind_protocol), so a stream
+             * the transaction left behind - a route that un-set file_served after a
+             * successful take-over - is released here rather than freed with its session. */
             _http_server_session_reset(session);
             break;
         }
@@ -1160,6 +1374,81 @@ static bool _http_server_response_add_extra_headers(HTTP_Server_Response *const 
     trace_log_pop();
 
     return success;
+}
+
+/**
+ * @brief Write a response's header block: status line, Content-Type, Content-Length (unless
+ *        no_body), every header queued with header_add / header_add_raw, and the terminator.
+ *        One builder for send_2 and send_file_handle, so the two never drift.
+ * @return true with headers_sent set and the status recorded; false - logged, write_success
+ *         false, nothing written - when content_type carries CR, LF or a control byte other than
+ *         HTAB, when the block does not fit _HTTP_SERVER_RESPONSE_HEADER_SIZE, or when the write
+ *         is short.
+ */
+static bool _http_server_response_headers_write(HTTP_Server_Response *const self, U16 const status_code, char const *const content_type, USize const content_length, bool const no_body) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+    error_check_null(LOG_METADATA, "content_type", (void*) content_type);
+
+    /* Response splitting through the content type: lws_add_http_header_by_token copies the
+     * value verbatim, so a CR or LF in it ends the header block early. Refused here, the one
+     * builder every sender with a content type goes through, BY VALUE - a type is often looked
+     * up from request data (an extension, a stored upload's MIME) - and the WARN echoes none of
+     * it, since the value is the payload. The response fails exactly as an oversized block does:
+     * this is send_2's refusal, which is void and cannot answer false. send_file_handle refuses
+     * the type first in its own refusal block, so for it this check is only the backstop. */
+    if (!_http_server_header_value_valid(content_type, char_length(content_type), true)) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_server_response: refusing a content type that carries CR, LF or a control byte; nothing was written");
+
+        self->write_success = false;
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    self->status_code = status_code;
+
+    Byte    header[_HTTP_SERVER_RESPONSE_HEADER_SIZE + LWS_PRE]  = DEFAULT_INITIALIZATION;
+    Byte    *p                                                   = &header[LWS_PRE];
+    Byte    *const end                                           = &header[sizeof(header) - 1];
+
+    if (lws_add_http_header_status(self->wsi, status_code, &p, end) ||
+        lws_add_http_header_by_token(self->wsi, WSI_TOKEN_HTTP_CONTENT_TYPE, (Byte const*) content_type, (I32) char_length(content_type), &p, end) ||
+        (!no_body && lws_add_http_header_content_length(self->wsi, content_length, &p, end)) ||
+        !_http_server_response_add_extra_headers(self, &p, end) ||
+        lws_finalize_http_header(self->wsi, &p, end)) {
+        /* The header block did not fit (2048 bytes, extra headers included). This used to
+         * return with write_success still true, so the transaction "completed" having
+         * written nothing at all and the client read an empty reply. */
+        log_message_2(LOG_LEVEL_ERROR, LOG_METADATA, "http_server_response: the response headers exceed %d bytes; nothing was written", _HTTP_SERVER_RESPONSE_HEADER_SIZE);
+
+        self->write_success = false;
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    I32 const header_size   = (I32) (p - &header[LWS_PRE]);
+    I32 const write_h       = lws_write(self->wsi, &header[LWS_PRE], (USize) header_size, LWS_WRITE_HTTP_HEADERS);
+
+    if (write_h < 0 || write_h != header_size) {
+        log_message_2(LOG_LEVEL_ERROR, LOG_METADATA, "http_server_response: header write returned %d, expected %d", write_h, header_size);
+
+        self->write_success = false;
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    self->headers_sent = true;
+
+    trace_log_pop();
+
+    return true;
 }
 
 /*==============================================================================
@@ -1575,7 +1864,8 @@ Result http_server_run(HTTP_Server *const self, U16 const port, bool const threa
 
     struct lws_context_creation_info info = DEFAULT_INITIALIZATION;
 
-    info.port = port;
+    info.port           = port;
+    info.timeout_secs   = _HTTP_SERVER_FILE_STREAM_TIMEOUT_SECS;
 
     Result const result = _http_server_start(self, &info, threaded);
 
@@ -1594,6 +1884,7 @@ Result http_server_run_tls(HTTP_Server *const self, char const *const key, char 
     struct lws_context_creation_info info = DEFAULT_INITIALIZATION;
 
     info.port                       = port;
+    info.timeout_secs               = _HTTP_SERVER_FILE_STREAM_TIMEOUT_SECS;
     info.options                    = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
     info.ssl_cert_filepath          = cert;
     info.ssl_private_key_filepath   = key;
@@ -1781,9 +2072,10 @@ bool http_server_response_header_add(HTTP_Server_Response *const self, char cons
 
     /* Response splitting: a CR or LF anywhere in the name or the value ends the header
      * block early, and everything after it is read by the client as a response of its
-     * own. Refused as a value, loudly, rather than written to the wire. */
-    if (!_http_server_header_field_valid(key) || !_http_server_header_field_valid(value)) {
-        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_server_response_header_add: refusing '%s' - the name or value carries CR, LF or a control byte", key);
+     * own. Refused as a value, loudly, rather than written to the wire - and the WARN names
+     * neither, since a CR or LF in the key would forge a log line of its own. */
+    if (!_http_server_header_value_valid(key, char_length(key), false) || !_http_server_header_value_valid(value, char_length(value), false)) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_server_response_header_add: refusing a header whose name or value carries CR, LF or a control byte");
 
         trace_log_pop();
 
@@ -1805,24 +2097,42 @@ bool http_server_response_header_add(HTTP_Server_Response *const self, char cons
         return false;
     }
 
-    http_server_response_header_add_raw(self, buffer, (USize) written);
+    /* The raw path re-checks the line it is handed; a key that passed the control-byte check
+     * above but is not a token ("X Bad", "X:Y") is refused there, and that answer is this one. */
+    bool const added = http_server_response_header_add_raw(self, buffer, (USize) written);
 
     trace_log_pop();
 
-    return true;
+    return added;
 }
 
-void http_server_response_header_add_raw(HTTP_Server_Response *const self, char const *const headers, USize const headers_size) {
+bool http_server_response_header_add_raw(HTTP_Server_Response *const self, char const *const headers, USize const headers_size) {
     trace_log_push(LOG_METADATA);
 
     error_check_null(LOG_METADATA, "self", (void*) self);
     error_check_null(LOG_METADATA, "headers", (void*) headers);
+
+    /* The block reaches the wire line by line through lws_add_http_header_by_name, which
+     * copies each value verbatim: a bare CR or LF, or an empty line, would end the header
+     * block early and let the rest read as a response of its own. Refused whole, by value,
+     * and the WARN echoes none of it - the block is the payload. */
+    if (!_http_server_header_lines_valid(headers, headers_size)) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA,
+                      "http_server_response_header_add_raw: refusing a %llu-byte block - every line must be \"Name: value\" with a token name, its own CRLF and no other control byte",
+                      (unsigned long long) headers_size);
+
+        trace_log_pop();
+
+        return false;
+    }
 
     if (headers_size > 0) {
         string_add_last_2(&self->extra_headers, (char*) headers, headers_size);
     }
 
     trace_log_pop();
+
+    return true;
 }
 
 void http_server_response_set_file_served(HTTP_Server_Response *const self, bool const served) {
@@ -2692,8 +3002,6 @@ void http_server_response_send_2(HTTP_Server_Response *const self, Byte const *c
         return;
     }
 
-    self->status_code = status_code;
-
     /* RFC 9110 SS8.6: a server MUST NOT send Content-Length on 1xx or 204, and MUST NOT
      * on 304 unless it equals the 200's length - which send_2 never knows, so absence is
      * the only correct answer. All three also carry no body, even if the caller passed
@@ -2702,41 +3010,11 @@ void http_server_response_send_2(HTTP_Server_Response *const self, Byte const *c
                           status_code == HTTP_SERVER_STATUS_CODE_NO_CONTENT ||
                           status_code == HTTP_SERVER_STATUS_CODE_NOT_MODIFIED;
 
-    Byte    header[_HTTP_SERVER_RESPONSE_HEADER_SIZE + LWS_PRE]  = DEFAULT_INITIALIZATION;
-    Byte    *p                                                   = &header[LWS_PRE];
-    Byte    *end                                                 = &header[sizeof(header) - 1];
-
-    if (lws_add_http_header_status(self->wsi, status_code, &p, end) ||
-        lws_add_http_header_by_token(self->wsi, WSI_TOKEN_HTTP_CONTENT_TYPE, (Byte const*) content_type, (I32) char_length(content_type), &p, end) ||
-        (!no_body && lws_add_http_header_content_length(self->wsi, data_size, &p, end)) ||
-        !_http_server_response_add_extra_headers(self, &p, end) ||
-        lws_finalize_http_header(self->wsi, &p, end)) {
-        /* The header block did not fit (2048 bytes, extra headers included). This used to
-         * return with write_success still true, so the transaction "completed" having
-         * written nothing at all and the client read an empty reply. */
-        log_message_2(LOG_LEVEL_ERROR, LOG_METADATA, "http_server_response_send_2: the response headers exceed %d bytes; nothing was written", _HTTP_SERVER_RESPONSE_HEADER_SIZE);
-
-        self->write_success = false;
-
+    if (!_http_server_response_headers_write(self, status_code, content_type, data_size, no_body)) {
         trace_log_pop();
 
         return;
     }
-
-    I32 const write_h       = lws_write(self->wsi, &header[LWS_PRE], (USize) (p - &header[LWS_PRE]), LWS_WRITE_HTTP_HEADERS);
-    I32 const header_size   = (I32) (p - &header[LWS_PRE]);
-
-    if (write_h < 0 || write_h != header_size) {
-        log_message_2(LOG_LEVEL_ERROR, LOG_METADATA, "http_server_response_send_2: header write returned %d, expected %d", write_h, header_size);
-
-        self->write_success = false;
-
-        trace_log_pop();
-
-        return;
-    }
-
-    self->headers_sent = true;
 
     /* HEAD asks for the headers a GET would produce and no body at all. Content-Length
      * above still reports the size the body would have had, which is what the method is
@@ -2809,11 +3087,22 @@ bool http_server_response_send_file(HTTP_Server_Response *const self, char const
         return false;
     }
 
-    /* None of the three refusals below writes a byte, so none of them touches
+    /* None of the refusals below writes a byte, so none of them touches
      * write_success. Marking the response failed for a refusal the caller is expected to
      * recover from (its own 404 body, say) turned that fallback reply into a closed
      * connection - and forced the suite to un-set the flag by hand to test the answer.
      * Only a failed lws_serve_http_file, which really did start writing, fails the write. */
+
+    /* lws_serve_http_file adds the content type by token and the caller's block verbatim, the
+     * same two routes to response splitting send_2's builder and header_add_raw close. Both
+     * are refused by value here, before lws sees either, and neither WARN echoes the value. */
+    if (!_http_server_header_value_valid(content_type, char_length(content_type), true)) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_server_response_send_file: refusing '%s' - the content type carries CR, LF or a control byte", path);
+
+        trace_log_pop();
+
+        return false;
+    }
 
     /* The caller's pre-formatted block first, then anything queued with
      * http_server_response_header_add (Cache-Control, etc.), so lws_serve_http_file emits
@@ -2824,6 +3113,16 @@ bool http_server_response_send_file(HTTP_Server_Response *const self, char const
     if (extra_headers != nullptr && extra_headers_size > 0) {
         if (extra_headers_size >= sizeof(extra)) {
             log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_server_response_send_file: refusing - the caller's header block exceeds %llu bytes", (unsigned long long) sizeof(extra) - 1);
+
+            trace_log_pop();
+
+            return false;
+        }
+
+        if (!_http_server_header_lines_valid(extra_headers, extra_headers_size)) {
+            log_message_2(LOG_LEVEL_WARN, LOG_METADATA,
+                          "http_server_response_send_file: refusing '%s' - the caller's header block is not \"Name: value\" lines with token names, CRLFs and no other control byte",
+                          path);
 
             trace_log_pop();
 
@@ -2900,6 +3199,114 @@ bool http_server_response_send_file(HTTP_Server_Response *const self, char const
 
         self->transaction_completed = true;
     }
+
+    trace_log_pop();
+
+    return true;
+}
+
+bool http_server_response_send_file_handle(HTTP_Server_Response *const self, File **const file, USize const start, USize const size, char const *const content_type, U16 const status_code) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+    error_check_null(LOG_METADATA, "file", (void*) file);
+    error_check_null(LOG_METADATA, "*file", (void*) *file);
+    error_check_null(LOG_METADATA, "content_type", (void*) content_type);
+    error_check_wrong_value(LOG_METADATA, "status_code", status_code != HTTP_SERVER_STATUS_CODE_OK && status_code != HTTP_SERVER_STATUS_CODE_PARTIAL_CONTENT);
+
+    /* The same guard send_2 and send_file carry: the header block goes out exactly once. */
+    if (self->headers_sent) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_server_response_send_file_handle: refusing - the response headers are already sent");
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    /* Every refusal below writes nothing and leaves write_success alone, exactly as
+     * send_file's: the caller's own fallback reply (a 404, a 416) still goes out. The
+     * window is request-derived data - static derives it from the Range header - so each
+     * check is BY VALUE; an error_check here would hand a peer an abort. */
+    if (!file_regular(*file)) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_server_response_send_file_handle: refusing - the handle is not a regular file");
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    USize const file_size = file_get_size(*file);
+
+    if (size > USIZE_MAX - start || start + size > file_size) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA,
+                      "http_server_response_send_file_handle: refusing a window of %llu bytes at %llu - the file is %llu bytes",
+                      (unsigned long long) size,
+                      (unsigned long long) start,
+                      (unsigned long long) file_size);
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    /* The content type is refused here, by value, with the window - not left to the header
+     * builder, which fails the response because send_2 is void and has no other way to say so.
+     * A bad type writes nothing either way, so this answer is the same false as the refusals
+     * above and the caller's fallback reply still goes out; the builder's check stays as
+     * send_2's backstop. The WARN echoes none of the type, since the value is the payload. */
+    if (!_http_server_header_value_valid(content_type, char_length(content_type), true)) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_server_response_send_file_handle: refusing a content type that carries CR, LF or a control byte; nothing was written");
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    /* Where the body streams from once this route has returned: the response is the
+     * dispatcher's stack object, the connection's session outlives it. */
+    HTTP_Session *const session = (HTTP_Session*) lws_wsi_user(self->wsi);
+
+    if (memory_empty(session)) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_server_response_send_file_handle: refusing - the connection carries no session state");
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    if (!_http_server_response_headers_write(self, status_code, content_type, size, false)) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    /* HEAD wants the headers a GET would produce and no body; an empty window has no body
+     * either. Both complete synchronously like a send_2 - the dispatcher completes the
+     * transaction and the handle is released here - and neither is file_served. */
+    if (self->is_head || size == 0) {
+        file_close(file);
+
+        trace_log_pop();
+
+        return true;
+    }
+
+    /* ONE seek; the chunks then read sequentially. start <= file_size was established
+     * above, so file_at's own (checked-build) bound holds unless the file shrank in the
+     * microseconds between the two queries. */
+    file_at(*file, start, FILE_POSITION_BEGIN);
+
+    /* No stream can still be in flight here - headers_sent allows one send per response,
+     * and the previous transaction's stream ended before this one was dispatched - but the
+     * release is idempotent, and a take-over must never leak a handle on any path. */
+    _http_server_stream_reset(&session->stream);
+
+    session->stream.file        = *file;
+    session->stream.remaining   = size;
+    *file                       = nullptr;
+    self->file_served           = true;
+
+    lws_callback_on_writable(self->wsi);
 
     trace_log_pop();
 

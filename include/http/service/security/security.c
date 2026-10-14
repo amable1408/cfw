@@ -1,5 +1,9 @@
 #include <http/service/security/security.h>
 
+// stdatomic.h is owed directly: apply()'s refused-block once-flag is an atomic_bool, and log.h
+// reaches it only under LOG_THREAD_IMPLEMENTATION.
+#include <stdatomic.h>
+
 /*==============================================================================
  * MARK: - API
  *============================================================================*/
@@ -83,9 +87,19 @@ void http_service_security_apply(HTTP_Service_Security const *const self, HTTP_S
     error_check_null(LOG_METADATA, "self", (void*) self);
     error_check_null(LOG_METADATA, "response", (void*) response);
 
-    /* Cached at construction (report High 5) - no per-response render, no per-response free. */
+    static atomic_bool _refused_warned = false;
+
+    /* Cached at construction (report High 5) - no per-response render, no per-response free.
+     * header_add_raw re-checks the block and refuses a malformed one whole; create_2 already
+     * re-checks every field, so a refusal here means the block itself is broken, and it is
+     * refused on every response alike - reported once per process, not once per response. */
     if (!string_empty(&self->header_block)) {
-        http_server_response_header_add_raw(response, string_get_data(&self->header_block), string_get_size(&self->header_block));
+        bool const added = http_server_response_header_add_raw(response, string_get_data(&self->header_block), string_get_size(&self->header_block));
+
+        if (!added && !atomic_exchange_explicit(&_refused_warned, true, memory_order_relaxed)) {
+            log_message_2(LOG_LEVEL_WARN, LOG_METADATA,
+                          "http_service_security_apply: the response refused the cached security header block - responses go out with no security headers (logged once per process)");
+        }
     }
 
     trace_log_pop();

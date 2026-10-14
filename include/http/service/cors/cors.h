@@ -1,6 +1,6 @@
 /*
  * cors.h - HTTP CORS service for the C Libraries Framework
- * @version 0.4.0
+ * @version 0.4.1
  *
  * Builds and validates Cross-Origin Resource Sharing policy data for browser
  * API requests. Application code owns reading request headers and writing the
@@ -30,7 +30,7 @@
  *   }
  *
  *   if (!http_service_cors_origin_add(&cors, "https://example.com")) {
- *       // Refused - a malformed value, see Error Handling. The WARN names why.
+ *       // Refused - a malformed value, see Error Handling. The WARN names the rule.
  *   }
  *
  *   // ... inside a route callback, with `request` and `response` in hand:
@@ -54,8 +54,8 @@
  *       // the Allow-* lines it does (or does not) find.
  *       String block = http_service_cors_preflight_create(&cors, origin, method, headers, false);
  *
- *       if (!string_empty(&block)) {
- *           http_server_response_header_add_raw(response, string_get_data(&block), string_get_size(&block));
+ *       if (!string_empty(&block) && !http_server_response_header_add_raw(response, string_get_data(&block), string_get_size(&block))) {
+ *           // refused: a malformed block - nothing was appended, the reply goes out without it
  *       }
  *
  *       string_uninit(&block);
@@ -65,8 +65,8 @@
  *   else {
  *       String block = http_service_cors_headers_create(&cors, origin);
  *
- *       if (!string_empty(&block)) {
- *           http_server_response_header_add_raw(response, string_get_data(&block), string_get_size(&block));
+ *       if (!string_empty(&block) && !http_server_response_header_add_raw(response, string_get_data(&block), string_get_size(&block))) {
+ *           // refused: a malformed block - nothing was appended, the reply goes out without it
  *       }
  *
  *       string_uninit(&block);
@@ -97,7 +97,12 @@
  *     "*" and "null" exempt. "https://example.com/" (a trailing slash), "example.com" (no
  *     scheme), "https://example.com/app" (a path) and "https://a:" (an empty port) are refused
  *     at add time with a WARN rather than stored as an entry a browser's Origin can never
- *     match. A bracketed IPv6 literal host ("http://[::1]:3000") is accepted. A port is a
+ *     match; so is an unbracketed host holding a forbidden host byte ('@', '\', '[', ']', '^',
+ *     '|', '%', '<', '>'), which no browser's Origin carries. A bracketed IPv6 literal host
+ *     ("http://[::1]:3000") is accepted - but only the COMPRESSED spelling can ever match:
+ *     uncompressed or dotted forms ("[0:0:0:0:0:0:0:1]", "[::ffff:1.2.3.4]") are accepted
+ *     and store dead, because a browser serialises the compressed form. There is deliberately
+ *     no scheme allow-list: "chrome-extension://" and "moz-extension://" are real Origins. A port is a
  *     plain integer in 1..65535: a leading zero (":08080", and ":0" itself) or a value above
  *     65535 is refused the same way. A special scheme's DEFAULT port is stored stripped -
  *     ":80" from http and ws, ":443" from https and wss - because a browser's Origin omits

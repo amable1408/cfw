@@ -1,6 +1,6 @@
 /*
  * oauth.h - HTTP OAuth 2.0 client service for the C Libraries Framework
- * @version 0.3.0
+ * @version 0.4.0
  *
  * Provides provider configuration, signed state tokens bound to a provider, a
  * TTL and the user agent that started the login, PKCE (RFC 7636)
@@ -38,6 +38,11 @@
  *   - Every network answer carries its transport status, HTTP status code, and
  *     the provider's own `error` / `error_description` - "no access token" is
  *     never the only thing a caller gets to branch on.
+ *   - Tiered names only. 0.4.0 retired the deprecated pre-tier spellings
+ *     (alloc_init, exchange_code, get_authorize_url, get_profile, init,
+ *     state_issue, state_verify - call their _1 tiers) and the positional
+ *     nine-char* provider_add_2 (call provider_add_1 with a designated
+ *     initializer).
  *
  * Usage Examples:
  *   @code
@@ -222,16 +227,11 @@
  * MARK: - Includes
  *============================================================================*/
 
-#include <allocator/allocator.h>
-#include <crypto/hash/hash.h>
-#include <crypto/hmac/hmac.h>
-#include <crypto/random/random.h>
-#include <datetime/datetime.h>
-#include <encoding/base64/base64.h>
+#ifdef ARENA_IMPLEMENTATION
+#include <arena/arena.h>
+#endif // ARENA_IMPLEMENTATION
+#include <container/string/string.h>
 #include <http/client/http_client.h>
-#include <http/query/query.h>
-#include <json/json.h>
-#include <log/log.h>
 #include <thread/thread.h>
 
 /*==============================================================================
@@ -454,15 +454,6 @@ bool http_service_oauth_alloc_init_1(HTTP_Service_OAuth *const self, Arena *cons
  *       generated it goes away.
  */
 bool http_service_oauth_alloc_init_2(HTTP_Service_OAuth *const self, Arena *const allocator, U8 const *const key, USize const key_size);
-
-/**
- * @brief Pre-tier spelling of http_service_oauth_alloc_init_1.
- * @param self Service to initialize IN PLACE.
- * @param allocator Arena allocator.
- * @return true when the service is ready.
- * @deprecated Call http_service_oauth_alloc_init_1; retired before 1.0.
- */
-bool http_service_oauth_alloc_init(HTTP_Service_OAuth *const self, Arena *const allocator);
 #endif // ARENA_IMPLEMENTATION
 
 /**
@@ -493,16 +484,6 @@ HTTP_Service_OAuth_Token http_service_oauth_exchange_code_1(HTTP_Service_OAuth *
  *         field would not fit the request body. Caller must uninitialize it.
  */
 HTTP_Service_OAuth_Token http_service_oauth_exchange_code_2(HTTP_Service_OAuth *const self, char const *const provider, char const *const code, char const *const code_verifier);
-
-/**
- * @brief Pre-tier spelling of http_service_oauth_exchange_code_1.
- * @param self Service instance.
- * @param provider Provider name.
- * @param code Authorization code.
- * @return Parsed token response. Caller must uninitialize it.
- * @deprecated Call http_service_oauth_exchange_code_1; retired before 1.0.
- */
-HTTP_Service_OAuth_Token http_service_oauth_exchange_code(HTTP_Service_OAuth *const self, char const *const provider, char const *const code);
 
 /**
  * @brief Build a provider authorization URL.
@@ -543,16 +524,6 @@ String http_service_oauth_get_authorize_url_2(HTTP_Service_OAuth *const self, ch
     char const *const code_challenge, char const *const extra_params);
 
 /**
- * @brief Pre-tier spelling of http_service_oauth_get_authorize_url_1.
- * @param self Service instance.
- * @param provider Provider name.
- * @param state CSRF/session state value.
- * @return URL string. Caller must uninitialize it.
- * @deprecated Call http_service_oauth_get_authorize_url_1; retired before 1.0.
- */
-String http_service_oauth_get_authorize_url(HTTP_Service_OAuth *const self, char const *const provider, char const *const state);
-
-/**
  * @brief Fetch a provider profile using a token response.
  * @param self Service instance.
  * @param provider Provider name.
@@ -586,16 +557,6 @@ HTTP_Service_OAuth_Profile http_service_oauth_get_profile_1(HTTP_Service_OAuth *
 HTTP_Service_OAuth_Profile http_service_oauth_get_profile_2(HTTP_Service_OAuth *const self, char const *const provider, char const *const access_token);
 
 /**
- * @brief Pre-tier spelling of http_service_oauth_get_profile_1.
- * @param self Service instance.
- * @param provider Provider name.
- * @param token Token response.
- * @return Parsed profile response. Caller must uninitialize it.
- * @deprecated Call http_service_oauth_get_profile_1; retired before 1.0.
- */
-HTTP_Service_OAuth_Profile http_service_oauth_get_profile(HTTP_Service_OAuth *const self, char const *const provider, HTTP_Service_OAuth_Token const *const token);
-
-/**
  * @brief Initialize an empty OAuth service with a generated state key.
  * @param self Service to initialize IN PLACE.
  * @return true when the service is ready. On false NOTHING was initialized and
@@ -614,14 +575,6 @@ bool http_service_oauth_init_1(HTTP_Service_OAuth *const self);
  *         key_size of 0 or above the maximum.
  */
 bool http_service_oauth_init_2(HTTP_Service_OAuth *const self, U8 const *const key, USize const key_size);
-
-/**
- * @brief Pre-tier spelling of http_service_oauth_init_1.
- * @param self Service to initialize IN PLACE.
- * @return true when the service is ready.
- * @deprecated Call http_service_oauth_init_1; retired before 1.0.
- */
-bool http_service_oauth_init(HTTP_Service_OAuth *const self);
 
 /**
  * @brief Derive the PKCE S256 challenge for a code verifier (RFC 7636 §4.2).
@@ -672,27 +625,6 @@ void http_service_oauth_profile_uninit(HTTP_Service_OAuth_Profile *const self);
  *         was rather than pairing a new client_id with the old secret.
  */
 bool http_service_oauth_provider_add_1(HTTP_Service_OAuth *const self, HTTP_Service_OAuth_Provider const *const provider);
-
-/**
- * @brief Register or update a provider from explicit fields.
- * @param self Service instance.
- * @param name Provider name.
- * @param client_id OAuth client ID.
- * @param client_secret OAuth client secret.
- * @param redirect_uri OAuth redirect URI.
- * @param authorize_url Provider authorization endpoint.
- * @param token_url Provider token endpoint.
- * @param profile_url Provider userinfo/profile endpoint.
- * @param revoke_url Provider revoke endpoint; optional.
- * @param scope Provider scope list; optional.
- * @return true when the provider is registered; see http_service_oauth_provider_add_1.
- * @deprecated Nine same-typed positional char* in an order that matches neither
- *             the struct nor the wire. Call http_service_oauth_provider_add_1
- *             with a designated initializer; this is retired before 1.0.
- */
-bool http_service_oauth_provider_add_2(HTTP_Service_OAuth *const self,
-    char const *const name, char const *const client_id, char const *const client_secret, char const *const redirect_uri, char const *const authorize_url, char const *const token_url,
-    char const *const profile_url, char const *const revoke_url, char const *const scope);
 
 /**
  * @brief Exchange a refresh token for a new provider token response.
@@ -808,18 +740,6 @@ bool http_service_oauth_state_issue_2(HTTP_Service_OAuth *const self, char const
     char *const out);
 
 /**
- * @brief Pre-tier spelling of http_service_oauth_state_issue_1.
- * @param self Service instance.
- * @param provider Provider name the state is bound to.
- * @param ttl_seconds Seconds the token stays valid.
- * @param out Destination; must hold HTTP_SERVICE_OAUTH_STATE_MAX_SIZE + 1 chars.
- * @return true when a token was written.
- * @deprecated Call http_service_oauth_state_issue_1 - or, for a login-CSRF
- *             defence, http_service_oauth_state_issue_2; retired before 1.0.
- */
-bool http_service_oauth_state_issue(HTTP_Service_OAuth *const self, char const *const provider, USize const ttl_seconds, char *const out);
-
-/**
  * @brief Verify a state token issued by this service for this provider, under
  *        no binding.
  * @param self Service instance.
@@ -868,17 +788,6 @@ bool http_service_oauth_state_verify_1(HTTP_Service_OAuth *const self, char cons
  *         and accept what that means.
  */
 bool http_service_oauth_state_verify_2(HTTP_Service_OAuth *const self, char const *const provider, char const *const binding, USize const binding_size, char const *const state);
-
-/**
- * @brief Pre-tier spelling of http_service_oauth_state_verify_1.
- * @param self Service instance.
- * @param provider Provider name the state must be bound to.
- * @param state State token from the provider's redirect.
- * @return true only when the token verifies under the empty binding.
- * @deprecated Call http_service_oauth_state_verify_1 - or, for a login-CSRF
- *             defence, http_service_oauth_state_verify_2; retired before 1.0.
- */
-bool http_service_oauth_state_verify(HTTP_Service_OAuth *const self, char const *const provider, char const *const state);
 
 /**
  * @brief Whether a token exchange actually succeeded.

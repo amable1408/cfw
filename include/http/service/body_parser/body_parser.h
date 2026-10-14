@@ -60,7 +60,10 @@
  *   - Form field lookup is a linear scan over the map.
  *
  * Dependencies:
- *   - char, map_char_char, memory.
+ *   - char, map_char_char, memory; http/query (http_query_next walks the form body's pairs
+ *     and http_query_decode decodes each name and value - '+' -> space, "%XX" -> byte, a
+ *     malformed escape kept literal - so the form decoding rules are http/query's own, not
+ *     a second copy). Included by body_parser.c only: nothing in this header's API names it.
  *
  * See body_parser.c for implementation details.
  */
@@ -198,7 +201,9 @@ USize http_service_body_parser_json_get_size(HTTP_Service_Body_Parser const *con
  * Form value notes: an empty value ("k=") is stored as ""; a decoded "%00" ends the C string
  * early because form_data stores C strings (the bytes after it are silently unreachable via
  * form_get - documented, not fixed here). A duplicate key ("a=1&a=2") keeps the first value;
- * form_get always answers the first-inserted value for a repeated key.
+ * form_get always answers the first-inserted value for a repeated key (the later duplicates
+ * are still stored, so they count toward max_pairs). A pair with no '=' ("k") is skipped and
+ * never counted; an empty-key pair ("=v") is skipped but IS checked against max_pairs first.
  *
  * @param self Service instance.
  * @param content_type The HTTP Content-Type header value.

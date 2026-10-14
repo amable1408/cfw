@@ -292,6 +292,54 @@ static void _test_security_empty_value(Test *const test) {
     test_case_end(test);
 }
 
+static void _test_security_create_rechecks_public_fields(Test *const test) {
+    test_case_begin(test, "security: create_2 re-checks a policy String written directly after init");
+
+    char hostile[] = "default-src 'self'\r\nX-Evil: 1";
+    char clean[]   = "no-referrer-when-downgrade";
+
+    HTTP_Headers_Security policy = http_headers_security_init_2("csp", "DENY", "no-referrer", "perm", true, false, false, false, false, 0, false, false);
+
+    String const saved_csp      = policy.content_security_policy;
+    String const saved_frame    = policy.frame_options;
+    String const saved_referrer = policy.referrer_policy;
+
+    policy.content_security_policy = string_init_3(hostile);
+
+    String block = http_headers_security_create_2(&policy);
+
+    test_expect_true(test, "a directly-written hostile CSP loses its line", string_find_count_1(&block, "Content-Security-Policy") == 0);
+    test_expect_true(test, "no injected line leaks", string_find_count_1(&block, "X-Evil") == 0);
+    test_expect_true(test, "X-Content-Type-Options still ships", string_find_count_1(&block, "X-Content-Type-Options: nosniff\r\n") == 1);
+    test_expect_true(test, "an unaffected field still ships", string_find_count_1(&block, "X-Frame-Options: DENY\r\n") == 1);
+
+    string_uninit(&block);
+
+    policy.content_security_policy = saved_csp;
+    policy.frame_options           = string_init_3(hostile);
+    block                          = http_headers_security_create_2(&policy);
+
+    test_expect_true(test, "a hostile frame_options loses its line", string_find_count_1(&block, "X-Frame-Options") == 0);
+    test_expect_true(test, "and nothing is injected", string_find_count_1(&block, "X-Evil") == 0);
+    test_expect_true(test, "the CSP line still ships", string_find_count_1(&block, "Content-Security-Policy: csp\r\n") == 1);
+
+    string_uninit(&block);
+
+    policy.frame_options    = saved_frame;
+    policy.referrer_policy  = string_init_3(clean);
+    block                   = http_headers_security_create_2(&policy);
+
+    test_expect_true(test, "a clean directly-written field still emits", string_find_count_1(&block, "Referrer-Policy: no-referrer-when-downgrade\r\n") == 1);
+
+    string_uninit(&block);
+
+    policy.referrer_policy = saved_referrer;
+
+    http_headers_security_uninit(&policy);
+
+    test_case_end(test);
+}
+
 static void _test_security_control_byte_refusal(Test *const test) {
     test_case_begin(test, "security: a control byte in a policy value logs WARN and omits only that header (heap tier cannot refuse whole)");
 
@@ -456,6 +504,7 @@ int main(void) {
     _test_security_hsts(&test);
     _test_security_empty_value(&test);
     _test_security_control_byte_refusal(&test);
+    _test_security_create_rechecks_public_fields(&test);
     _test_security_uninit(&test);
     _test_token_valid(&test);
 #ifdef ARENA_IMPLEMENTATION

@@ -26,22 +26,46 @@
 #include <unistd.h>
 #endif // _WIN32
 
+#include <char/char.h>
 #include <dir/dir.h>
+#include <file/file.h>
 #include <http/service/static/static.h>
 #include <log/log.h>
+#include <memory/memory.h>
 #include <net/net.h>
 #include <test/test.h>
+#include <thread/thread.h>
 
 /*==============================================================================
  * MARK: - Constants
  *============================================================================*/
-#define _BIG_FILE_SIZE          (1 * 1024 * 1024 + 100000)    /* > the 1 MiB range cap */
+/* 3 MiB + 1: well past the 1 MiB window 0.4.x capped a 206 at, past any socket buffer (so the
+ * streaming seam has to wait on a choked connection), and not a whole number of
+ * HTTP_SERVER_FILE_CHUNK_SIZE chunks, so the last chunk is a partial one. */
+#define _BIG_FILE_SIZE          (3 * 1024 * 1024 + 1)
 #define _CLIENT_BODY_MAX        (_BIG_FILE_SIZE + 16384)
 #define _CLIENT_HEADERS_MAX     8192
 #define _CLIENT_IO_TIMEOUT_MS   4000
 #define _CLIENT_RAW_MAX         (_BIG_FILE_SIZE + 32768)
+#define _CLIENT_STALL_MS        2000
+#define _COMMAND_MAX            1024
+#define _FIXTURE_LATE_ROOT      "static_test_fixture_late"
+#define _FIXTURE_OUTSIDE        "static_test_fixture_outside"
 #define _FIXTURE_ROOT           "static_test_fixture"
 #define _FIXTURE_SPA_ROOT       "static_test_fixture_spa"
+#define _SECRET_CONTENT         "TOP-SECRET-OUTSIDE-THE-ROOT"
+#define _SWAP_RETRY_COUNT       40
+#define _SWAP_RETRY_DELAY_MS    50
+
+/* Link targets as a link INSIDE _FIXTURE_ROOT spells them (relative to the link's own directory),
+ * in the separator the platform's link resolution expects. */
+#ifdef _WIN32
+#define _OUTSIDE_FROM_ROOT      "..\\" _FIXTURE_OUTSIDE
+#define _SECRET_FROM_ROOT       "..\\" _FIXTURE_OUTSIDE "\\secret.txt"
+#else
+#define _OUTSIDE_FROM_ROOT      "../" _FIXTURE_OUTSIDE
+#define _SECRET_FROM_ROOT       "../" _FIXTURE_OUTSIDE "/secret.txt"
+#endif // _WIN32
 
 /*==============================================================================
  * MARK: - Raw client (modelled on tests/http/server/test_all.c)
@@ -150,8 +174,12 @@ static bool _reply_header(_Reply const *const reply, char const *const name, cha
     return true;
 }
 
-/** @brief Read one HTTP/1.1 reply: status line, headers, then Content-Length bytes of body. */
-static bool _client_read(Net_Socket const socket, _Reply *const reply) {
+/**
+ * @brief Read one HTTP/1.1 reply: status line, headers, then Content-Length bytes of body -
+ *        sleeping stall_ms between the header block and the rest of the body (0: no stall), the
+ *        slow reader whose unread bytes back up into the server's socket while it waits.
+ */
+static bool _client_read_stalled(Net_Socket const socket, _Reply *const reply, U32 const stall_ms) {
     USize raw_size      = 0;
     USize header_end    = 0;
 
@@ -201,6 +229,10 @@ static bool _client_read(Net_Socket const socket, _Reply *const reply) {
         }
     }
 
+    if (stall_ms > 0) {
+        thread_sleep(stall_ms);
+    }
+
     USize body_have = raw_size - header_end;
 
     while (body_have < expected && raw_size + 1 < sizeof(_raw)) {
@@ -225,6 +257,11 @@ static bool _client_read(Net_Socket const socket, _Reply *const reply) {
     reply->complete = body_have >= expected;
 
     return true;
+}
+
+/** @brief Read one HTTP/1.1 reply with no stall (see _client_read_stalled). */
+static bool _client_read(Net_Socket const socket, _Reply *const reply) {
+    return _client_read_stalled(socket, reply, 0);
 }
 
 /**
@@ -341,11 +378,16 @@ static bool _client_round_trip(U16 const port, char const *const request, _Reply
  * MARK: - Fixture
  *============================================================================*/
 static Byte _big_file_content[_BIG_FILE_SIZE];
+/* Whether this account can create a symbolic link to a FILE (probed once by _fixture_setup). */
+static bool _file_links_available = false;
+/* Whether T4's file symlink and T5's junction to the outside secret could be created. */
+static bool _outside_file_link_created = false;
+static bool _outside_junction_created = false;
 
 static void _fixture_write(char const *const path, char const *const content) {
     FILE *const file = fopen(path, "wb");
 
-    if (file == nullptr) {
+    if (memory_empty(file)) {
         log_message_2(LOG_LEVEL_ERROR, LOG_METADATA, "_fixture_write: fopen failed for %s", path);
 
         return;
@@ -353,6 +395,98 @@ static void _fixture_write(char const *const path, char const *const content) {
 
     fwrite(content, 1, char_length(content), file);
     fclose(file);
+}
+
+#ifdef _WIN32
+/* Copy `path` into `buffer` with every '/' turned into '\\' - cmd's mklink reads a forward slash
+ * as a switch. */
+static void _fixture_backslash(char const *const path, char *const buffer, USize const capacity) {
+    char_copy_truncate(buffer, capacity, path);
+
+    for (USize index = 0; buffer[index] != '\0'; index += 1) {
+        if (buffer[index] == '/') {
+            buffer[index] = '\\';
+        }
+    }
+}
+#endif // _WIN32
+
+/* rename with a short retry: the fixture lives under a Dropbox-synced tree, whose client can hold
+ * a just-written entry open for a moment, and a rename against it then fails with a sharing
+ * violation that has nothing to do with the server under test. */
+static bool _fixture_rename(char const *const from, char const *const to) {
+    for (USize attempt = 0; attempt < _SWAP_RETRY_COUNT; attempt += 1) {
+        if (rename(from, to) == 0) {
+            return true;
+        }
+
+        thread_sleep(_SWAP_RETRY_DELAY_MS);
+    }
+
+    log_message_2(LOG_LEVEL_ERROR, LOG_METADATA, "_fixture_rename: %s -> %s failed", from, to);
+
+    return false;
+}
+
+/* A symbolic link to a FILE. Windows needs SeCreateSymbolicLinkPrivilege - an elevated process, or
+ * Developer Mode honouring the unprivileged flag - and answers false without it. */
+static bool _fixture_link_file(char const *const link, char const *const target_from_link) {
+#ifdef _WIN32
+    return CreateSymbolicLinkA(link, target_from_link, SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) != 0;
+#else
+    return symlink(target_from_link, link) == 0;
+#endif // _WIN32
+}
+
+#ifdef _WIN32
+/* A junction - mklink /J needs no privilege and resolves its cwd-relative target to an absolute
+ * path. True when `link` now exists as a reparse point. */
+static bool _fixture_junction(char const *const link, char const *const target_from_cwd) {
+    char link_native[_COMMAND_MAX]      = DEFAULT_INITIALIZATION;
+    char target_native[_COMMAND_MAX]    = DEFAULT_INITIALIZATION;
+    char command[_COMMAND_MAX]          = DEFAULT_INITIALIZATION;
+
+    _fixture_backslash(link, link_native, sizeof(link_native));
+    _fixture_backslash(target_from_cwd, target_native, sizeof(target_native));
+    snprintf(command, sizeof(command), "mklink /J \"%s\" \"%s\" >NUL", link_native, target_native);
+    system(command);
+
+    DWORD const attributes = GetFileAttributesA(link);
+
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+}
+#endif // _WIN32
+
+/* A link to a DIRECTORY: a directory symlink where it can be created, else (Windows, no
+ * privilege) a junction. */
+static bool _fixture_link_directory(char const *const link, char const *const target_from_link, char const *const target_from_cwd) {
+#ifdef _WIN32
+    if (CreateSymbolicLinkA(link, target_from_link, SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) != 0) {
+        return true;
+    }
+
+    return _fixture_junction(link, target_from_cwd);
+#else
+    (void) target_from_cwd;
+
+    return symlink(target_from_link, link) == 0;
+#endif // _WIN32
+}
+
+/* Remove a link (or a plain file) itself, never what it points at. */
+static void _fixture_unlink(char const *const link, bool const directory) {
+#ifdef _WIN32
+    if (directory) {
+        RemoveDirectoryA(link);
+    }
+    else {
+        DeleteFileA(link);
+    }
+#else
+    (void) directory;
+
+    unlink(link);
+#endif // _WIN32
 }
 
 static void _fixture_write_symlink(void) {
@@ -390,6 +524,45 @@ static void _fixture_setup(void) {
     _fixture_write(_FIXTURE_ROOT "/range.txt", "ABCDEFGHIJ");
     _fixture_write(_FIXTURE_ROOT "/symlink_target.txt", "target");
     _fixture_write_symlink();
+
+    /* The TOCTOU pins: a secret OUTSIDE the root, and innocent files the swap hooks replace with
+     * links to it - a file (T1, T3) and a directory holding a same-named file (T2). */
+    dir_create_all_1(_FIXTURE_OUTSIDE);
+    dir_create_all_1(_FIXTURE_ROOT "/swapdir");
+    _fixture_write(_FIXTURE_OUTSIDE "/secret.txt", _SECRET_CONTENT);
+    _fixture_write(_FIXTURE_ROOT "/swap_a.txt", "innocent-a");
+    _fixture_write(_FIXTURE_ROOT "/swapdir/secret.txt", "innocent-dir");
+
+    _file_links_available = _fixture_link_file(_FIXTURE_ROOT "/probe_link.txt", "symlink_target.txt");
+
+    if (_file_links_available) {
+        _fixture_unlink(_FIXTURE_ROOT "/probe_link.txt", false);
+    }
+
+    /* T3's file (replaced after the open), and T4/T5's links to the outside secret, IN PLACE from
+     * the start: a file symlink (needs the privilege) and, on Windows, a junction (needs none). */
+    _fixture_write(_FIXTURE_ROOT "/swap_open.txt", "original-bytes-T3");
+    _outside_file_link_created = _fixture_link_file(_FIXTURE_ROOT "/outside_link.txt", _SECRET_FROM_ROOT);
+#ifdef _WIN32
+    _outside_junction_created = _fixture_junction(_FIXTURE_ROOT "/outside_junction", _FIXTURE_OUTSIDE);
+#endif // _WIN32
+
+    /* T6: the dotfile whose 8.3 alias (HTACCE~1 on a volume that makes short names) is asked for
+     * with refuse_symlinks on and off. */
+    _fixture_write(_FIXTURE_ROOT "/.htaccess", "Deny from all");
+
+    /* T8: a non-ASCII name, written through the WIDE API on Windows so the bytes on disk are
+     * "cafe" with an acute e whatever the process code page is. */
+#ifdef _WIN32
+    FILE *const non_ascii = _wfopen(L"" _FIXTURE_ROOT L"\\caf\u00e9.txt", L"wb");
+#else
+    FILE *const non_ascii = fopen(_FIXTURE_ROOT "/caf\xC3\xA9.txt", "wb");
+#endif // _WIN32
+
+    if (!memory_empty(non_ascii)) {
+        fwrite("non-ascii-name", 1, CHAR_STATIC_SIZE("non-ascii-name"), non_ascii);
+        fclose(non_ascii);
+    }
 
     /* Dotfiles at the root and below a dot-directory, plus the one exempt dot-directory, for the
      * refuse_dotfiles pins. */
@@ -436,6 +609,16 @@ static void _fixture_setup(void) {
 }
 
 static void _fixture_teardown(void) {
+    /* The links into _FIXTURE_OUTSIDE go first, as links, so no recursive removal below can
+     * ever be asked to walk through one. */
+    if (_outside_file_link_created) {
+        _fixture_unlink(_FIXTURE_ROOT "/outside_link.txt", false);
+    }
+
+    if (_outside_junction_created) {
+        _fixture_unlink(_FIXTURE_ROOT "/outside_junction", true);
+    }
+
     /* dir_remove_all_1 refuses any path containing a "." or ".." segment (dir.h's documented
      * contract); the former "./"-prefixed roots tripped that refusal on every platform, so the
      * fixture trees silently survived every run. Fixed by dropping the leading "./" from the
@@ -449,6 +632,96 @@ static void _fixture_teardown(void) {
     if (!dir_remove_all_1(_FIXTURE_SPA_ROOT)) {
         log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "_fixture_teardown: dir_remove_all_1 failed for %s", _FIXTURE_SPA_ROOT);
     }
+
+    if (!dir_remove_all_1(_FIXTURE_LATE_ROOT)) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "_fixture_teardown: dir_remove_all_1 failed for %s", _FIXTURE_LATE_ROOT);
+    }
+
+    /* Last: every link into it lived under _FIXTURE_ROOT, already gone. */
+    if (!dir_remove_all_1(_FIXTURE_OUTSIDE)) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "_fixture_teardown: dir_remove_all_1 failed for %s", _FIXTURE_OUTSIDE);
+    }
+}
+
+/*==============================================================================
+ * MARK: - Swap hooks (TOCTOU pins)
+ *============================================================================*/
+/*
+ * What a static.c test hook does to the file system when it fires: park `original` under
+ * `parked`, then put a file link, a directory link (junction on Windows without privilege), or a
+ * plain file carrying the secret's bytes where it was. `at_open` picks the hook - after the
+ * lexical resolve (before the open) or after the open (before the send). One request consumes
+ * one arming; _swap_restore puts the fixture back.
+ */
+typedef enum {
+    _SWAP_KIND_DIRECTORY_LINK,
+    _SWAP_KIND_FILE_LINK,
+    _SWAP_KIND_REGULAR_FILE
+} _Swap_Kind;
+
+typedef struct {
+    char const  *original;
+    char const  *parked;
+    char const  *target_from_link;
+    char const  *target_from_cwd;
+    _Swap_Kind  kind;
+    bool        at_open;
+    bool        armed;
+    bool        done;
+} _Swap;
+
+static _Swap _swap = DEFAULT_INITIALIZATION;
+
+static void _swap_apply(void) {
+    _swap.armed = false;
+
+    if (!_fixture_rename(_swap.original, _swap.parked)) {
+        return;
+    }
+
+    if (_swap.kind == _SWAP_KIND_FILE_LINK) {
+        _swap.done = _fixture_link_file(_swap.original, _swap.target_from_link);
+    }
+    else if (_swap.kind == _SWAP_KIND_DIRECTORY_LINK) {
+        _swap.done = _fixture_link_directory(_swap.original, _swap.target_from_link, _swap.target_from_cwd);
+    }
+    else {
+        _fixture_write(_swap.original, _SECRET_CONTENT);
+        _swap.done = file_exists_1(_swap.original);
+    }
+
+    if (!_swap.done) {
+        _fixture_rename(_swap.parked, _swap.original);
+    }
+}
+
+static void _swap_hook_after_resolve(char const *const file_name) {
+    (void) file_name;
+
+    if (_swap.armed && !_swap.at_open) {
+        _swap_apply();
+    }
+}
+
+static void _swap_hook_after_open(char const *const file_name) {
+    (void) file_name;
+
+    if (_swap.armed && _swap.at_open) {
+        _swap_apply();
+    }
+}
+
+static void _swap_restore(void) {
+    _swap.armed = false;
+
+    if (!_swap.done) {
+        return;
+    }
+
+    _fixture_unlink(_swap.original, _swap.kind == _SWAP_KIND_DIRECTORY_LINK);
+    _fixture_rename(_swap.parked, _swap.original);
+
+    _swap.done = false;
 }
 
 /*==============================================================================
@@ -458,6 +731,8 @@ static HTTP_Service_Static _svc_default;
 static HTTP_Service_Static _svc_spa;
 static HTTP_Service_Static _svc_cached;
 static HTTP_Service_Static _svc_dotfiles;
+static HTTP_Service_Static _svc_follow = DEFAULT_INITIALIZATION;
+static HTTP_Service_Static _svc_late = DEFAULT_INITIALIZATION;
 
 /* No router needed - every request in this suite goes through the same two static services, so
  * the per-server handler (set via http_server_set_handler below) does exactly what a real
@@ -478,6 +753,14 @@ static void _handler(void *context, HTTP_Server_Request *request, HTTP_Server_Re
     }
 
     if (http_service_static_serve_2(&_svc_dotfiles, request, response)) {
+        return;
+    }
+
+    if (http_service_static_serve_2(&_svc_follow, request, response)) {
+        return;
+    }
+
+    if (http_service_static_serve_2(&_svc_late, request, response)) {
         return;
     }
 
@@ -510,6 +793,13 @@ static U16 _start(Test *const test, HTTP_Server *const server) {
 /*==============================================================================
  * MARK: - Cases
  *============================================================================*/
+/* A pin that cannot run on this machine says so on stdout - where the suite's own report goes,
+ * whatever the log level (the suite runs at LOG_LEVEL_ERROR, which silenced the WARN skips this
+ * replaced) - instead of passing vacuously. */
+static void _skip_loudly(char const *const message) {
+    printf("    SKIPPED: %s\n", message);
+}
+
 static void _test_conditional_get(Test *const test, U16 const port) {
     test_case_begin(test, "conditional GET: ETag/Last-Modified, If-None-Match, If-Modified-Since");
 
@@ -731,24 +1021,45 @@ static void _test_cached_headers(Test *const test, U16 const port) {
     test_case_end(test);
 }
 
-static void _test_range_cap(Test *const test, U16 const port) {
-    test_case_begin(test, "the 1 MiB range cap on a file larger than the cap");
+/*
+ * T7 - the 0.4.x 1 MiB cap is gone: a wide-open Range on a 3 MiB + 1 file is ONE 206 carrying the
+ * whole remainder, streamed from the handle chunk by chunk, and an interior window starting
+ * mid-chunk arrives byte-exact too.
+ */
+static void _test_range_large_whole(Test *const test, U16 const port) {
+    test_case_begin(test, "T7: a wide-open Range on a 3 MiB file arrives whole as ONE 206, byte-exact; an interior window too");
 
     _Reply reply = DEFAULT_INITIALIZATION;
 
     if (test_expect_true(test, "open-ended Range on the big file round trip",
                          _client_round_trip(port, "GET /static/big.bin HTTP/1.1\r\nHost: t\r\nRange: bytes=0-\r\nConnection: close\r\n\r\n", &reply))) {
-        char content_range[64] = DEFAULT_INITIALIZATION;
+        char content_range[64]  = DEFAULT_INITIALIZATION;
+        char expected[64]       = DEFAULT_INITIALIZATION;
 
-        test_expect_u(test, "a wide-open Range on an oversize file -> 206", 206, reply.status);
-        test_expect_u(test, "the body is capped at 1 MiB, not the whole file", 1 * 1024 * 1024, reply.body_size);
+        snprintf(expected, sizeof(expected), "bytes 0-%d/%d", _BIG_FILE_SIZE - 1, _BIG_FILE_SIZE);
+
+        test_expect_u(test, "a wide-open Range on a 3 MiB file -> 206", 206, reply.status);
+        test_expect_true(test, "the whole declared body arrived", reply.complete);
+        test_expect_u(test, "the body is the WHOLE remainder, no cap", _BIG_FILE_SIZE, reply.body_size);
         test_expect_true(test, "Content-Range present", _reply_header(&reply, "content-range:", content_range, sizeof(content_range)));
+        test_expect_string(test, "Content-Range names the whole file", expected, content_range);
+        test_expect_true(test, "the body is byte-exact",
+                         reply.body_size == _BIG_FILE_SIZE && char_compare_equal_2(reply.body, reply.body_size, (char const*) _big_file_content, _BIG_FILE_SIZE));
+    }
 
-        char expected[64] = DEFAULT_INITIALIZATION;
+    USize const window_start    = 65535;
+    USize const window_end      = 2200000;
+    USize const window_size     = window_end - window_start + 1;
+    char        request[256]    = DEFAULT_INITIALIZATION;
 
-        snprintf(expected, sizeof(expected), "bytes 0-%d/%d", 1 * 1024 * 1024 - 1, _BIG_FILE_SIZE);
+    snprintf(request, sizeof(request), "GET /static/big.bin HTTP/1.1\r\nHost: t\r\nRange: bytes=%llu-%llu\r\nConnection: close\r\n\r\n",
+             (unsigned long long) window_start, (unsigned long long) window_end);
 
-        test_expect_string(test, "Content-Range reports the capped window and the real file size", expected, content_range);
+    if (test_expect_true(test, "interior window round trip", _client_round_trip(port, request, &reply))) {
+        test_expect_u(test, "an interior window -> 206", 206, reply.status);
+        test_expect_u(test, "the interior window's size", window_size, reply.body_size);
+        test_expect_true(test, "the interior window is byte-exact",
+                         reply.body_size == window_size && char_compare_equal_2(reply.body, reply.body_size, (char const*) _big_file_content + window_start, window_size));
     }
 
     test_case_end(test);
@@ -923,11 +1234,9 @@ static void _test_symlink_refusal(Test *const test, U16 const port) {
 
     if (!file_exists_1(_FIXTURE_ROOT "/symlink_link.txt")) {
 #ifdef _WIN32
-        log_message_1(LOG_LEVEL_WARN, "SKIPPED: symlink_refusal leaf - CreateSymbolicLinkA failed (no SeCreateSymbolicLinkPrivilege on this"
-                                      " account/machine); this pin needs a real symlink to refuse.\n");
+        _skip_loudly("symlink_refusal leaf - CreateSymbolicLinkA failed (no SeCreateSymbolicLinkPrivilege on this account/machine); this pin needs a real symlink to refuse.");
 #else
-        log_message_1(LOG_LEVEL_WARN, "SKIPPED: symlink_refusal leaf - symlink() failed on this filesystem/account; this pin needs a real"
-                                      " symlink to refuse.\n");
+        _skip_loudly("symlink_refusal leaf - symlink() failed on this filesystem/account; this pin needs a real symlink to refuse.");
 #endif // _WIN32
     }
     else if (test_expect_true(test, "symlink round trip", _client_round_trip(port, "GET /static/symlink_link.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply))) {
@@ -940,7 +1249,7 @@ static void _test_symlink_refusal(Test *const test, U16 const port) {
      * independently of the leaf half: on Windows the fixture falls back to a junction, which
      * needs no privilege, so this half runs where the file symlink cannot be created. */
     if (!file_exists_1(_FIXTURE_ROOT "/sublink/index.html")) {
-        log_message_1(LOG_LEVEL_WARN, "SKIPPED: symlink ANCESTOR - the directory symlink could not be created on this account/machine.\n");
+        _skip_loudly("symlink ANCESTOR - the directory symlink could not be created on this account/machine.");
 
         test_case_end(test);
 
@@ -966,6 +1275,357 @@ static void _test_symlink_refusal(Test *const test, U16 const port) {
         test_expect_u(test, "'sublink.' (a trailing-dot spelling of the link) is refused -> 404", 404, reply.status);
     }
 #endif // _WIN32
+
+    test_case_end(test);
+}
+
+/*
+ * T1 - swap BEFORE the open, final component. After the lexical resolve (and, on the old code,
+ * after its refuse_symlinks walk said "clear"), the hook parks swap_a.txt and puts a symlink to a
+ * secret OUTSIDE the root in its place. The open must refuse the link itself: a nofollow open
+ * answers "link refused", the request 404s, and not one byte of the secret is on the wire.
+ */
+static void _test_swap_before_open_file(Test *const test, U16 const port) {
+    test_case_begin(test, "TOCTOU T1: a file swapped for a link to an outside secret between resolve and open is never served");
+
+    if (!_file_links_available) {
+        _skip_loudly("TOCTOU T1 (final-component swap) - this account cannot create a FILE symlink (no"
+                     " SeCreateSymbolicLinkPrivilege, Developer Mode off); a hard link is no substitute (not a"
+                     " reparse point). T2 below pins the swap through a junction, which needs no privilege.");
+
+        test_case_end(test);
+
+        return;
+    }
+
+    _Swap const swap = {
+        .original         = _FIXTURE_ROOT "/swap_a.txt",
+        .parked           = _FIXTURE_ROOT "/swap_a.parked",
+        .target_from_link = _SECRET_FROM_ROOT,
+        .target_from_cwd  = _FIXTURE_OUTSIDE "/secret.txt",
+        .kind             = _SWAP_KIND_FILE_LINK,
+        .at_open          = false,
+        .armed            = true,
+        .done             = false
+    };
+
+    _swap = swap;
+
+    _Reply reply = DEFAULT_INITIALIZATION;
+
+    if (test_expect_true(test, "T1 round trip", _client_round_trip(port, "GET /static/swap_a.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply))) {
+        test_expect_true(test, "T1: the hook swapped swap_a.txt for a link to the secret", _swap.done);
+        test_expect_u(test, "T1: the link swapped in before the open is refused -> 404", 404, reply.status);
+        test_expect_false(test, "T1: not one byte of the secret reaches the client", char_find_exists_1(reply.body, _SECRET_CONTENT));
+    }
+
+    _swap_restore();
+
+    test_case_end(test);
+}
+
+/*
+ * T2 - swap BEFORE the open, an ANCESTOR. The hook parks the directory swapdir and puts a link to
+ * the outside directory in its place (a junction on Windows without privilege), so
+ * swapdir/secret.txt now names the outside secret. A nofollow open follows an ancestor like any
+ * open - only the final-path compare on the opened handle sees where the bytes really live.
+ */
+static void _test_swap_before_open_ancestor(Test *const test, U16 const port) {
+    test_case_begin(test, "TOCTOU T2: a directory swapped for a link to an outside directory between resolve and open is never served");
+
+    _Swap const swap = {
+        .original         = _FIXTURE_ROOT "/swapdir",
+        .parked           = _FIXTURE_ROOT "/swapdir_parked",
+        .target_from_link = _OUTSIDE_FROM_ROOT,
+        .target_from_cwd  = _FIXTURE_OUTSIDE,
+        .kind             = _SWAP_KIND_DIRECTORY_LINK,
+        .at_open          = false,
+        .armed            = true,
+        .done             = false
+    };
+
+    _swap = swap;
+
+    _Reply reply = DEFAULT_INITIALIZATION;
+
+    if (test_expect_true(test, "T2 round trip", _client_round_trip(port, "GET /static/swapdir/secret.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply))) {
+        test_expect_true(test, "T2: the hook swapped swapdir for a link to the outside directory", _swap.done);
+        test_expect_u(test, "T2: a linked ancestor swapped in before the open is refused -> 404", 404, reply.status);
+        test_expect_false(test, "T2: not one byte of the secret reaches the client", char_find_exists_1(reply.body, _SECRET_CONTENT));
+    }
+
+    _swap_restore();
+
+    test_case_end(test);
+}
+
+/*
+ * T3 - swap AFTER the open. The hook (after the open and the compare, before the send) parks
+ * swap_open.txt and puts a link to the outside secret in its place - or, where this account cannot
+ * create a file symlink, a plain file carrying the secret's bytes, which pins the same property.
+ * The response must carry the ORIGINAL bytes: the body comes from the handle that was verified,
+ * and nothing re-resolves the name. A future "re-open per chunk" refactor fails this.
+ */
+static void _test_swap_after_open(Test *const test, U16 const port) {
+    test_case_begin(test, "TOCTOU T3: a file swapped for the secret AFTER the open still serves the original bytes (200)");
+
+    if (!_file_links_available) {
+        _skip_loudly("TOCTOU T3 link variant - no FILE symlink privilege here; T3 swaps in a plain file carrying the secret's"
+                     " bytes instead, which pins the same property (the body comes from the handle, never the name).");
+    }
+
+    _Swap const swap = {
+        .original         = _FIXTURE_ROOT "/swap_open.txt",
+        .parked           = _FIXTURE_ROOT "/swap_open.parked",
+        .target_from_link = _SECRET_FROM_ROOT,
+        .target_from_cwd  = _FIXTURE_OUTSIDE "/secret.txt",
+        .kind             = _file_links_available ? _SWAP_KIND_FILE_LINK : _SWAP_KIND_REGULAR_FILE,
+        .at_open          = true,
+        .armed            = true,
+        .done             = false
+    };
+
+    _swap = swap;
+
+    _Reply reply = DEFAULT_INITIALIZATION;
+
+    if (test_expect_true(test, "T3 round trip", _client_round_trip(port, "GET /static/swap_open.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply))) {
+        test_expect_true(test, "T3: the hook replaced swap_open.txt after the open", _swap.done);
+        test_expect_u(test, "T3: a swap after the open changes nothing -> 200", 200, reply.status);
+        test_expect_string(test, "T3: the body is the ORIGINAL file's bytes, from the handle", "original-bytes-T3", reply.body);
+    }
+
+    _swap_restore();
+
+    test_case_end(test);
+}
+
+/*
+ * T4 - a file symlink to the outside secret, in place from the start (no hook): refused with
+ * refuse_symlinks on (the default), followed with it off - the documented opt-out.
+ */
+static void _test_link_in_place(Test *const test, U16 const port) {
+    test_case_begin(test, "T4: a file symlink to an outside secret, in place: refuse_symlinks on -> 404, off -> 200 (followed)");
+
+    if (!_outside_file_link_created) {
+        _skip_loudly("T4 (file symlink in place) - this account cannot create a FILE symlink; T5 pins the in-place refusal through a junction.");
+
+        test_case_end(test);
+
+        return;
+    }
+
+    _Reply reply = DEFAULT_INITIALIZATION;
+
+    if (test_expect_true(test, "T4 on round trip", _client_round_trip(port, "GET /static/outside_link.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply))) {
+        test_expect_u(test, "T4: refuse_symlinks on (the default) refuses the link -> 404", 404, reply.status);
+        test_expect_false(test, "T4: not one byte of the secret reaches the client", char_find_exists_1(reply.body, _SECRET_CONTENT));
+    }
+
+    if (test_expect_true(test, "T4 off round trip", _client_round_trip(port, "GET /follow/outside_link.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply))) {
+        test_expect_u(test, "T4: refuse_symlinks off follows the link -> 200", 200, reply.status);
+        test_expect_string(test, "T4: ... and serves its target", _SECRET_CONTENT, reply.body);
+    }
+
+    test_case_end(test);
+}
+
+/*
+ * T5 - the same with a junction (Windows; needs no privilege), as an ANCESTOR: the open follows
+ * it like any intermediate component, so only the final-path compare refuses it.
+ */
+static void _test_junction_in_place(Test *const test, U16 const port) {
+    test_case_begin(test, "T5: a junction to an outside directory, in place: refuse_symlinks on -> 404, off -> 200 (followed)");
+
+#ifdef _WIN32
+    if (!_outside_junction_created) {
+        _skip_loudly("T5 (junction in place) - mklink /J failed on this volume.");
+
+        test_case_end(test);
+
+        return;
+    }
+
+    _Reply reply = DEFAULT_INITIALIZATION;
+
+    if (test_expect_true(test, "T5 on round trip", _client_round_trip(port, "GET /static/outside_junction/secret.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply))) {
+        test_expect_u(test, "T5: refuse_symlinks on refuses a file reached through a junction -> 404", 404, reply.status);
+        test_expect_false(test, "T5: not one byte of the secret reaches the client", char_find_exists_1(reply.body, _SECRET_CONTENT));
+    }
+
+    if (test_expect_true(test, "T5 off round trip", _client_round_trip(port, "GET /follow/outside_junction/secret.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply))) {
+        test_expect_u(test, "T5: refuse_symlinks off follows the junction -> 200", 200, reply.status);
+        test_expect_string(test, "T5: ... and serves the file behind it", _SECRET_CONTENT, reply.body);
+    }
+#else
+    (void) port;
+
+    _skip_loudly("T5 (junction) - junctions are Windows-only; the directory-symlink ancestor is pinned by T2 and the symlink-refusal case.");
+#endif // _WIN32
+
+    test_case_end(test);
+}
+
+/*
+ * refuse_symlinks is ON by default (0.5.0) in both constructors, and root_dir's final path is
+ * taken once at construction - so a root that did not exist then refuses every request (fail
+ * closed) even after it is created, while the same tree served with the knob off is served.
+ *
+ * That refusal is a "cannot tell" - no root to compare against - not a link, so its WARN names
+ * the ROOT, never a "link refused", and it is logged ONCE per process, not once per request (the
+ * log volume would otherwise scale with traffic). The log state is per THREAD (LOG_THREAD_
+ * IMPLEMENTATION), so the server thread's WARN is out of the mirror's reach: the two captured
+ * requests go through serve_1 on THIS thread with a never-dereferenced response, as
+ * test_unchecked.c does - a refusal returns before serve_1 touches it, and a late root that was
+ * SERVED would crash the run loudly, never pass. The once-flag is process-wide, so these must be
+ * the first requests any case sends to /late; the live round trip follows them.
+ */
+static void _test_symlink_default_and_late_root(Test *const test, U16 const port) {
+    test_case_begin(test, "refuse_symlinks defaults ON in init_1 and init_2; a root missing at construction fails closed, WARNed once naming the root");
+
+    test_expect_true(test, "init_1 turns refuse_symlinks on", _svc_default.refuse_symlinks);
+    test_expect_true(test, "init_2 turns refuse_symlinks on", _svc_spa.refuse_symlinks);
+    test_expect_true(test, "init_1 resolved root_dir's final path", _svc_default.root_final_size > 0);
+    test_expect_true(test, "init_2 resolved root_dir's final path", _svc_spa.root_final_size > 0);
+    test_expect_u(test, "a root that did not exist at construction has no final path", 0, _svc_late.root_final_size);
+
+    char            log_buffer[2048]    = DEFAULT_INITIALIZATION;
+    LogLevel const  previous_level      = log_get_level();
+
+    log_set_level(LOG_LEVEL_WARN);
+    log_set_buffer(log_buffer, sizeof(log_buffer));
+    log_buffer_clear();
+
+    /* Never dereferenced: a refusal returns before serve_1 touches it (see above). */
+    HTTP_Server_Response *const unused_response = (HTTP_Server_Response*) (void*) 1;
+    char const *const           late_path       = "/late/late.txt";
+
+    test_expect_false(test, "the late root's (now existing) file is refused on this thread", http_service_static_serve_1(&_svc_late, unused_response, late_path, char_length(late_path)));
+    test_expect_true(test, "the first refusal WARNs naming the unresolved root", char_find_exists_1(log_buffer, "root_dir '" _FIXTURE_LATE_ROOT "'"));
+    test_expect_true(test, "and does not blame a link that does not exist", !char_find_exists_1(log_buffer, "link refused"));
+
+    log_buffer_clear();
+
+    test_expect_false(test, "a second request is refused too", http_service_static_serve_1(&_svc_late, unused_response, late_path, char_length(late_path)));
+    test_expect_u(test, "and logs nothing - the cause was named once, not per request", 0, log_get_buffer_size());
+
+    log_set_buffer(nullptr, 0);
+    log_set_level(previous_level);
+
+    _Reply reply = DEFAULT_INITIALIZATION;
+
+    if (test_expect_true(test, "late-root round trip", _client_round_trip(port, "GET /late/late.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply))) {
+        test_expect_u(test, "the late root's (now existing) file is refused - fail closed -> 404", 404, reply.status);
+    }
+
+    test_case_end(test);
+}
+
+#ifdef _WIN32
+/*
+ * T6 - the 8.3 alias of a dotfile, asked for with refuse_symlinks on (/static) AND off (/follow):
+ * 404 both ways. The lexical rule refuses it before the open either way; under refuse_symlinks
+ * the final-path compare would refuse it too (the handle's final path is the LONG name), so the
+ * refusal does not rest on one mechanism. GetShortPathNameA asks the volume for the real alias;
+ * a volume that makes no short names (`fsutil 8dot3name query` needs elevation here, so the
+ * volume is asked directly) answers the long name back, and the hand-spelled HTACCE~1 is pinned.
+ */
+static void _test_short_name_under_compare(Test *const test, U16 const port) {
+    test_case_begin(test, "T6: an 8.3 alias (HTACCE~1 for .htaccess) is refused with refuse_symlinks on AND off");
+
+    char            short_path[512] = DEFAULT_INITIALIZATION;
+    DWORD   const   short_size      = GetShortPathNameA(_FIXTURE_ROOT "\\.htaccess", short_path, (DWORD) sizeof(short_path));
+    char    const   *short_name     = "HTACCE~1";
+    bool            live_alias      = false;
+
+    if (short_size > 0 && short_size < sizeof(short_path)) {
+        USize base_start = 0;
+
+        for (USize index = short_size; index > 0; index -= 1) {
+            if (short_path[index - 1] == '\\' || short_path[index - 1] == '/') {
+                base_start = index;
+
+                break;
+            }
+        }
+
+        if (!char_compare_equal_1(short_path + base_start, ".htaccess")) {
+            short_name = short_path + base_start;
+            live_alias = true;
+        }
+    }
+
+    if (!live_alias) {
+        _skip_loudly("T6 live 8.3 alias - this volume answered no short name for .htaccess; pinning the hand-spelled HTACCE~1 (lexical refusal) instead.");
+    }
+
+    _Reply  reply           = DEFAULT_INITIALIZATION;
+    char    request[512]    = DEFAULT_INITIALIZATION;
+
+    snprintf(request, sizeof(request), "GET /static/%s HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", short_name);
+
+    if (test_expect_true(test, "T6 on round trip", _client_round_trip(port, request, &reply))) {
+        test_expect_u(test, "T6: the 8.3 alias with refuse_symlinks on -> 404", 404, reply.status);
+    }
+
+    snprintf(request, sizeof(request), "GET /follow/%s HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", short_name);
+
+    if (test_expect_true(test, "T6 off round trip", _client_round_trip(port, request, &reply))) {
+        test_expect_u(test, "T6: the 8.3 alias with refuse_symlinks off -> 404 too", 404, reply.status);
+    }
+
+    test_case_end(test);
+}
+#endif // _WIN32
+
+/*
+ * T8 - a non-ASCII name. The URI's %C3%A9 decodes to the UTF-8 bytes of an acute e, and the wide
+ * opener opens exactly the file those bytes name - where the 0.4.x ANSI path read them in the
+ * process code page and 404'd or mis-targeted. Under refuse_symlinks (on here) the final-path
+ * compare matches it byte for byte.
+ */
+static void _test_non_ascii_name(Test *const test, U16 const port) {
+    test_case_begin(test, "T8: a non-ASCII asset name (caf%C3%A9.txt) is served with its bytes");
+
+    _Reply reply = DEFAULT_INITIALIZATION;
+
+    if (test_expect_true(test, "T8 round trip", _client_round_trip(port, "GET /static/caf%C3%A9.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply))) {
+        test_expect_u(test, "T8: the non-ASCII name is served -> 200", 200, reply.status);
+        test_expect_string(test, "T8: ... with its own bytes", "non-ascii-name", reply.body);
+    }
+
+    test_case_end(test);
+}
+
+/*
+ * T9 - a slow reader. The client reads the header block, stalls 2 s while the 3 MiB body backs up
+ * into the server's socket (the seam's choked-wait path), then reads the rest: every byte must
+ * arrive, in order. lws's per-chunk content timeout is far longer than the stall, so this pins
+ * that the choked wait RESUMES, not how much memory it holds.
+ */
+static void _test_slow_reader(Test *const test, U16 const port) {
+    test_case_begin(test, "T9: a reader that stalls 2 s after the headers still gets every byte of a 3 MiB body");
+
+    Net_Socket socket = DEFAULT_INITIALIZATION;
+
+    if (!test_expect_true(test, "T9 connection opens", _client_open(port, &socket))) {
+        test_case_end(test);
+
+        return;
+    }
+
+    _Reply      reply   = DEFAULT_INITIALIZATION;
+    bool const  sent    = _client_write(socket, "GET /static/big.bin HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+                                        CHAR_STATIC_SIZE("GET /static/big.bin HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"));
+
+    if (test_expect_true(test, "T9 stalled round trip", sent && _client_read_stalled(socket, &reply, _CLIENT_STALL_MS))) {
+        test_expect_u(test, "T9: status 200", 200, reply.status);
+        test_expect_true(test, "T9: the whole declared body arrived after the stall", reply.complete);
+        test_expect_u(test, "T9: every byte", _BIG_FILE_SIZE, reply.body_size);
+        test_expect_true(test, "T9: byte-exact", reply.body_size == _BIG_FILE_SIZE && char_compare_equal_2(reply.body, reply.body_size, (char const*) _big_file_content, _BIG_FILE_SIZE));
+    }
+
+    net_socket_close(socket);
 
     test_case_end(test);
 }
@@ -1157,7 +1817,7 @@ static void _test_short_name_refused(Test *const test, U16 const port) {
     }
 
     if (!live_alias) {
-        log_message_1(LOG_LEVEL_WARN, "SKIPPED: live 8.3 alias - this volume answered no short name for .env; pinning a hand-spelled ENV~1.\n");
+        _skip_loudly("live 8.3 alias - this volume answered no short name for .env; pinning a hand-spelled ENV~1.");
     }
 
     _Reply  reply           = DEFAULT_INITIALIZATION;
@@ -1200,8 +1860,9 @@ int main(void) {
 
     _fixture_setup();
 
+    /* refuse_symlinks is left at its default - ON since 0.5.0, pinned by
+     * _test_symlink_default_and_late_root - rather than set here. */
     _svc_default = http_service_static_init_1(_FIXTURE_ROOT, "/static");
-    _svc_default.refuse_symlinks = true;
 
     _svc_spa = http_service_static_init_2(_FIXTURE_SPA_ROOT, "/spa", "index.html", true, 0);
 
@@ -1214,6 +1875,23 @@ int main(void) {
     _svc_dotfiles = http_service_static_init_1(_FIXTURE_ROOT, "/dot");
     _svc_dotfiles.refuse_dotfiles = true;
 
+    /* The same root again with the link refusal turned OFF - the documented opt-out - so T4/T5
+     * pin both directions against one fixture. */
+    _svc_follow = http_service_static_init_1(_FIXTURE_ROOT, "/follow");
+    _svc_follow.refuse_symlinks = false;
+
+    /* A root that does NOT exist at construction (its final path cannot be taken - one WARN),
+     * created only afterwards: refuse_symlinks must keep refusing it (fail closed). */
+    _svc_late = http_service_static_init_1(_FIXTURE_LATE_ROOT, "/late");
+
+    dir_create_all_1(_FIXTURE_LATE_ROOT);
+    _fixture_write(_FIXTURE_LATE_ROOT "/late.txt", "late");
+
+    /* The swap hooks act only when a case arms them (_swap.armed), so installing them once for the
+     * whole run leaves every other case untouched. */
+    http_service_static_test_hook_after_resolve_set(_swap_hook_after_resolve);
+    http_service_static_test_hook_after_open_set(_swap_hook_after_open);
+
     Test test = test_init("tests/http/service/static/test_all.c");
 
     test_suite_begin(&test, "http_service_static (live server)");
@@ -1225,13 +1903,21 @@ int main(void) {
     _test_range(&test, port);
     _test_if_range(&test, port);
     _test_cached_headers(&test, port);
-    _test_range_cap(&test, port);
+    _test_range_large_whole(&test, port);
     _test_head_range(&test, port);
     _test_head_full_file(&test, port);
     _test_mimetypes(&test, port);
     _test_default_file_subdirectory(&test, port);
     _test_spa_fallback(&test, port);
     _test_symlink_refusal(&test, port);
+    _test_swap_before_open_file(&test, port);
+    _test_swap_before_open_ancestor(&test, port);
+    _test_swap_after_open(&test, port);
+    _test_link_in_place(&test, port);
+    _test_junction_in_place(&test, port);
+    _test_symlink_default_and_late_root(&test, port);
+    _test_non_ascii_name(&test, port);
+    _test_slow_reader(&test, port);
     _test_dotfiles(&test, port);
     _test_tilde_name_served(&test, port);
 #ifdef _WIN32
@@ -1239,6 +1925,7 @@ int main(void) {
     _test_reserved_windows_name_refused(&test, port);
     _test_reserved_windows_name_spellings_refused(&test, port);
     _test_short_name_refused(&test, port);
+    _test_short_name_under_compare(&test, port);
 #endif // _WIN32
 
     http_server_delete(&server);

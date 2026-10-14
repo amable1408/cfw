@@ -7,17 +7,27 @@
 // libwebsockets.h is owed directly: lws_get_mimetype, lws_hdr_copy, WSI_TOKEN_* and struct lws are
 // named here, and a third-party header a CFW module re-exports is included like any other.
 #include <libwebsockets.h>
+// stdatomic.h is owed directly too: the "cannot tell" once-flags in
+// _http_service_static_handle_below_root are atomic_bool, and log.h reaches it only under
+// LOG_THREAD_IMPLEMENTATION.
+#include <stdatomic.h>
+
+// The OS error state a refused nofollow open leaves behind (_http_service_static_link_refused):
+// GetLastError / ERROR_STOPPED_ON_SYMLINK on Windows, errno / ELOOP elsewhere.
+#ifdef _WIN32
+#include <platform/windows/windows.h>
+#endif // _WIN32
 
 // char.h is singled out because it declares no TYPES at all: no header's API can ever name one,
 // so every chain that happens to reach it is accidental and a file using char_* owes it directly.
 #include <char/char.h>
 #include <datetime/datetime.h>
-#include <dir/dir.h>
 #include <file/file.h>
 #include <http/headers/headers.h>
 // Compression stays OUT of static.h: there it dragged an unpublished module into published
 // static's dependency closure and broke the public export.
 #include <http/service/compression/compression.h>
+#include <log/log.h>
 #include <memory/memory.h>
 
 /*==============================================================================
@@ -56,13 +66,26 @@ typedef struct {
     USize       if_range_size;
 } _HTTP_Service_Static_Conditional_Headers;
 
+/*
+ * Where a served handle lives, as _http_service_static_handle_below_root answers it under
+ * refuse_symlinks. Only BELOW_ROOT is served. ELSEWHERE is a fact about THIS request - a link on
+ * the way, or a second spelling - and is logged per request; UNKNOWN means the check could not
+ * run at all (no root_final, or a handle whose path cannot be read), a fact about the instance or
+ * the platform, so its cause is logged once per process and the request is refused all the same.
+ */
+typedef enum {
+    _HTTP_SERVICE_STATIC_PLACEMENT_BELOW_ROOT,
+    _HTTP_SERVICE_STATIC_PLACEMENT_ELSEWHERE,
+    _HTTP_SERVICE_STATIC_PLACEMENT_UNKNOWN
+} _HTTP_Service_Static_Placement;
+
 /*==============================================================================
  * MARK: - Constants
  *============================================================================*/
 
-/* Switch for the compression seam _http_service_static_send passes buffer sends through (not
- * the full-file, 206, or 304 paths - see that function's comment). Off until static grows
- * per-instance compression configuration. */
+/* Switch for the compression seam _http_service_static_send passes buffer sends through - only
+ * the bodiless 304 now; every 200 and 206 is streamed from the handle and never reaches it (see
+ * that function's comment). Off until static grows per-instance compression configuration. */
 static bool const _HTTP_SERVICE_STATIC_COMPRESSION_ENABLED = false;
 /* Buffer size for the rendered "<mimetype>; charset=utf-8" Content-Type value. The longest
  * mimetype in the table below is well under half of this. */
@@ -130,16 +153,11 @@ static _HTTP_Service_Static_Mime const _HTTP_SERVICE_STATIC_MIME_TABLE[] = {
     { ".gz",            CHAR_STATIC_SIZE(".gz"),            "application/gzip",             false }
 };
 
-/* Largest window returned for one Range response. The 206 path BUFFERS its whole window - one heap
- * copy here, then a second LWS_PRE-prefixed copy inside http_server_response_send_2, which lws may
- * hold for a slow reader - where the 200 path streams through send_file with no per-connection
- * copy. Any client turns the cheap path into this one with `Range: bytes=0-`, so the cap is a
- * per-request memory amplifier and stays small: 1 MiB. A streaming
- * http_server_response_send_file_range (the window read in lws-sized chunks on the writable
- * callback, no module-side buffer at all) is deferred behind an RSS measurement of many slow
- * concurrent ranged readers. See static.h's Range requests note for the LWS_WITH_RANGES
- * trade-off. */
-#define _HTTP_SERVICE_STATIC_RANGE_CHUNK_MAX (1 * 1024 * 1024)
+/* Bytes in every on-disk path buffer this file builds: the resolved file name (root_dir + '/' +
+ * the request-relative path, each bounded by HTTP_SERVER_PATH_MAX_LENGTH), the handle's final
+ * path, and the expected final path it is compared against. The same size as root_final in
+ * static.h, so a root_final that fit always leaves room for the comparison. */
+#define _HTTP_SERVICE_STATIC_PATH_BUFFER_MAX HTTP_SERVICE_STATIC_ROOT_FINAL_MAX_LENGTH
 /* Maximum digits accepted per Range number; the I64/ISize digit count keeps
  * accumulation below 2^64 (no wrap) and stays cross-checked by types.h. */
 #define _HTTP_SERVICE_STATIC_RANGE_DIGITS_MAX ISIZE_DIGITS_MAX
@@ -151,6 +169,26 @@ static _HTTP_Service_Static_Mime const _HTTP_SERVICE_STATIC_MIME_TABLE[] = {
  * sending an oversize conditional/Range header silently gets the unconditional response rather
  * than a 400. Documented, not changed: the safe direction for a value we cannot fully read. */
 #define _HTTP_SERVICE_STATIC_RANGE_HEADER_MAX 256
+/* The separator file_final_path_* answers in, and so the one the expected final path is joined
+ * with. */
+#ifdef _WIN32
+#define _HTTP_SERVICE_STATIC_SEPARATOR '\\'
+#else
+#define _HTTP_SERVICE_STATIC_SEPARATOR '/'
+#endif // _WIN32
+
+#ifdef HTTP_SERVICE_STATIC_TEST_HOOKS
+/*==============================================================================
+ * MARK: - Test Hooks
+ *============================================================================*/
+
+/* Test build only: called with the resolved file_name right after the lexical resolve, before
+ * the file is opened - the window a swapped-in link has to land in to be served. */
+static FpHTTP_Service_Static_Test_Hook _http_service_static_hook_after_resolve = nullptr;
+/* Test build only: called with the resolved file_name after the file is opened and verified,
+ * before the body is handed to the sender - a swap here must change nothing the client gets. */
+static FpHTTP_Service_Static_Test_Hook _http_service_static_hook_after_open = nullptr;
+#endif // HTTP_SERVICE_STATIC_TEST_HOOKS
 
 /*==============================================================================
  * MARK: - Helpers
@@ -439,103 +477,6 @@ static USize _http_service_static_http_date(I64 const epoch_seconds, char *const
 }
 
 /*
- * Whether ANY path component from self->root_dir down through the resolved file_name is a
- * symlink/junction, for the opt-in self->refuse_symlinks check - catching a symlinked ANCESTOR
- * directory (e.g. root_dir/linked_dir/real_leaf.txt), not just the final component. dir/dir.h
- * exposes is_link only per directory entry (dir_list_entries), not per single path, so this lists
- * each directory ONCE PER COMPONENT below the root and scans for the matching name - O(depth)
- * directory listings per request, which is exactly why the caller-facing flag defaults to off.
- * Returns false (not a symlink / cannot tell) on any lookup failure, which is the safe direction
- * for this being a REFUSAL check: a false negative here means the file is served as it always
- * was; a false positive would 404 a legitimate file.
- *
- * Accepted risk (see static.h Symlinks note): this is a check-then-open, not an atomic
- * operation - a component swapped for a symlink between this call returning false and the
- * subsequent open (TOCTOU) is not caught.
- */
-static bool _http_service_static_is_symlink(HTTP_Service_Static const *const self, char const *const file_name) {
-    trace_log_push(LOG_METADATA);
-
-    USize const file_name_size = char_length(file_name);
-
-    char parent[HTTP_SERVER_PATH_MAX_LENGTH * 4] = DEFAULT_INITIALIZATION;
-
-    char_copy_3(parent, sizeof(parent), file_name, self->root_dir_size);
-    parent[self->root_dir_size] = '\0';
-
-    USize cursor = self->root_dir_size;
-
-    while (cursor < file_name_size && (file_name[cursor] == '/' || file_name[cursor] == '\\')) {
-        cursor += 1;
-    }
-
-    while (cursor < file_name_size) {
-        USize const segment_start = cursor;
-
-        while (cursor < file_name_size && file_name[cursor] != '/' && file_name[cursor] != '\\') {
-            cursor += 1;
-        }
-
-        USize const segment_size = cursor - segment_start;
-
-        char segment[HTTP_SERVER_PATH_MAX_LENGTH] = DEFAULT_INITIALIZATION;
-
-        char_copy_3(segment, sizeof(segment), file_name + segment_start, segment_size);
-        segment[segment_size] = '\0';
-
-        char const *const           parent_for_lookup = parent[0] == '\0' ? "." : parent;
-        DirEntry                    *entries           = nullptr;
-        USize                       count              = 0;
-        bool                        is_link            = false;
-
-        if (dir_list_entries_1(parent_for_lookup, &entries, &count)) {
-            for (USize i = 0; i < count; i += 1) {
-#ifdef _WIN32
-                /* NTFS names are case-insensitive: "LINKDIR" opens the entry listed as "linkdir",
-                 * so an exact match would miss the link and serve straight through it. */
-                bool const matches = char_compare_iequal_1(entries[i].name, segment);
-#else
-                bool const matches = char_compare_equal_1(entries[i].name, segment);
-#endif // _WIN32
-
-                if (matches) {
-                    is_link = entries[i].is_link;
-
-                    break;
-                }
-            }
-
-            dir_list_entries_uninit(entries, count);
-        }
-
-        if (is_link) {
-            trace_log_pop();
-
-            return true;
-        }
-
-        USize parent_size = char_length(parent);
-
-        if (parent_size > 0 && parent[parent_size - 1] != '/' && parent[parent_size - 1] != '\\') {
-            parent[parent_size]        = '/';
-            parent_size                += 1;
-            parent[parent_size]        = '\0';
-        }
-
-        char_copy_3(parent + parent_size, sizeof(parent) - parent_size, segment, segment_size);
-        parent[parent_size + segment_size] = '\0';
-
-        while (cursor < file_name_size && (file_name[cursor] == '/' || file_name[cursor] == '\\')) {
-            cursor += 1;
-        }
-    }
-
-    trace_log_pop();
-
-    return false;
-}
-
-/*
  * Whether any component of the request-relative path `rel_path` starts with '.', for the opt-in
  * self->refuse_dotfiles check - `.git`, `.env`, `.htaccess`, `.vscode/` and the like, at any
  * depth. Exactly `.well-known` is exempt: it is the one dot-directory the web platform mandates
@@ -575,52 +516,13 @@ static bool _http_service_static_has_dotfile(char const *const rel_path, USize c
 }
 
 /*
- * Append a snprintf-formatted header fragment into `buffer` at `*size`, refusing (leaving `*size`
- * unchanged) rather than accumulating a value that would overrun the remaining capacity. Mirrors
- * http_headers_cache_max_age_into's own refuse-rather-than-truncate contract - a cut-off header
- * line is indistinguishable from a real one, and without this clamp an snprintf return value that
- * EXCEEDS the space actually available (the C standard's contract: the number of bytes that WOULD
- * have been written, not the number actually written) could push `*size` past `capacity`; the
- * NEXT call's "capacity - *size" would then underflow (both USize, unsigned) into a huge number
- * and write past the end of `buffer`.
- */
-static void _http_service_static_headers_append(char *const buffer, USize const capacity, USize *const size, char const *const format, ...) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "buffer", (void*) buffer);
-    error_check_null(LOG_METADATA, "size", (void*) size);
-    error_check_null(LOG_METADATA, "format", (void*) format);
-
-    if (*size >= capacity) {
-        trace_log_pop();
-
-        return;
-    }
-
-    va_list args;
-
-    va_start(args, format);
-
-    I32 const written = vsnprintf(buffer + *size, capacity - *size, format, args);
-
-    va_end(args);
-
-    if (written > 0 && (USize) written < capacity - *size) {
-        *size += (USize) written;
-    }
-
-    trace_log_pop();
-}
-
-/*
  * Queue "Cache-Control: max-age=<max_age>" on `response` as a header_add VALUE.
  *
- * http_headers_cache_max_age_into renders a whole "Cache-Control: ...\r\n" LINE, which is what
- * the raw extra-headers block on the full-file path wants; header_add wants the value alone, so
- * the prefix and the trailing CRLF are trimmed here. Shared by the 206 and 304 paths so neither
- * goes out lacking the freshness the 200 carries: a 304 that omits Cache-Control does not renew
- * the stored entry's freshness, so a client revalidates on every load once the original max-age
- * has lapsed.
+ * http_headers_cache_max_age_into renders a whole "Cache-Control: ...\r\n" LINE; header_add wants
+ * the value alone, so the prefix and the trailing CRLF are trimmed here. Shared by the 200, 206
+ * and 304 paths so all three carry the same freshness: a 304 that omits Cache-Control does not
+ * renew the stored entry's freshness, so a client revalidates on every load once the original
+ * max-age has lapsed.
  */
 static void _http_service_static_cache_control_add(HTTP_Server_Response *const response, U32 const max_age) {
     trace_log_push(LOG_METADATA);
@@ -666,11 +568,11 @@ static void _http_service_static_cache_control_add(HTTP_Server_Response *const r
  * Render the Content-Type VALUE a reply should carry: the mimetype, plus "; charset=utf-8" for
  * the text-family entries the MIME table flags.
  *
- * Content-Type is a singleton field (RFC 9110 S5.5): appending charset as a second
- * "Content-Type:" line in the raw extra-headers block, alongside the one libwebsockets emits from
- * send_file's content_type argument, would send two - which of the two a client honors is
- * implementation-defined and an intermediary may reject the reply outright. Rendering the full
- * value here and handing it to the sender as THE content type leaves exactly one on the wire.
+ * Content-Type is a singleton field (RFC 9110 S5.5): queueing charset as a second "Content-Type"
+ * header alongside the one the sender emits from its content_type argument would send two -
+ * which of the two a client honors is implementation-defined and an intermediary may reject the
+ * reply outright. Rendering the full value here and handing it to the sender as THE content type
+ * leaves exactly one on the wire.
  */
 static void _http_service_static_content_type(char const *const mimetype, bool const charset, char *const buffer, USize const capacity) {
     trace_log_push(LOG_METADATA);
@@ -684,17 +586,18 @@ static void _http_service_static_content_type(char const *const mimetype, bool c
 }
 
 /*
- * Every buffer send this file makes goes through the compression seam, and the seam is switched
+ * Every BUFFER send this file makes goes through the compression seam, and the seam is switched
  * OFF (_HTTP_SERVICE_STATIC_COMPRESSION_ENABLED). With the flag false this is exactly
- * http_server_response_send_2 - same bytes, same headers, same suite counts. This is an anchor
- * for BUFFER sends only (this function): a 200 goes out through http_server_response_send_file,
- * which never calls this function; compression.c refuses to touch a 206 (a Content-Range byte
- * window promised against the wrong content-length otherwise); and a 304 has no body to compress.
- * Turning compression on for those paths needs either routing the full file through this seam
- * instead of send_file, or precompressed sidecars served alongside the original - neither is done
- * here. The seam stays off until static grows real per-instance compression configuration: a
- * service built per call would re-add its MIME defaults on every response, and static.h cannot
- * gain a compression field without a public API change.
+ * http_server_response_send_2 - same bytes, same headers, same suite counts. Only the 304 passes
+ * through here now, and it has no body: every 200 and 206 is STREAMED from the open handle by
+ * http_server_response_send_file_handle, which never calls this function. Compressing a served
+ * file therefore means compressing a streamed body, never a buffer: the adjacent for that day is
+ * libwebsockets' lws_http_compression_apply, which wraps exactly the LWS_WRITE_HTTP ...
+ * LWS_WRITE_HTTP_FINAL sequence the streaming seam writes (a 206 stays uncompressed either way -
+ * its Content-Range promises a byte window of the identity body), or precompressed sidecars
+ * served alongside the original. Neither is done here. The seam stays off until static grows real
+ * per-instance compression configuration: a service built per call would re-add its MIME defaults
+ * on every response, and static.h cannot gain a compression field without a public API change.
  *
  * `request` may be null (serve_1 has none), in which case there is no Accept-Encoding to read
  * and the body goes out as identity whatever the flag says.
@@ -725,149 +628,25 @@ static void _http_service_static_send(HTTP_Server_Request *const request, HTTP_S
 }
 
 /*
- * Read the [start, end] window (capped to _HTTP_SERVICE_STATIC_RANGE_CHUNK_MAX)
- * from file_name and send it as 206 Partial Content with Content-Range and
- * Accept-Ranges headers, honoring max_age. An unsatisfiable range answers 416 with
- * Content-Range: bytes * /file_size here rather than falling back to a full body.
- * Returns true when a response was already sent (206 or 416) - the caller must not
- * fall back in that case. Returns false only for a malformed/multi-range value or
- * an unreadable file, so the caller can fall back to a full response.
- *
- * content_type is the full rendered value (charset included), and etag /
- * last_modified are the caller's already-computed validators, empty when the file could not be
- * stat'ed - carried so a 206 answers with the same validators the 200 for the same file would,
- * which is what lets Safari's opening one-byte probe (`bytes=0-1`) learn the ETag and send
- * If-Range on the continuation ranges that follow (RFC 9110 S15.3.7).
+ * Resolve an incoming request path to an on-disk file name, LEXICALLY - honoring route_prefix,
+ * the directory default_file, and (opt-in) dotfile refusal, and refusing on Windows the second
+ * spellings and device names whose OPEN would itself be the hazard. Nothing here touches the file
+ * system: whether the name exists, is a link, or lives below the root is answered by the open
+ * (_http_service_static_open), on the handle that is then served. Returns false when nothing
+ * should be served; on true, file_name holds root_dir + '/' + the request-relative path,
+ * *out_relative_start is where that relative part begins in it, and *out_fallback_allowed says
+ * whether a failed open may fall back to the SPA shell (fallback on, an extension-less final
+ * segment, not a directory request).
  */
-static bool _http_service_static_serve_range(HTTP_Server_Request *const request, char const *const file_name, char const *const content_type,
-    char const *const range, U32 const max_age, char const *const etag, char const *const last_modified, HTTP_Server_Response *const response) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
-    error_check_null(LOG_METADATA, "content_type", (void*) content_type);
-    error_check_null(LOG_METADATA, "range", (void*) range);
-    error_check_null(LOG_METADATA, "etag", (void*) etag);
-    error_check_null(LOG_METADATA, "last_modified", (void*) last_modified);
-    error_check_null(LOG_METADATA, "response", (void*) response);
-
-    /* file_open_try_1, not file_open_1: the null check below was dead, because
-     * file_open_1 ends the process on a path that is not there. A range request
-     * for a file that does not exist reaches here from an unauthenticated
-     * client, so the dead check was a remote way to stop the server. */
-    File *file = file_open_try_1(file_name, "rb");
-
-    if (memory_empty((void*) file)) {
-        trace_log_pop();
-
-        return false;
-    }
-
-    USize   const   file_size       = file_get_size(file);
-    USize           start           = 0;
-    USize           end             = 0;
-    bool            unsatisfiable   = false;
-
-    if (!_http_service_static_range_parse(range, file_size, &start, &end, &unsatisfiable)) {
-        file_close(&file);
-
-        if (unsatisfiable) {
-            char content_range[_HTTP_SERVICE_STATIC_RANGE_HEADER_MAX] = DEFAULT_INITIALIZATION;
-
-            snprintf(content_range, sizeof(content_range), "bytes */%llu", (unsigned long long) file_size);
-
-            /* Accept-Ranges on the 416 too: harmless, and it tells a client
-             * whose range was out of bounds that a corrected one is still worth sending. */
-            http_server_response_header_add(response, "Accept-Ranges", "bytes");
-            http_server_response_header_add(response, "Content-Range", content_range);
-            http_server_response_send_empty(response, HTTP_SERVER_STATUS_CODE_REQ_RANGE_NOT_SATISFIABLE);
-
-            trace_log_pop();
-
-            return true;
-        }
-
-        trace_log_pop();
-
-        return false;
-    }
-
-    if (end - start + 1 > _HTTP_SERVICE_STATIC_RANGE_CHUNK_MAX) {
-        end = start + _HTTP_SERVICE_STATIC_RANGE_CHUNK_MAX - 1;
-    }
-
-    USize   const   size    = end - start + 1;
-    /* try_alloc: the guard below was dead behind the aborting alloc - the same
-     * defect as file_open_1 above, 30 lines apart. size is capped by the chunk
-     * limit, so this is contract honesty, not exposure. OOM branch verified by
-     * reading only - the range path ends in lws_write on a live wsi. */
-    Byte    *const  buffer  = (Byte*) memory_try_alloc(size);
-
-    if (buffer == nullptr) {
-        file_close(&file);
-
-        trace_log_pop();
-
-        return false;
-    }
-
-    file_at(file, start, FILE_POSITION_BEGIN);
-
-    USize const read_size = file_read_1(file, buffer, 1, size);
-
-    file_close(&file);
-
-    if (read_size != size) {
-        memory_delete((void**) &buffer);
-
-        trace_log_pop();
-
-        return false;
-    }
-
-    char content_range[_HTTP_SERVICE_STATIC_RANGE_HEADER_MAX] = DEFAULT_INITIALIZATION;
-
-    snprintf(content_range, sizeof(content_range), "bytes %llu-%llu/%llu", (unsigned long long) start, (unsigned long long) end, (unsigned long long) file_size);
-
-    http_server_response_header_add(response, "Accept-Ranges", "bytes");
-    http_server_response_header_add(response, "Content-Range", content_range);
-
-    /* The same validators the 200 carries. Empty when the file could not be
-     * stat'ed, in which case the 206 goes out without them exactly as the 200 does. */
-    if (etag[0] != '\0') {
-        http_server_response_header_add(response, "ETag", etag);
-    }
-
-    if (last_modified[0] != '\0') {
-        http_server_response_header_add(response, "Last-Modified", last_modified);
-    }
-
-    _http_service_static_cache_control_add(response, max_age);
-
-    _http_service_static_send(request, response, buffer, size, content_type, HTTP_SERVER_STATUS_CODE_PARTIAL_CONTENT);
-
-    memory_delete((void**) &buffer);
-
-    trace_log_pop();
-
-    return true;
-}
-
-/*
- * Resolve an incoming request path to an on-disk file, honoring route_prefix, the directory
- * default_file, SPA fallback, and (opt-in) dotfile and symlink refusal - everything serve_1/serve_2 need
- * before the header-driven conditional-GET/Range decision, which is the only part that differs
- * between the two entry points. Returns false when nothing should be served, in which case the
- * caller must also report "not served" without touching file_name/out_mimetype/out_charset.
- */
-static bool _http_service_static_resolve(HTTP_Service_Static const *const self, char const *const path, USize const path_size,
-    char *const file_name, USize const file_name_capacity, char const **const out_mimetype, bool *const out_charset) {
+static bool _http_service_static_resolve(HTTP_Service_Static const *const self,
+    char const *const path, USize const path_size, char *const file_name, USize const file_name_capacity, USize *const out_relative_start, bool *const out_fallback_allowed) {
     trace_log_push(LOG_METADATA);
 
     error_check_null(LOG_METADATA, "self", (void*) self);
     error_check_null(LOG_METADATA, "path", (void*) path);
     error_check_null(LOG_METADATA, "file_name", (void*) file_name);
-    error_check_null(LOG_METADATA, "out_mimetype", (void*) out_mimetype);
-    error_check_null(LOG_METADATA, "out_charset", (void*) out_charset);
+    error_check_null(LOG_METADATA, "out_relative_start", (void*) out_relative_start);
+    error_check_null(LOG_METADATA, "out_fallback_allowed", (void*) out_fallback_allowed);
 
     /* No error_check_non_value_uint on path_size: it is request-derived, and
      * aborting on zero would kill the process four lines above the branch that
@@ -930,6 +709,8 @@ static bool _http_service_static_resolve(HTTP_Service_Static const *const self, 
         file_name_size              += 1;
     }
 
+    USize const relative_start = file_name_size;
+
     if (directory_request) {
         if (self->default_file_size == 0) {
             trace_log_pop();
@@ -978,7 +759,7 @@ static bool _http_service_static_resolve(HTTP_Service_Static const *const self, 
 #ifdef _WIN32
     /* A Win32 device as the final component - request-chosen, or the config-sourced default_file
      * a directory request appends. Opening one is the hazard ("CONIN$ .txt" blocks this thread),
-     * so the refusal precedes file_exists_1. */
+     * so the refusal precedes the open. */
     {
         USize base_start = 0;
 
@@ -998,108 +779,344 @@ static bool _http_service_static_resolve(HTTP_Service_Static const *const self, 
     }
 #endif // _WIN32
 
-    if (!file_exists_1(file_name)) {
-        /* SPA fallback restricted to extension-less paths: falling back to index.html 200 with a
-         * text/html body for a missing .js/.css asset makes browsers refuse to run/apply it and
-         * report a MIME-type console error. A request with a dot in its
-         * final segment is asking for a specific asset, not a client-side route - a dot in an
-         * EARLIER segment ("/app/v1.2/users") is not an extension and must not disqualify the
-         * fallback, so the search starts after the last '/', mirroring the basename scan above. */
-        USize segment_start = 0;
+    /* SPA fallback restricted to extension-less paths: falling back to index.html 200 with a
+     * text/html body for a missing .js/.css asset makes browsers refuse to run/apply it and
+     * report a MIME-type console error. A request with a dot in its
+     * final segment is asking for a specific asset, not a client-side route - a dot in an
+     * EARLIER segment ("/app/v1.2/users") is not an extension and must not disqualify the
+     * fallback, so the search starts after the last '/', mirroring the basename scan above. */
+    USize segment_start = 0;
 
-        for (USize i = rel_path_size; i > 0; i -= 1) {
-            if (rel_path[i - 1] == '/') {
-                segment_start = i;
+    for (USize i = rel_path_size; i > 0; i -= 1) {
+        if (rel_path[i - 1] == '/') {
+            segment_start = i;
 
-                break;
-            }
-        }
-
-        bool const has_extension = !directory_request && char_find_slice_5(rel_path, rel_path_size, segment_start, ".", CHAR_STATIC_SIZE(".")) != nullptr;
-
-        if (self->spa_fallback && self->fallback_file_size > 0 && !has_extension) {
-            file_name_size = self->root_dir_size;
-
-            char_copy_3(file_name, file_name_capacity, self->root_dir, self->root_dir_size);
-
-            if (file_name_size > 0 && file_name[file_name_size - 1] != '/' && file_name[file_name_size - 1] != '\\') {
-                file_name[file_name_size]   = '/';
-                file_name_size              += 1;
-            }
-
-            char_copy_3(file_name + file_name_size, file_name_capacity - file_name_size, self->fallback_file, self->fallback_file_size);
-            file_name_size += self->fallback_file_size;
-
-            /* char_copy_3 already writes this terminator (it terminates at data_size; char_copy_2
-             * is the one that doesn't) - kept explicit here anyway, right before the
-             * file_exists_1 check below, so the intent ("file_name_size marks the real end of the
-             * fallback path, shorter than the requested path that just failed") stays visible
-             * without following the call chain. */
-            file_name[file_name_size] = '\0';
-
-            if (!file_exists_1(file_name)) {
-                trace_log_pop();
-
-                return false;
-            }
-        }
-        else {
-            trace_log_pop();
-
-            return false;
+            break;
         }
     }
 
-    /* Opt-in: off by default, so zero cost unless a caller explicitly asks. */
-    if (self->refuse_symlinks && _http_service_static_is_symlink(self, file_name)) {
-        trace_log_pop();
+    bool const has_extension = !directory_request && !memory_empty(char_find_slice_5(rel_path, rel_path_size, segment_start, ".", CHAR_STATIC_SIZE(".")));
 
-        return false;
+    *out_relative_start     = relative_start;
+    *out_fallback_allowed   = self->spa_fallback && self->fallback_file_size > 0 && !has_extension;
+
+#ifdef HTTP_SERVICE_STATIC_TEST_HOOKS
+    if (_http_service_static_hook_after_resolve != nullptr) {
+        _http_service_static_hook_after_resolve(file_name);
     }
-
-    *out_mimetype = _http_service_static_mimetype(file_name, char_length(file_name), out_charset);
+#endif // HTTP_SERVICE_STATIC_TEST_HOOKS
 
     trace_log_pop();
 
     return true;
 }
 
+/* Whether `character` separates path components where the open reads them: '/' everywhere, and
+ * '\\' too on Windows. */
+static bool _http_service_static_is_separator(char const character) {
+#ifdef _WIN32
+    return character == '/' || character == '\\';
+#else
+    return character == '/';
+#endif // _WIN32
+}
+
 /*
- * Shared conditional-GET/Range/full-file serving decision, once path resolution and header
- * extraction are both done. Both serve_1 (legacy wsi-read headers) and serve_2 (clean
- * http_server_request_header_copy-read headers) funnel into this, so the RFC 9110 decision logic
- * - If-None-Match takes precedence over If-Modified-Since (S13.1.1), If-Range gates whether a
- * Range is honored, the 1 MiB range cap, 416 on an unsatisfiable range - exists exactly once.
+ * Whether the open that just answered nullptr was refused because its final component is a link -
+ * read straight off the OS error state, which file_open_nofollow_try_1 leaves as the refusal's own
+ * (ELOOP from O_NOFOLLOW; ERROR_STOPPED_ON_SYMLINK from the reparse-tag check, a junction
+ * included). It must run before anything that could overwrite that state, so it is not traced.
  */
-static bool _http_service_static_serve_conditional(
-    HTTP_Service_Static const *const self,
-    HTTP_Server_Request *const request,
-    HTTP_Server_Response *const response,
-    char const *const file_name,
-    char const *const mimetype,
-    bool const charset,
+static bool _http_service_static_link_refused(void) {
+#ifdef _WIN32
+    return GetLastError() == ERROR_STOPPED_ON_SYMLINK;
+#else
+    return errno == ELOOP;
+#endif // _WIN32
+}
+
+/*
+ * Whether `file` - the handle that will be served - physically lives at root_final + separator +
+ * `relative`, the request-relative name AS RESOLVED (default_file appended on a directory request,
+ * or the SPA fallback file). The handle's final path is where its bytes live, so a link anywhere
+ * on the way - the final component or ANY ancestor, symlink or junction, swapped in before the
+ * open or present all along - makes the two differ, and so does an 8.3, trailing-dot or link-case
+ * spelling the lexical rules let through. Empty and "." components of `relative` are skipped, as
+ * the open itself skips them, so a doubled slash is not a false refusal. Windows compares
+ * case-insensitively, ASCII only (NTFS names are; a NON-ASCII case variant mismatches and is
+ * refused - the fail-closed direction); POSIX compares exactly. Fails CLOSED: only BELOW_ROOT is
+ * served. An expected path that does not fit answers ELSEWHERE. No root_final (it could not be
+ * resolved at construction) or a handle whose final path cannot be read (Linux without /proc)
+ * answers UNKNOWN, and logs its real cause ONCE per process - one flag per cause, process-wide
+ * because self is const, and swapped with atomic_exchange so of two racing first requests exactly
+ * one logs. Logging those per request would blame a link that does not exist, at a volume that
+ * grows with the traffic. Every other instance's unresolved root was named by its own
+ * construction WARN.
+ */
+static _HTTP_Service_Static_Placement _http_service_static_handle_below_root(HTTP_Service_Static const *const self, File *const file, char const *const relative, USize const relative_size) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+    error_check_null(LOG_METADATA, "file", (void*) file);
+    error_check_null(LOG_METADATA, "relative", (void*) relative);
+
+    static atomic_bool _root_unresolved_warned  = false;
+    static atomic_bool _handle_unnamed_warned   = false;
+
+    if (self->root_final_size == 0) {
+        if (!atomic_exchange_explicit(&_root_unresolved_warned, true, memory_order_relaxed)) {
+            log_message_2(LOG_LEVEL_WARN, LOG_METADATA,
+                "http_service_static: root_dir '%s' had no resolvable final path at construction, so refuse_symlinks cannot tell where a served"
+                " file lives and refuses every request below it until the service is rebuilt over an existing root (logged once per process)",
+                self->root_dir);
+        }
+
+        trace_log_pop();
+
+        return _HTTP_SERVICE_STATIC_PLACEMENT_UNKNOWN;
+    }
+
+    char final_path[_HTTP_SERVICE_STATIC_PATH_BUFFER_MAX] = DEFAULT_INITIALIZATION;
+
+    if (!file_get_final_path(file, final_path, sizeof(final_path))) {
+        if (!atomic_exchange_explicit(&_handle_unnamed_warned, true, memory_order_relaxed)) {
+            log_message_2(LOG_LEVEL_WARN, LOG_METADATA,
+                "http_service_static: the served file's final path could not be resolved (too long for the buffer, or the platform cannot"
+                " report it - see file_get_final_path), so refuse_symlinks cannot tell where it lives and refuses it (logged once per process)");
+        }
+
+        trace_log_pop();
+
+        return _HTTP_SERVICE_STATIC_PLACEMENT_UNKNOWN;
+    }
+
+    char    expected[_HTTP_SERVICE_STATIC_PATH_BUFFER_MAX]  = DEFAULT_INITIALIZATION;
+    USize   expected_size                                   = self->root_final_size;
+    USize   cursor                                          = 0;
+
+    char_copy_3(expected, sizeof(expected), self->root_final, self->root_final_size);
+
+    while (cursor < relative_size) {
+        USize const segment_start = cursor;
+
+        while (cursor < relative_size && !_http_service_static_is_separator(relative[cursor])) {
+            cursor += 1;
+        }
+
+        USize const segment_size = cursor - segment_start;
+
+        cursor += 1;
+
+        if (segment_size == 0 || (segment_size == 1 && relative[segment_start] == '.')) {
+            continue;
+        }
+
+        /* Separator, segment and terminator must all fit: a path that does not is refused, never
+         * truncated - a truncated expected path could equal a prefix it is not. */
+        if (expected_size + 1 + segment_size + CHAR_END_CHARACTER > sizeof(expected)) {
+            trace_log_pop();
+
+            return _HTTP_SERVICE_STATIC_PLACEMENT_ELSEWHERE;
+        }
+
+        if (expected[expected_size - 1] != _HTTP_SERVICE_STATIC_SEPARATOR) {
+            expected[expected_size] = _HTTP_SERVICE_STATIC_SEPARATOR;
+            expected_size += 1;
+        }
+
+        char_copy_3(expected + expected_size, sizeof(expected) - expected_size, relative + segment_start, segment_size);
+
+        expected_size += segment_size;
+    }
+
+    USize const final_size = char_length(final_path);
+
+#ifdef _WIN32
+    bool const below = char_compare_iequal_2(final_path, final_size, expected, expected_size);
+#else
+    bool const below = char_compare_equal_2(final_path, final_size, expected, expected_size);
+#endif // _WIN32
+
+    trace_log_pop();
+
+    return below ? _HTTP_SERVICE_STATIC_PLACEMENT_BELOW_ROOT : _HTTP_SERVICE_STATIC_PLACEMENT_ELSEWHERE;
+}
+
+/*
+ * Open one resolved name for serving. Always NOFOLLOW first: the open itself must never reach a
+ * link's target - a link to a FIFO or a device makes the OPEN the hazard - and a directory, FIFO
+ * or device is refused by the open, so a name that is not a regular file is "not served" exactly
+ * where file_exists_1 used to answer false. A refused LINK then depends on refuse_symlinks. On
+ * (the default) it is refused: logged as a link refusal, distinct from a plain miss, with
+ * *out_link_refused set so the caller does not mask it with the SPA shell. Off, the link is
+ * followed the documented way: its target is resolved (file_final_path_1) and THAT is opened
+ * nofollow, so the target must itself be a regular file and the open still never lands on a link.
+ * Following is a second path resolution - the check-then-open an operator accepts by turning
+ * refuse_symlinks off. Returns the handle, or nullptr.
+ */
+static File* _http_service_static_open_one(HTTP_Service_Static const *const self, char const *const file_name, bool *const out_link_refused) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
+    error_check_null(LOG_METADATA, "out_link_refused", (void*) out_link_refused);
+
+    *out_link_refused = false;
+
+    File *file = file_open_nofollow_try_1(file_name);
+
+    if (!memory_empty(file) || !_http_service_static_link_refused()) {
+        trace_log_pop();
+
+        return file;
+    }
+
+    if (self->refuse_symlinks) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_service_static: link refused: %s is a symlink or junction (refuse_symlinks)", file_name);
+
+        *out_link_refused = true;
+
+        trace_log_pop();
+
+        return nullptr;
+    }
+
+    char target[_HTTP_SERVICE_STATIC_PATH_BUFFER_MAX] = DEFAULT_INITIALIZATION;
+
+    if (file_final_path_1(file_name, target, sizeof(target))) {
+        file = file_open_nofollow_try_1(target);
+    }
+
+    trace_log_pop();
+
+    return file;
+}
+
+/*
+ * Open what _http_service_static_resolve named - or the SPA fallback, when that open fails for
+ * any reason but a refused link and the fallback is allowed - and, under refuse_symlinks, verify
+ * the handle lives where the request said it does (_http_service_static_handle_below_root),
+ * closing it and answering nullptr otherwise. `file_name` is rewritten in place to the fallback's
+ * name when the fallback is taken, so the caller's MIME lookup sees the file actually served. The
+ * handle returned is the one served: nothing after this re-resolves the name.
+ */
+static File* _http_service_static_open(HTTP_Service_Static const *const self, char *const file_name, USize const file_name_capacity, USize const relative_start, bool const fallback_allowed) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
+
+    bool link_refused   = false;
+    File *file          = _http_service_static_open_one(self, file_name, &link_refused);
+
+    if (memory_empty(file) && !link_refused && fallback_allowed) {
+        char_copy_3(file_name + relative_start, file_name_capacity - relative_start, self->fallback_file, self->fallback_file_size);
+
+        file = _http_service_static_open_one(self, file_name, &link_refused);
+    }
+
+    if (memory_empty(file)) {
+        trace_log_pop();
+
+        return nullptr;
+    }
+
+    if (self->refuse_symlinks) {
+        USize                           const   file_name_size  = char_length(file_name);
+        _HTTP_Service_Static_Placement  const   placement       = _http_service_static_handle_below_root(self, file, file_name + relative_start, file_name_size - relative_start);
+
+        if (placement != _HTTP_SERVICE_STATIC_PLACEMENT_BELOW_ROOT) {
+            /* Only ELSEWHERE is this request's own fact; UNKNOWN already named its cause, once. */
+            if (placement == _HTTP_SERVICE_STATIC_PLACEMENT_ELSEWHERE) {
+                log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_service_static: link refused: %s does not live below root_dir (refuse_symlinks)", file_name);
+            }
+
+            file_close(&file);
+
+            trace_log_pop();
+
+            return nullptr;
+        }
+    }
+
+#ifdef HTTP_SERVICE_STATIC_TEST_HOOKS
+    if (_http_service_static_hook_after_open != nullptr) {
+        _http_service_static_hook_after_open(file_name);
+    }
+#endif // HTTP_SERVICE_STATIC_TEST_HOOKS
+
+    trace_log_pop();
+
+    return file;
+}
+
+/*
+ * Queue the headers every served body carries - 200 and 206 alike - ahead of the send:
+ * Accept-Ranges (so a client knows a byte range is worth asking for), the validators when the
+ * handle could be stat'ed (empty strings otherwise, and then omitted - a 206 answers with the
+ * same validators the 200 for the same file would, which is what lets Safari's opening one-byte
+ * probe learn the ETag and send If-Range on the continuation ranges, RFC 9110 S15.3.7), and the
+ * Cache-Control max_age asks for.
+ */
+static void _http_service_static_body_headers_add(HTTP_Server_Response *const response, char const *const etag, char const *const last_modified, U32 const max_age) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "response", (void*) response);
+    error_check_null(LOG_METADATA, "etag", (void*) etag);
+    error_check_null(LOG_METADATA, "last_modified", (void*) last_modified);
+
+    http_server_response_header_add(response, "Accept-Ranges", "bytes");
+
+    if (etag[0] != '\0') {
+        http_server_response_header_add(response, "ETag", etag);
+    }
+
+    if (last_modified[0] != '\0') {
+        http_server_response_header_add(response, "Last-Modified", last_modified);
+    }
+
+    _http_service_static_cache_control_add(response, max_age);
+
+    trace_log_pop();
+}
+
+/*
+ * Shared conditional-GET/Range/full-file serving decision, once the file is open and verified and
+ * the headers are extracted. Both serve_1 (legacy wsi-read headers) and serve_2 (clean
+ * http_server_request_header_copy-read headers) funnel into this, so the RFC 9110 decision logic -
+ * If-None-Match takes precedence over If-Modified-Since (S13.1.1), If-Range gates whether a Range
+ * is honored, 416 on an unsatisfiable range - exists exactly once. Size and mtime come from the
+ * HANDLE, so the validators describe exactly the bytes about to be served.
+ *
+ * TAKES *file: on a 200 or 206 it is handed to http_server_response_send_file_handle, which owns
+ * it from then on; on every other path (304, 416, a refused send) it is closed here. The caller
+ * never closes it.
+ */
+static bool _http_service_static_serve_conditional(HTTP_Service_Static const *const self,
+    HTTP_Server_Request *const request, HTTP_Server_Response *const response, File **const file, char const *const mimetype, bool const charset,
     _HTTP_Service_Static_Conditional_Headers const *const headers) {
     trace_log_push(LOG_METADATA);
 
     error_check_null(LOG_METADATA, "self", (void*) self);
     error_check_null(LOG_METADATA, "response", (void*) response);
-    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
+    error_check_null(LOG_METADATA, "file", (void*) file);
+    error_check_null(LOG_METADATA, "*file", !memory_empty(file) ? (void*) *file : nullptr);
     error_check_null(LOG_METADATA, "mimetype", (void*) mimetype);
     error_check_null(LOG_METADATA, "headers", (void*) headers);
 
     /* Conditional GET: Last-Modified + a strong ETag from size+mtime, a 304 on a
      * weakly-matching If-None-Match, and a 304 on an If-Modified-Since that the file has not
      * changed since - via datetime_from_http_try, an RFC 7231 IMF-fixdate parser. */
-    USize   file_size   = 0;
-    I64     mtime       = 0;
-    bool    const have_stat = file_size_1(file_name, &file_size) && file_modified_1(file_name, &mtime);
+    USize   const   file_size   = file_get_size(*file);
+    I64             mtime       = 0;
+    bool    const   have_stat   = file_get_modified(*file, &mtime);
 
     char    etag[64]            = DEFAULT_INITIALIZATION;
     USize   etag_size           = 0;
     char    last_modified[40]   = DEFAULT_INITIALIZATION;
 
-    /* Rendered ONCE, and handed to whichever of the three senders below answers, so exactly one
-     * Content-Type reaches the wire whatever the status code is. */
+    /* Rendered ONCE, and handed to whichever sender below answers, so exactly one Content-Type
+     * reaches the wire whatever the status code is. */
     char content_type[_HTTP_SERVICE_STATIC_CONTENT_TYPE_MAX] = DEFAULT_INITIALIZATION;
 
     _http_service_static_content_type(mimetype, charset, content_type, sizeof(content_type));
@@ -1130,6 +1147,8 @@ static bool _http_service_static_serve_conditional(
         }
 
         if (not_modified) {
+            file_close(file);
+
             http_server_response_header_add(response, "ETag", etag);
             http_server_response_header_add(response, "Last-Modified", last_modified);
 
@@ -1155,9 +1174,10 @@ static bool _http_service_static_serve_conditional(
      * If-Range (if present) still matches the current ETag, so a range is never served against a
      * stale cached copy. If-Range uses the STRONG comparison (RFC 9110 S13.1.5): the byte-equal
      * test below is exactly that against our strong tag, and a W/-prefixed value - which a client
-     * must not send there - never matches, so it falls back to a full 200. libwebsockets is a system dependency, not vendored, and whether it was
-     * built with LWS_WITH_RANGES cannot be assumed, so this hand-rolled path runs
-     * unconditionally.
+     * must not send there - never matches, so it falls back to a full 200. The window is whatever
+     * the client asked for, streamed from the handle like the 200 - no cap, no module-side
+     * buffer. A malformed or multi-range value is ignored (a full 200, which RFC 9110 permits); a
+     * syntactically valid range naming no existing byte answers 416.
      */
     if (headers->range_size > 0) {
         bool range_valid = true;
@@ -1166,41 +1186,91 @@ static bool _http_service_static_serve_conditional(
             range_valid = have_stat && etag_size > 0 && char_compare_equal_2(headers->if_range, headers->if_range_size, etag, etag_size);
         }
 
-        if (range_valid && _http_service_static_serve_range(request, file_name, content_type, headers->range, self->max_age, etag, last_modified, response)) {
+        USize   start           = 0;
+        USize   end             = 0;
+        bool    unsatisfiable   = false;
+
+        if (range_valid && _http_service_static_range_parse(headers->range, file_size, &start, &end, &unsatisfiable)) {
+            char content_range[_HTTP_SERVICE_STATIC_RANGE_HEADER_MAX] = DEFAULT_INITIALIZATION;
+
+            snprintf(content_range, sizeof(content_range), "bytes %llu-%llu/%llu", (unsigned long long) start, (unsigned long long) end, (unsigned long long) file_size);
+
+            http_server_response_header_add(response, "Content-Range", content_range);
+
+            _http_service_static_body_headers_add(response, etag, last_modified, self->max_age);
+
+            bool const served = http_server_response_send_file_handle(response, file, start, end - start + 1, content_type, HTTP_SERVER_STATUS_CODE_PARTIAL_CONTENT);
+
+            if (!served && !memory_empty(*file)) {
+                file_close(file);
+            }
+
+            trace_log_pop();
+
+            return served;
+        }
+
+        if (range_valid && unsatisfiable) {
+            file_close(file);
+
+            char content_range[_HTTP_SERVICE_STATIC_RANGE_HEADER_MAX] = DEFAULT_INITIALIZATION;
+
+            snprintf(content_range, sizeof(content_range), "bytes */%llu", (unsigned long long) file_size);
+
+            /* Accept-Ranges on the 416 too: harmless, and it tells a client
+             * whose range was out of bounds that a corrected one is still worth sending. */
+            http_server_response_header_add(response, "Accept-Ranges", "bytes");
+            http_server_response_header_add(response, "Content-Range", content_range);
+            http_server_response_send_empty(response, HTTP_SERVER_STATUS_CODE_REQ_RANGE_NOT_SATISFIABLE);
+
             trace_log_pop();
 
             return true;
         }
     }
 
-    char extra_headers[2048] = DEFAULT_INITIALIZATION;
-    USize extra_headers_size = 0;
+    _http_service_static_body_headers_add(response, etag, last_modified, self->max_age);
 
-    /* Advertise range support so clients know they may request byte ranges. */
-    _http_service_static_headers_append(extra_headers, sizeof(extra_headers), &extra_headers_size, "Accept-Ranges: bytes\r\n");
+    /* The seam answers false with nothing written and the handle still ours - closed here, and
+     * the caller's own fallback reply still goes out. On true it owns the handle; on a HEAD it
+     * has already closed it and completed the transaction. */
+    bool const served = http_server_response_send_file_handle(response, file, 0, file_size, content_type, HTTP_SERVER_STATUS_CODE_OK);
 
-    if (have_stat) {
-        _http_service_static_headers_append(extra_headers, sizeof(extra_headers), &extra_headers_size, "ETag: %s\r\nLast-Modified: %s\r\n", etag, last_modified);
+    if (!served && !memory_empty(*file)) {
+        file_close(file);
     }
-
-    if (self->max_age > 0) {
-        /* http_headers_cache_max_age_into already clamps itself (returns 0 on overflow), so the
-         * remaining-capacity arithmetic here stays safe without going through the helper above. */
-        extra_headers_size += http_headers_cache_max_age_into(extra_headers + extra_headers_size, sizeof(extra_headers) - extra_headers_size, (USize) self->max_age);
-    }
-
-    /* No "Content-Type:" line in this block: the charset travels in content_type, which
-     * libwebsockets emits as the reply's ONE Content-Type header. */
-
-    /* http_server_response_send_file merges in anything already queued on `response` via
-     * http_server_response_header_add (Cache-Control, Set-Cookie, ...) itself, and sets
-     * write_success/file_served on `response` internally, so no manual bookkeeping around a raw
-     * lws_serve_http_file call is needed here. */
-    bool const served = http_server_response_send_file(response, file_name, content_type, extra_headers_size > 0 ? extra_headers : nullptr, extra_headers_size);
 
     trace_log_pop();
 
     return served;
+}
+
+/*
+ * Take root_dir's final path ONCE, at construction, into self->root_final - the prefix every
+ * served handle's final path is compared against under refuse_symlinks. A root that cannot be
+ * resolved then (missing, unreadable, too long for the buffer) leaves root_final EMPTY and logs
+ * one WARN: refuse_symlinks then refuses every request - fail closed - until the service is
+ * rebuilt over a root that exists. A root that is itself a link is legal: its final path is the
+ * target, and requests compare below the target.
+ */
+static void _http_service_static_root_final_take(HTTP_Service_Static *const self, char const *const caller) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+    error_check_null(LOG_METADATA, "caller", (void*) caller);
+
+    if (file_final_path_1(self->root_dir, self->root_final, sizeof(self->root_final))) {
+        self->root_final_size = char_length(self->root_final);
+    }
+    else {
+        /* file_final_path_1 left root_final empty, and root_final_size is still the zero the
+         * constructor's DEFAULT_INITIALIZATION gave it - the fail-closed state. */
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA,
+            "%s: root_dir '%s' has no resolvable final path; refuse_symlinks (on by default) refuses every request until the service is rebuilt"
+            " over an existing root", caller, self->root_dir);
+    }
+
+    trace_log_pop();
 }
 
 /*==============================================================================
@@ -1272,7 +1342,9 @@ HTTP_Service_Static http_service_static_init_1(char const *const root_dir, char 
     self.spa_fallback       = false;
     self.max_age            = 0;
     self.refuse_dotfiles    = false;
-    self.refuse_symlinks    = false;
+    self.refuse_symlinks    = true;
+
+    _http_service_static_root_final_take(&self, "http_service_static_init_1");
 
     trace_log_pop();
 
@@ -1324,7 +1396,9 @@ HTTP_Service_Static http_service_static_init_2(char const *const root_dir, char 
     self.spa_fallback       = spa_fallback;
     self.max_age            = max_age;
     self.refuse_dotfiles    = false;
-    self.refuse_symlinks    = false;
+    self.refuse_symlinks    = true;
+
+    _http_service_static_root_final_take(&self, "http_service_static_init_2");
 
     trace_log_pop();
 
@@ -1338,15 +1412,28 @@ bool http_service_static_serve_1(HTTP_Service_Static const *const self, HTTP_Ser
     error_check_null(LOG_METADATA, "response", (void*) response);
     error_check_null(LOG_METADATA, "path", (void*) path);
 
-    char            file_name[HTTP_SERVER_PATH_MAX_LENGTH * 4]  = DEFAULT_INITIALIZATION;
-    char    const   *mimetype                                   = nullptr;
-    bool            charset                                     = false;
+    char    file_name[_HTTP_SERVICE_STATIC_PATH_BUFFER_MAX]  = DEFAULT_INITIALIZATION;
+    USize   relative_start                                  = 0;
+    bool    fallback_allowed                                = false;
 
-    if (!_http_service_static_resolve(self, path, path_size, file_name, sizeof(file_name), &mimetype, &charset)) {
+    if (!_http_service_static_resolve(self, path, path_size, file_name, sizeof(file_name), &relative_start, &fallback_allowed)) {
         trace_log_pop();
 
         return false;
     }
+
+    /* Opened, and under refuse_symlinks verified, BEFORE any header is read: a refusal returns
+     * here having touched nothing on the response. */
+    File *file = _http_service_static_open(self, file_name, sizeof(file_name), relative_start, fallback_allowed);
+
+    if (memory_empty(file)) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    bool                charset     = false;
+    char const *const   mimetype    = _http_service_static_mimetype(file_name, char_length(file_name), &charset);
 
     /*
      * This entry point receives no HTTP_Server_Request, so it cannot use
@@ -1390,7 +1477,7 @@ bool http_service_static_serve_1(HTTP_Service_Static const *const self, HTTP_Ser
 
     /* nullptr: this entry point has no HTTP_Server_Request, so the compression seam has no
      * Accept-Encoding to read and every body it sends stays identity. */
-    bool const served = _http_service_static_serve_conditional(self, nullptr, response, file_name, mimetype, charset, &headers);
+    bool const served = _http_service_static_serve_conditional(self, nullptr, response, &file, mimetype, charset, &headers);
 
     trace_log_pop();
 
@@ -1407,15 +1494,28 @@ bool http_service_static_serve_2(HTTP_Service_Static const *const self, HTTP_Ser
     char const *const path_data = http_server_request_get_path_1(request);
     USize const path_size = http_server_request_get_path_size(request);
 
-    char            file_name[HTTP_SERVER_PATH_MAX_LENGTH * 4]  = DEFAULT_INITIALIZATION;
-    char    const   *mimetype                                   = nullptr;
-    bool            charset                                     = false;
+    char    file_name[_HTTP_SERVICE_STATIC_PATH_BUFFER_MAX]  = DEFAULT_INITIALIZATION;
+    USize   relative_start                                  = 0;
+    bool    fallback_allowed                                = false;
 
-    if (!_http_service_static_resolve(self, path_data, path_size, file_name, sizeof(file_name), &mimetype, &charset)) {
+    if (!_http_service_static_resolve(self, path_data, path_size, file_name, sizeof(file_name), &relative_start, &fallback_allowed)) {
         trace_log_pop();
 
         return false;
     }
+
+    /* Opened, and under refuse_symlinks verified, BEFORE any header is read: a refusal returns
+     * here having touched nothing on the response. */
+    File *file = _http_service_static_open(self, file_name, sizeof(file_name), relative_start, fallback_allowed);
+
+    if (memory_empty(file)) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    bool                charset     = false;
+    char const *const   mimetype    = _http_service_static_mimetype(file_name, char_length(file_name), &charset);
 
     /* The clean path: every header read through http_server_request_header_copy, no raw wsi. */
     _HTTP_Service_Static_Conditional_Headers headers = DEFAULT_INITIALIZATION;
@@ -1448,12 +1548,30 @@ bool http_service_static_serve_2(HTTP_Service_Static const *const self, HTTP_Ser
         headers.if_range_size = char_length(if_range);
     }
 
-    bool const served = _http_service_static_serve_conditional(self, request, response, file_name, mimetype, charset, &headers);
+    bool const served = _http_service_static_serve_conditional(self, request, response, &file, mimetype, charset, &headers);
 
     trace_log_pop();
 
     return served;
 }
+
+#ifdef HTTP_SERVICE_STATIC_TEST_HOOKS
+void http_service_static_test_hook_after_open_set(FpHTTP_Service_Static_Test_Hook const hook) {
+    trace_log_push(LOG_METADATA);
+
+    _http_service_static_hook_after_open = hook;
+
+    trace_log_pop();
+}
+
+void http_service_static_test_hook_after_resolve_set(FpHTTP_Service_Static_Test_Hook const hook) {
+    trace_log_push(LOG_METADATA);
+
+    _http_service_static_hook_after_resolve = hook;
+
+    trace_log_pop();
+}
+#endif // HTTP_SERVICE_STATIC_TEST_HOOKS
 
 void http_service_static_uninit(HTTP_Service_Static *const self) {
     trace_log_push(LOG_METADATA);

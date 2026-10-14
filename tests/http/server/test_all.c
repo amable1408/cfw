@@ -14,6 +14,9 @@
 #include <stdio.h>
 
 #include <chrono/chrono.h>
+#ifndef _WIN32
+#include <dir/dir.h>
+#endif // _WIN32
 #include <math/scalar.h>
 #include <http/server/http_server.h>
 #include <log/log.h>
@@ -24,17 +27,75 @@
 /*==============================================================================
  * MARK: - Constants
  *============================================================================*/
+/* A raw header block every raw path must accept: an HTAB inside a value and an empty value. */
+#define _BLOCK_ACCEPTED             "X-Raw-Good: a\tb\r\nX-Raw-Empty: \r\n"
+/* The CR/LF chokepoint case: its served file, one formatted assertion name, and one byte per
+ * send_file call it makes (seven blocks, five types, the accepted call, the terminator). */
+#define _CHOKEPOINT_FIXTURE_SIZE    64
+#define _CHOKEPOINT_NAME_MAX        96
+#define _CHOKEPOINT_RECORD_MAX      16
 #define _CLIENT_BODY_MAX            65536
 #define _CLIENT_HEADERS_MAX         8192
 #define _CLIENT_IO_TIMEOUT_MS       4000
 #define _CLIENT_RAW_MAX             131072
+/* A content type every sender must accept: HTAB is RFC 9110 whitespace inside a field value. */
+#define _CONTENT_TYPE_ACCEPTED      "text/plain;\tcharset=utf-8"
+#define _DECIMAL_RADIX              10
+/* A fixture the server thread may still hold is retried this often before it counts as stuck. */
+#define _FIXTURE_REMOVE_ATTEMPTS    40
+#define _FIXTURE_REMOVE_SLEEP_MS    25
 #define _FORWARDED_DEEP_ENTRIES     33
 #define _FORWARDED_TEST_ENTRIES     40
+/* Two handle-count readings this far apart that agree make a baseline. */
+#define _HANDLE_BASELINE_SLEEP_MS   100
+/* Handle-count pins poll this many rounds, this far apart (4 s), for the server to tear its wsi down. */
+#define _HANDLE_SETTLE_ROUNDS       160
+#define _HANDLE_SETTLE_SLEEP_MS     25
 #define _HEADER_ENUM_COUNT          15
 #define _OWNING_ROUNDS              64
+/* The stream fixtures' integer-hash mixer: two odd multipliers and three xor-shifts. */
+#define _PATTERN_MULTIPLIER_1       2654435761u
+#define _PATTERN_MULTIPLIER_2       2246822519u
+#define _PATTERN_SHIFT_1            15
+#define _PATTERN_SHIFT_2            13
+#define _PATTERN_SHIFT_3            8
 #define _PAYLOAD_TEST_MAX           4096
+/* A short header value ("yes", "0") and a numeric one (a Content-Length). */
+#define _REPLY_FLAG_MAX             16
+#define _REPLY_VALUE_MAX            32
 #define _ROUTE_BENCHMARK_ROUNDS     20000
 #define _ROUTE_BENCHMARK_ROUTES     80
+/* 2 MiB: large enough that the client's stall leaves the stream in flight (loopback buffers
+ * hold far less), so the disconnect and truncation pins exercise the mid-stream paths. */
+#define _STREAM_BIG_FIXTURE_SIZE    (2 * 1024 * 1024)
+/* A connection the server closed must do so well inside the client's 4 s IO timeout. */
+#define _STREAM_CLOSE_MAX_MS        3000
+/* 1 MiB + 1: crosses 16 chunk boundaries and ends mid-chunk. */
+#define _STREAM_FIXTURE_SIZE        (1024 * 1024 + 1)
+/* The past-EOF refusal asks for a window that starts this close to the end and runs past it. */
+#define _STREAM_PAST_EOF_BACK       5
+#define _STREAM_READ_MAX            65536
+/* The plain one-shot stream request: the server closes once the body is sent. */
+#define _STREAM_REQUEST_CLOSE       "GET /stream HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"
+/* The slow reader's receive buffer, pinned before connect so the RECEIVE side holds 4 KiB.
+ * It does not bound the server's send buffer, which a kernel autotunes on its own (Windows
+ * loopback was measured buffering ~5 MB for one slow reader) - _STREAM_SLOW_FIXTURE_SIZE and
+ * the held-handle check are what keep the stream genuinely in flight while it stalls. */
+#define _STREAM_SLOW_BUFFER         4096
+/* 32 MiB: far past what either kernel buffers for one connection, so the server still has
+ * chunks left to write when the stall ends. Only the slow-reader case writes it. */
+#define _STREAM_SLOW_FIXTURE_SIZE   (32 * 1024 * 1024)
+/* Over the baseline while the stream is in flight: the client's own socket, the server's
+ * accepted socket, and the stream's FILE*. A server that finished (or dropped) the stream
+ * holds neither of its two, so it reads 1. */
+#define _STREAM_SLOW_HELD_HANDLES   3
+/* Past the 20 s a chunk used to get (with 3 s of margin), well inside the 129 s a full chunk
+ * gets at the 1 KiB/s minimum read rate over two windows of drain. */
+#define _STREAM_SLOW_STALL_MS       23000
+#define _STREAM_TRUNCATE_TO         1024
+/* Straddles the first chunk boundary (65531 + 10 > 65536). */
+#define _STREAM_WINDOW_SIZE         10
+#define _STREAM_WINDOW_START        65531
 
 /*==============================================================================
  * MARK: - Request builder
@@ -89,6 +150,34 @@ static bool _client_open(U16 const port, Net_Socket *const out) {
     }
 
     if (result_is_error(net_socket_connect(*out, &address))) {
+        net_socket_close(*out);
+
+        return false;
+    }
+
+    net_socket_set_timeout(*out, _CLIENT_IO_TIMEOUT_MS);
+    net_socket_set_nodelay(*out, true);
+
+    return true;
+}
+
+/**
+ * @brief _client_open with SO_RCVBUF pinned to RECEIVE_BUFFER_SIZE BEFORE the connect, so the
+ *        window the server sees stays that small instead of autotuning past the body. Raw
+ *        setsockopt, because net has no receive-buffer setter.
+ */
+static bool _client_open_receive_buffer(U16 const port, I32 const receive_buffer_size, Net_Socket *const out) {
+    Net_Socket_Address address = DEFAULT_INITIALIZATION;
+
+    if (result_is_error(net_socket_address_init_2(NET_FAMILY_IPV4, port, "127.0.0.1", &address))) {
+        return false;
+    }
+
+    if (result_is_error(net_socket_init(out, NET_FAMILY_IPV4, NET_TYPE_TCP))) {
+        return false;
+    }
+
+    if (setsockopt(*out, SOL_SOCKET, SO_RCVBUF, (char const*) &receive_buffer_size, sizeof(receive_buffer_size)) != 0 || result_is_error(net_socket_connect(*out, &address))) {
         net_socket_close(*out);
 
         return false;
@@ -311,6 +400,50 @@ static bool _client_round_trip(U16 const port, char const *const request, _Reply
     net_socket_close(socket);
 
     return ok;
+}
+
+/** @brief The Content-Length a reply declares, or 0. */
+static USize _reply_content_length(_Reply const *const reply) {
+    char    text[_REPLY_VALUE_MAX]  = DEFAULT_INITIALIZATION;
+    USize   value                   = 0;
+
+    if (_reply_header(reply, "content-length:", text, sizeof(text))) {
+        for (USize index = 0; text[index] >= '0' && text[index] <= '9'; index += 1) {
+            value = (value * _DECIMAL_RADIX) + (USize) (text[index] - '0');
+        }
+    }
+
+    return value;
+}
+
+/** @brief How many times a header NAME (lowercase, colon included) occurs in a reply. */
+static USize _reply_header_count(_Reply const *const reply, char const *const name) {
+    static char lowered[_CLIENT_HEADERS_MAX] = DEFAULT_INITIALIZATION;
+
+    USize const size        = reply->headers_size < sizeof(lowered) ? reply->headers_size : sizeof(lowered) - CHAR_END_CHARACTER;
+    USize const name_size   = char_length(name);
+    USize       offset      = 0;
+    USize       count       = 0;
+
+    memory_copy_1((Byte*) lowered, (Byte*) reply->headers, size);
+
+    lowered[size] = '\0';
+
+    char_lower_2(lowered, size);
+
+    /* Guarded on the remainder: char_find_slice_5 aborts when the needle outruns the haystack. */
+    while (size - offset >= name_size) {
+        char const *const found = char_find_slice_5(lowered + offset, size - offset, 0, (char*) name, name_size);
+
+        if (memory_empty(found)) {
+            break;
+        }
+
+        count   += 1;
+        offset  = (USize) (found - lowered) + name_size;
+    }
+
+    return count;
 }
 
 /*==============================================================================
@@ -693,6 +826,376 @@ static Byte _big_body[16384] = DEFAULT_INITIALIZATION;
 static void _route_big_body(HTTP_Server_Route *const route) {
     http_server_response_send_2(http_server_route_get_holder(route)->response, _big_body, sizeof(_big_body),
                                 HTTP_SERVER_CONTENT_TYPE_APPLICATION_OCTET_STREAM, HTTP_SERVER_STATUS_CODE_OK);
+}
+
+/* The send_file_handle routes. The window, status and fixture are set by the test before each
+ * request and read by the route on the service thread - sequenced by the request itself, as
+ * the suite's other route globals are. */
+static char _stream_fixture_name[CHAR_STATIC_SIZE("http_server_suite_stream_65535.bin") + CHAR_END_CHARACTER]         = DEFAULT_INITIALIZATION;
+static char _stream_big_fixture_name[CHAR_STATIC_SIZE("http_server_suite_stream_big_65535.bin") + CHAR_END_CHARACTER] = DEFAULT_INITIALIZATION;
+
+static char const   *_stream_served = nullptr;
+static USize        _stream_start   = 0;
+static USize        _stream_size    = 0;
+static U16          _stream_status  = HTTP_SERVER_STATUS_CODE_OK;
+static bool         _stream_ok      = false;
+
+static void _stream_fixture_names_set(U16 const port) {
+    snprintf(_stream_fixture_name, sizeof(_stream_fixture_name), "http_server_suite_stream_%u.bin", (unsigned) port);
+    snprintf(_stream_big_fixture_name, sizeof(_stream_big_fixture_name), "http_server_suite_stream_big_%u.bin", (unsigned) port);
+}
+
+static void _route_stream(HTTP_Server_Route *const route) {
+    HTTP_Server_Holder *const holder = http_server_route_get_holder(route);
+
+    File *file = file_open_try_1(_stream_served, "rb");
+
+    if (memory_empty(file)) {
+        http_server_response_send_1(holder->response, "no fixture", HTTP_SERVER_CONTENT_TYPE_TEXT_PLAIN, HTTP_SERVER_STATUS_CODE_INTERNAL_SERVER_ERROR);
+
+        return;
+    }
+
+    http_server_response_header_add(holder->response, "X-Queued", "yes");
+
+    _stream_ok = http_server_response_send_file_handle(holder->response, &file, _stream_start, _stream_size, HTTP_SERVER_CONTENT_TYPE_APPLICATION_OCTET_STREAM, _stream_status);
+
+    /* A refusal leaves the handle with the caller and writes nothing, so the route's own
+     * reply goes out - the shape static takes for its 416. */
+    if (!_stream_ok) {
+        file_close(&file);
+
+        http_server_response_send_1(holder->response, "fallback", HTTP_SERVER_CONTENT_TYPE_TEXT_PLAIN, HTTP_SERVER_STATUS_CODE_REQ_RANGE_NOT_SATISFIABLE);
+    }
+}
+
+static void _route_stream_after_send(HTTP_Server_Route *const route) {
+    HTTP_Server_Holder *const holder = http_server_route_get_holder(route);
+
+    _send_text(holder->response, "first");
+
+    File *file = file_open_try_1(_stream_served, "rb");
+
+    if (memory_empty(file)) {
+        return;
+    }
+
+    _stream_ok = http_server_response_send_file_handle(holder->response, &file, 0, _stream_size, HTTP_SERVER_CONTENT_TYPE_APPLICATION_OCTET_STREAM, HTTP_SERVER_STATUS_CODE_OK);
+
+    if (!memory_empty(file)) {
+        file_close(&file);
+    }
+}
+
+/* A handle that is not a regular file. Linux: fopen of a directory succeeds and file_regular
+ * says so. Windows: fopen refuses a directory and file_regular is tautologically true, so the
+ * equivalent is the NUL device - a handle with no file size, which the window check refuses. */
+static void _route_stream_irregular(HTTP_Server_Route *const route) {
+    HTTP_Server_Holder *const holder = http_server_route_get_holder(route);
+
+#ifdef _WIN32
+    File *file = file_open_try_1("NUL", "rb");
+#else
+    File *file = file_open_try_1(".", "rb");
+#endif // _WIN32
+
+    if (memory_empty(file)) {
+        http_server_response_send_1(holder->response, "no handle", HTTP_SERVER_CONTENT_TYPE_TEXT_PLAIN, HTTP_SERVER_STATUS_CODE_INTERNAL_SERVER_ERROR);
+
+        return;
+    }
+
+    _stream_ok = http_server_response_send_file_handle(holder->response, &file, 0, 1, HTTP_SERVER_CONTENT_TYPE_APPLICATION_OCTET_STREAM, HTTP_SERVER_STATUS_CODE_OK);
+
+    if (!memory_empty(file)) {
+        file_close(&file);
+    }
+
+    http_server_response_send_1(holder->response, "fallback", HTTP_SERVER_CONTENT_TYPE_TEXT_PLAIN, HTTP_SERVER_STATUS_CODE_NOT_FOUND);
+}
+
+/* The CR/LF chokepoint routes. A content type and a raw header block both reach the wire verbatim
+ * through libwebsockets, so every refused shape carries an "X-Injected" line that would surface as
+ * a header of its own if the refusal let it through. The type is set by the test before each
+ * request, sequenced by the request itself as the stream globals are. */
+static char const *const _CONTENT_TYPES_REFUSED[] = {
+    "text/plain\r\nX-Injected: crlf",
+    "text/plain\rX-Injected: cr",
+    "text/plain\nX-Injected: lf",
+    "text/plain\x01",
+    "text/plain\x7F"
+};
+
+/* One per refusal in _http_server_header_lines_valid, in its order. */
+static char const *const _MALFORMED_BLOCKS[] = {
+    "X-Raw: ok\r\nX-Injected: unterminated",
+    "X-Raw: ok\nX-Injected: bare-lf\r\n",
+    "X-Raw: ok\rX-Injected: bare-cr\r\n",
+    "X-Raw: ok\r\n\r\nX-Injected: empty-line\r\n",
+    "X Injected: not-a-token\r\n",
+    "X-Injected:no-space\r\n",
+    "X-Injected: control\x01\r\n"
+};
+
+static char const   *_content_type_value                        = HTTP_SERVER_CONTENT_TYPE_TEXT_PLAIN;
+static char         _file_blocks_record[_CHOKEPOINT_RECORD_MAX] = DEFAULT_INITIALIZATION;
+static bool         _type_stream_handle_kept                    = false;
+
+static void _route_type_send_1(HTTP_Server_Route *const route) {
+    http_server_response_send_1(http_server_route_get_holder(route)->response, "typed", _content_type_value, HTTP_SERVER_STATUS_CODE_OK);
+}
+
+static void _route_type_send_2(HTTP_Server_Route *const route) {
+    http_server_response_send_2(http_server_route_get_holder(route)->response, (Byte const*) "typed", CHAR_STATIC_SIZE("typed"), _content_type_value, HTTP_SERVER_STATUS_CODE_OK);
+}
+
+/* A refused type is a refusal like the window's: false, nothing written, the response NOT failed,
+ * so the route's fallback send_2 must reach the peer - and the handle is still the route's. */
+static void _route_type_stream(HTTP_Server_Route *const route) {
+    HTTP_Server_Holder *const holder = http_server_route_get_holder(route);
+
+    File *file = file_open_try_1(_stream_served, "rb");
+
+    if (memory_empty(file)) {
+        return;
+    }
+
+    _stream_ok = http_server_response_send_file_handle(holder->response, &file, 0, _stream_size, _content_type_value, HTTP_SERVER_STATUS_CODE_OK);
+
+    _type_stream_handle_kept = !memory_empty(file);
+
+    if (!_stream_ok) {
+        file_close(&file);
+
+        http_server_response_send_2(holder->response, (Byte const*) "fallback", CHAR_STATIC_SIZE("fallback"), HTTP_SERVER_CONTENT_TYPE_TEXT_PLAIN,
+                                    HTTP_SERVER_STATUS_CODE_INTERNAL_SERVER_ERROR);
+    }
+}
+
+/* One byte per call - '1' accepted, '0' refused - sent back as the body. */
+static void _route_raw_blocks(HTTP_Server_Route *const route) {
+    HTTP_Server_Holder *const holder = http_server_route_get_holder(route);
+
+    USize cursor = 0;
+
+    for (USize index = 0; index < sizeof(_MALFORMED_BLOCKS) / sizeof(_MALFORMED_BLOCKS[0]); index += 1) {
+        char const *const block = _MALFORMED_BLOCKS[index];
+
+        _scratch[cursor] = http_server_response_header_add_raw(holder->response, block, char_length(block)) ? '1' : '0';
+        cursor += 1;
+    }
+
+    /* header_add hands its line to the raw path, so a name that passes header_add's own
+     * control-byte check but is not a token is refused there. */
+    _scratch[cursor] = http_server_response_header_add(holder->response, "X Injected", "header-add") ? '1' : '0';
+    cursor += 1;
+
+    _scratch[cursor] = http_server_response_header_add_raw(holder->response, _BLOCK_ACCEPTED, CHAR_STATIC_SIZE(_BLOCK_ACCEPTED)) ? '1' : '0';
+    cursor += 1;
+
+    http_server_response_send_2(holder->response, (Byte const*) _scratch, cursor, HTTP_SERVER_CONTENT_TYPE_TEXT_PLAIN, HTTP_SERVER_STATUS_CODE_OK);
+}
+
+/* One byte per send_file call into _file_blocks_record. A refusal writes nothing and leaves the
+ * response to the next call, so the last, well-formed call is the one that serves the file. */
+static void _route_file_blocks(HTTP_Server_Route *const route) {
+    HTTP_Server_Holder *const holder = http_server_route_get_holder(route);
+
+    USize cursor = 0;
+
+    for (USize index = 0; index < sizeof(_MALFORMED_BLOCKS) / sizeof(_MALFORMED_BLOCKS[0]); index += 1) {
+        char const *const block = _MALFORMED_BLOCKS[index];
+        bool const served = http_server_response_send_file(holder->response, _stream_served, HTTP_SERVER_CONTENT_TYPE_APPLICATION_OCTET_STREAM, block, char_length(block));
+
+        _file_blocks_record[cursor] = served ? '1' : '0';
+        cursor += 1;
+    }
+
+    for (USize index = 0; index < sizeof(_CONTENT_TYPES_REFUSED) / sizeof(_CONTENT_TYPES_REFUSED[0]); index += 1) {
+        _file_blocks_record[cursor] = http_server_response_send_file(holder->response, _stream_served, _CONTENT_TYPES_REFUSED[index], nullptr, 0) ? '1' : '0';
+        cursor += 1;
+    }
+
+    _file_blocks_record[cursor] = http_server_response_send_file(holder->response, _stream_served, _CONTENT_TYPE_ACCEPTED, _BLOCK_ACCEPTED, CHAR_STATIC_SIZE(_BLOCK_ACCEPTED)) ? '1' : '0';
+    cursor += 1;
+
+    _file_blocks_record[cursor] = '\0';
+}
+
+/*==============================================================================
+ * MARK: - Streamed-file client
+ *============================================================================*/
+/** @brief Byte INDEX of the stream fixtures: a pure function of the offset, so any window can be checked without the file, with no short period a chunk boundary could hide behind. */
+static Byte _pattern_byte(USize const index) {
+    U32 value = (U32) index * _PATTERN_MULTIPLIER_1;
+
+    value ^= value >> _PATTERN_SHIFT_1;
+    value *= _PATTERN_MULTIPLIER_2;
+    value ^= value >> _PATTERN_SHIFT_2;
+
+    return (Byte) (value ^ (value >> _PATTERN_SHIFT_3));
+}
+
+/** @brief Write SIZE pattern bytes to NAME, 64 KiB at a time. */
+static bool _fixture_write(char const *const name, USize const size) {
+    static Byte block[_STREAM_READ_MAX] = DEFAULT_INITIALIZATION;
+
+    File *file = file_open_try_1(name, "wb");
+
+    if (memory_empty(file)) {
+        return false;
+    }
+
+    USize   written = 0;
+    bool    ok      = true;
+
+    while (ok && written < size) {
+        USize const count = math_min_u(size - written, sizeof(block));
+
+        for (USize index = 0; index < count; index += 1) {
+            block[index] = _pattern_byte(written + index);
+        }
+
+        ok      = file_write_1(file, block, 1, count) == count;
+        written += count;
+    }
+
+    file_close(&file);
+
+    return ok;
+}
+
+/**
+ * @brief Read one reply's headers, then its body up to Content-Length or EOF, checking every
+ *        body byte against the pattern from WINDOW_START without buffering the body (the
+ *        _Reply body cap is 64 KiB; the fixtures are MiBs).
+ * @param out_size  Body bytes received.
+ * @param out_exact Every received byte matched the pattern.
+ * @param out_eof   The peer closed before Content-Length was reached (false on a timeout too).
+ */
+static bool _client_read_window(Net_Socket const socket, _Reply *const reply, USize const window_start, USize *const out_size, bool *const out_exact, bool *const out_eof) {
+    static Byte buffer[_STREAM_READ_MAX] = DEFAULT_INITIALIZATION;
+
+    if (!_client_read_headers(socket, reply)) {
+        return false;
+    }
+
+    USize const expected    = _reply_content_length(reply);
+    USize       received    = reply->body_size;
+    bool        exact       = true;
+    bool        eof         = false;
+
+    /* Whatever arrived behind the header terminator in the same read is the body's start. */
+    for (USize index = 0; index < reply->body_size; index += 1) {
+        exact = exact && (Byte) _raw[reply->headers_size + index] == _pattern_byte(window_start + index);
+    }
+
+    while (received < expected) {
+        USize           got     = 0;
+        Result  const   result  = net_socket_recv_1(socket, buffer, sizeof(buffer), &got);
+
+        if (result_is_error(result)) {
+            break;
+        }
+
+        if (got == 0) {
+            eof = true;
+
+            break;
+        }
+
+        for (USize index = 0; index < got; index += 1) {
+            exact = exact && buffer[index] == _pattern_byte(window_start + received + index);
+        }
+
+        received += got;
+    }
+
+    *out_size   = received;
+    *out_exact  = exact;
+    *out_eof    = eof;
+
+    return true;
+}
+
+/**
+ * @brief The process's open-handle count: /proc/self/fd entries on Linux (the listing's own
+ *        descriptor is counted on every call alike), GetProcessHandleCount on Windows. The
+ *        server runs in-process, so a File* the seam failed to close shows up here.
+ */
+static bool _handle_count(USize *const out) {
+#ifdef _WIN32
+    DWORD count = 0;
+
+    if (!GetProcessHandleCount(GetCurrentProcess(), &count)) {
+        return false;
+    }
+
+    *out = (USize) count;
+
+    return true;
+#else
+    DirEntry    *entries    = nullptr;
+    USize       count       = 0;
+
+    if (!dir_list_entries_1("/proc/self/fd", &entries, &count)) {
+        return false;
+    }
+
+    dir_list_entries_uninit(entries, count);
+
+    *out = count;
+
+    return true;
+#endif // _WIN32
+}
+
+/** @brief Poll until the handle count is back at BASELINE: the server tears its wsi down on its own thread, after the client already has its bytes. */
+static bool _handles_settle(USize const baseline, USize *const out_last) {
+    for (USize round = 0; round < _HANDLE_SETTLE_ROUNDS; round += 1) {
+        USize count = 0;
+
+        if (_handle_count(&count) && count == baseline) {
+            *out_last = count;
+
+            return true;
+        }
+
+        *out_last = count;
+
+        thread_sleep(_HANDLE_SETTLE_SLEEP_MS);
+    }
+
+    return false;
+}
+
+/** @brief A baseline is two readings 100 ms apart that agree - a closing wsi from the request before is not counted into it. */
+static bool _handles_baseline(USize *const out) {
+    USize previous = 0;
+
+    if (!_handle_count(&previous)) {
+        return false;
+    }
+
+    for (USize round = 0; round < _HANDLE_SETTLE_ROUNDS; round += 1) {
+        USize count = 0;
+
+        thread_sleep(_HANDLE_BASELINE_SLEEP_MS);
+
+        if (!_handle_count(&count)) {
+            return false;
+        }
+
+        if (count == previous) {
+            *out = count;
+
+            return true;
+        }
+
+        previous = count;
+    }
+
+    return false;
 }
 
 /*==============================================================================
@@ -1640,6 +2143,840 @@ static void _test_content_length_and_zero_body(Test *const test) {
     test_case_end(test);
 }
 
+/** @brief Remove a fixture the server thread may still be tearing down (Windows refuses to delete an open file). */
+static bool _fixture_remove(char const *const name) {
+    Result removed = file_remove_1(name);
+
+    for (USize attempt = 0; attempt < _FIXTURE_REMOVE_ATTEMPTS && removed != RESULT_SUCCESS; attempt += 1) {
+        thread_sleep(_FIXTURE_REMOVE_SLEEP_MS);
+
+        removed = file_remove_1(name);
+    }
+
+    return removed == RESULT_SUCCESS;
+}
+
+static void _test_send_file_handle(Test *const test) {
+    test_case_begin(test, "send_file_handle: 200 whole file, 206 window, empty window, HEAD keep-alive, the three value refusals");
+
+    HTTP_Server *server = http_server_new();
+
+    http_server_route_add(server, "/stream", _route_stream);
+    http_server_route_add(server, "/stream-after-send", _route_stream_after_send);
+    http_server_route_add(server, "/stream-irregular", _route_stream_irregular);
+    http_server_route_add(server, "/exact", _route_exact);
+
+    U16 const port = _start(test, server);
+
+    _stream_fixture_names_set(port);
+
+    test_expect_true(test, "the 1 MiB + 1 fixture is written", _fixture_write(_stream_fixture_name, _STREAM_FIXTURE_SIZE));
+
+    _stream_served  = _stream_fixture_name;
+    _stream_start   = 0;
+    _stream_size    = _STREAM_FIXTURE_SIZE;
+    _stream_status  = HTTP_SERVER_STATUS_CODE_OK;
+
+    _Reply      reply   = DEFAULT_INITIALIZATION;
+    Net_Socket  socket  = DEFAULT_INITIALIZATION;
+
+    if (test_expect_true(test, "whole-file connection opens", _client_open(port, &socket))) {
+        USize   size    = 0;
+        bool    exact   = false;
+        bool    eof     = false;
+
+        bool const ok = _client_write(socket, _STREAM_REQUEST_CLOSE, CHAR_STATIC_SIZE(_STREAM_REQUEST_CLOSE));
+
+        if (test_expect_true(test, "the whole file is answered", ok && _client_read_window(socket, &reply, 0, &size, &exact, &eof))) {
+            char queued[_REPLY_FLAG_MAX] = DEFAULT_INITIALIZATION;
+
+            test_expect_true(test, "the route's seam call answered true", _stream_ok);
+            test_expect_u(test, "200", 200, reply.status);
+            test_expect_u(test, "exactly one Content-Length", 1, _reply_header_count(&reply, "content-length:"));
+            test_expect_u(test, "Content-Length is the file size", _STREAM_FIXTURE_SIZE, _reply_content_length(&reply));
+            test_expect_u(test, "every byte arrived", _STREAM_FIXTURE_SIZE, size);
+            test_expect_true(test, "the body is byte-exact across 16 chunk boundaries and a partial last chunk", exact);
+            test_expect_false(test, "the connection was not cut short", eof);
+            test_expect_true(test, "the queued header is emitted ahead of the body", _reply_header(&reply, "x-queued:", queued, sizeof(queued)));
+        }
+
+        net_socket_close(socket);
+    }
+
+    _stream_start   = _STREAM_WINDOW_START;
+    _stream_size    = _STREAM_WINDOW_SIZE;
+    _stream_status  = HTTP_SERVER_STATUS_CODE_PARTIAL_CONTENT;
+
+    if (test_expect_true(test, "206 window round trip", _client_round_trip(port, _STREAM_REQUEST_CLOSE, &reply))) {
+        bool exact = true;
+
+        for (USize index = 0; index < reply.body_size && index < _STREAM_WINDOW_SIZE; index += 1) {
+            exact = exact && (Byte) reply.body[index] == _pattern_byte(_STREAM_WINDOW_START + index);
+        }
+
+        test_expect_u(test, "206", 206, reply.status);
+        test_expect_u(test, "Content-Length is the window", _STREAM_WINDOW_SIZE, _reply_content_length(&reply));
+        test_expect_u(test, "the window's bytes arrived", _STREAM_WINDOW_SIZE, reply.body_size);
+        test_expect_true(test, "the window straddling the chunk boundary is exact", exact);
+    }
+
+    _stream_start   = 0;
+    _stream_size    = 0;
+    _stream_status  = HTTP_SERVER_STATUS_CODE_OK;
+
+    if (test_expect_true(test, "empty window round trip", _client_round_trip(port, _STREAM_REQUEST_CLOSE, &reply))) {
+        char length[_REPLY_FLAG_MAX] = DEFAULT_INITIALIZATION;
+
+        test_expect_true(test, "an empty window is accepted", _stream_ok);
+        test_expect_u(test, "an empty window is 200", 200, reply.status);
+        test_expect_true(test, "it declares a Content-Length", _reply_header(&reply, "content-length:", length, sizeof(length)));
+        test_expect_string(test, "of zero", "0", length);
+        test_expect_u(test, "and carries no body", 0, reply.body_size);
+    }
+
+    /* HEAD: the headers a GET would produce, no body, and the keep-alive socket still serves
+     * the NEXT request - the regression class is "HEAD answered twice". */
+    _stream_size = _STREAM_FIXTURE_SIZE;
+
+    Net_Socket keep_alive = DEFAULT_INITIALIZATION;
+
+    if (test_expect_true(test, "HEAD keep-alive connection opens", _client_open(port, &keep_alive))) {
+        bool ok = _client_write(keep_alive, "HEAD /stream HTTP/1.1\r\nHost: t\r\n\r\n", CHAR_STATIC_SIZE("HEAD /stream HTTP/1.1\r\nHost: t\r\n\r\n"));
+
+        if (test_expect_true(test, "HEAD on the seam answers", ok && _client_read_headers(keep_alive, &reply))) {
+            test_expect_true(test, "the HEAD seam call answered true", _stream_ok);
+            test_expect_u(test, "HEAD is 200", 200, reply.status);
+            test_expect_u(test, "HEAD declares the window's Content-Length", _STREAM_FIXTURE_SIZE, _reply_content_length(&reply));
+            test_expect_u(test, "nothing follows the HEAD reply on the wire", 0, reply.body_size);
+        }
+
+        ok = _client_write(keep_alive, "GET /exact HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", CHAR_STATIC_SIZE("GET /exact HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"));
+
+        if (test_expect_true(test, "the SAME socket still serves the next request", ok && _client_read(keep_alive, &reply))) {
+            test_expect_string(test, "and that request gets its own reply", "exact", reply.body);
+        }
+
+        net_socket_close(keep_alive);
+    }
+
+    /* Refusal 1: the headers are already on the wire. Nothing more follows the first reply. */
+    _stream_ok = true;
+
+    Net_Socket after_send = DEFAULT_INITIALIZATION;
+
+    if (test_expect_true(test, "headers-sent connection opens", _client_open(port, &after_send))) {
+        bool const ok = _client_write(after_send, "GET /stream-after-send HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+                                      CHAR_STATIC_SIZE("GET /stream-after-send HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"));
+
+        if (test_expect_true(test, "the first send is answered", ok && _client_read(after_send, &reply))) {
+            test_expect_string(test, "with its own body", "first", reply.body);
+        }
+
+        _Reply second = DEFAULT_INITIALIZATION;
+
+        /* The first reply is on the wire BEFORE the route reaches the seam, so the refusal
+         * is read only once the connection has closed - which it does when the route has
+         * returned and the transaction completed. */
+        test_expect_false(test, "and nothing more is written onto the socket", _client_read_headers(after_send, &second));
+        test_expect_false(test, "the seam refused because the headers were sent", _stream_ok);
+
+        net_socket_close(after_send);
+    }
+
+    /* Refusal 2: a window past EOF - refused BY VALUE, and the route's 416 goes out. */
+    _stream_ok      = true;
+    _stream_start   = _STREAM_FIXTURE_SIZE - _STREAM_PAST_EOF_BACK;
+    _stream_size    = _STREAM_WINDOW_SIZE;
+    _stream_status  = HTTP_SERVER_STATUS_CODE_PARTIAL_CONTENT;
+
+    if (test_expect_true(test, "past-EOF round trip", _client_round_trip(port, _STREAM_REQUEST_CLOSE, &reply))) {
+        test_expect_false(test, "a window past EOF is refused", _stream_ok);
+        test_expect_u(test, "the route's own 416 goes out", 416, reply.status);
+        test_expect_string(test, "with the route's own body", "fallback", reply.body);
+    }
+
+    /* Refusal 3: not a regular file. */
+    _stream_ok = true;
+
+    if (test_expect_true(test, "irregular-handle round trip", _client_round_trip(port, "GET /stream-irregular HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply))) {
+        test_expect_false(test, "a handle that is not a regular file is refused", _stream_ok);
+        test_expect_u(test, "the route's own 404 goes out", 404, reply.status);
+        test_expect_string(test, "with the route's own body", "fallback", reply.body);
+    }
+
+    http_server_delete(&server);
+
+    test_expect_true(test, "the stream fixture is removed", _fixture_remove(_stream_fixture_name));
+
+    test_case_end(test);
+}
+
+/*
+ * The CR/LF chokepoint: every path a caller's bytes take into the header block - a sender's
+ * content type, a header_add_raw block, send_file's extra_headers - is refused BY VALUE when it
+ * could split the response, and the accepted control on each API proves the route and server
+ * were live, so a refusal pin cannot pass because nothing ran at all.
+ */
+static void _test_header_chokepoint(Test *const test) {
+    test_case_begin(test, "CR/LF chokepoint: content types and raw header blocks that could split a response are refused by value");
+
+    HTTP_Server *server = http_server_new();
+
+    http_server_route_add(server, "/type-send-1", _route_type_send_1);
+    http_server_route_add(server, "/type-send-2", _route_type_send_2);
+    http_server_route_add(server, "/type-stream", _route_type_stream);
+    http_server_route_add(server, "/raw-blocks", _route_raw_blocks);
+    http_server_route_add(server, "/file-blocks", _route_file_blocks);
+
+    U16 const port = _start(test, server);
+
+    _stream_fixture_names_set(port);
+
+    test_expect_true(test, "the chokepoint fixture is written", _fixture_write(_stream_fixture_name, _CHOKEPOINT_FIXTURE_SIZE));
+
+    _stream_served  = _stream_fixture_name;
+    _stream_start   = 0;
+    _stream_size    = _CHOKEPOINT_FIXTURE_SIZE;
+
+    _Reply  reply                       = DEFAULT_INITIALIZATION;
+    char    name[_CHOKEPOINT_NAME_MAX]  = DEFAULT_INITIALIZATION;
+    char    value[_REPLY_VALUE_MAX]     = DEFAULT_INITIALIZATION;
+
+    /* send_2: a refused type fails the response, so the connection closes with NO reply - not a
+     * reply short its Content-Type, and never one carrying the injected header. */
+    for (USize index = 0; index < sizeof(_CONTENT_TYPES_REFUSED) / sizeof(_CONTENT_TYPES_REFUSED[0]); index += 1) {
+        _content_type_value = _CONTENT_TYPES_REFUSED[index];
+
+        snprintf(name, sizeof(name), "send_2 refuses content type %llu (CR, LF or a control byte): no reply at all", (unsigned long long) index);
+
+        test_expect_false(test, name, _client_round_trip(port, "GET /type-send-2 HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply));
+    }
+
+    _content_type_value = _CONTENT_TYPE_ACCEPTED;
+
+    if (test_expect_true(test, "send_2 accepts a content type with an HTAB in it", _client_round_trip(port, "GET /type-send-2 HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply))) {
+        test_expect_u(test, "the accepted send_2 is a 200", 200, reply.status);
+        test_expect_true(test, "it carries the Content-Type", _reply_header(&reply, "content-type:", value, sizeof(value)));
+        test_expect_string(test, "byte for byte, the HTAB included", _CONTENT_TYPE_ACCEPTED, value);
+        test_expect_string(test, "and its body", "typed", reply.body);
+    }
+
+    /* send_1 forwards to send_2: one refused type and the accepted one pin the forwarding. */
+    _content_type_value = _CONTENT_TYPES_REFUSED[0];
+
+    test_expect_false(test, "send_1 refuses a CRLF content type: no reply at all", _client_round_trip(port, "GET /type-send-1 HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply));
+
+    _content_type_value = _CONTENT_TYPE_ACCEPTED;
+
+    if (test_expect_true(test, "send_1 accepts the HTAB content type", _client_round_trip(port, "GET /type-send-1 HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply))) {
+        test_expect_u(test, "the accepted send_1 is a 200", 200, reply.status);
+        test_expect_string(test, "with its body", "typed", reply.body);
+    }
+
+    /* send_file_handle refuses a type in its own refusal block, like its window: false, nothing
+     * written, the handle still the route's - and the response NOT failed, so the route's fallback
+     * send_2 (a 500) is what reaches the peer, never a silently closed connection. */
+    for (USize index = 0; index < sizeof(_CONTENT_TYPES_REFUSED) / sizeof(_CONTENT_TYPES_REFUSED[0]); index += 1) {
+        _content_type_value         = _CONTENT_TYPES_REFUSED[index];
+        _stream_ok                  = true;
+        _type_stream_handle_kept    = false;
+
+        snprintf(name, sizeof(name), "send_file_handle refuses content type %llu, and the fallback send_2 reaches the peer", (unsigned long long) index);
+
+        if (test_expect_true(test, name, _client_round_trip(port, "GET /type-stream HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply))) {
+            test_expect_u(test, "the fallback's 500 status line is what arrived", 500, reply.status);
+            test_expect_string(test, "with the fallback's body", "fallback", reply.body);
+            test_expect_u(test, "and no injected header", 0, _reply_header_count(&reply, "x-injected"));
+        }
+
+        test_expect_false(test, "send_file_handle answered false", _stream_ok);
+        test_expect_true(test, "and left the handle with the route", _type_stream_handle_kept);
+    }
+
+    /* The status line alone cannot tell a failed response from a recovered one: a FAILED response
+     * still lets the fallback's bytes reach the kernel before the connection is torn down. What a
+     * failed response cannot do is complete its transaction, so only a SECOND request on the same
+     * keep-alive socket shows that the refusal left the response alone. */
+    Net_Socket socket = DEFAULT_INITIALIZATION;
+
+    if (test_expect_true(test, "the refused-type keep-alive connection opens", _client_open(port, &socket))) {
+        _Reply first    = DEFAULT_INITIALIZATION;
+        _Reply second   = DEFAULT_INITIALIZATION;
+
+        _content_type_value = _CONTENT_TYPES_REFUSED[0];
+
+        bool ok = _client_write(socket, "GET /type-stream HTTP/1.1\r\nHost: t\r\n\r\n", CHAR_STATIC_SIZE("GET /type-stream HTTP/1.1\r\nHost: t\r\n\r\n"));
+
+        ok = ok && _client_read(socket, &first);
+
+        if (test_expect_true(test, "the refused type's fallback is answered on the keep-alive socket", ok)) {
+            test_expect_u(test, "with the fallback's 500", 500, first.status);
+        }
+
+        _content_type_value = _CONTENT_TYPE_ACCEPTED;
+
+        ok = ok && _client_write(socket, "GET /type-send-2 HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+                                 CHAR_STATIC_SIZE("GET /type-send-2 HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"));
+
+        ok = ok && _client_read(socket, &second);
+
+        if (test_expect_true(test, "the connection survived the refused type: the response was not failed", ok)) {
+            test_expect_string(test, "the next request is answered on the SAME socket", "typed", second.body);
+        }
+
+        net_socket_close(socket);
+    }
+
+    _content_type_value = _CONTENT_TYPE_ACCEPTED;
+
+    if (test_expect_true(test, "send_file_handle accepts the HTAB content type", _client_round_trip(port, "GET /type-stream HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply))) {
+        test_expect_true(test, "the accepted stream answered true", _stream_ok);
+        test_expect_u(test, "the accepted stream is a 200", 200, reply.status);
+        test_expect_u(test, "and the whole fixture arrived", _CHOKEPOINT_FIXTURE_SIZE, reply.body_size);
+    }
+
+    /* header_add_raw: one byte per call, seven malformed blocks, header_add's non-token name, then
+     * the well-formed block. A refused block is refused WHOLE: not even its first, well-formed
+     * "X-Raw: ok" line reaches the wire. */
+    if (test_expect_true(test, "the raw-block round trip is answered", _client_round_trip(port, "GET /raw-blocks HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply))) {
+        test_expect_string(test, "header_add_raw refuses every malformed shape, header_add a non-token name, and the well-formed block is accepted", "000000001", reply.body);
+        test_expect_u(test, "no injected header reaches the wire", 0, _reply_header_count(&reply, "x-injected"));
+        test_expect_u(test, "no line of a refused block reaches it either", 0, _reply_header_count(&reply, "x-raw:"));
+        test_expect_true(test, "the accepted block's first line is on the wire", _reply_header(&reply, "x-raw-good:", value, sizeof(value)));
+        test_expect_string(test, "with its HTAB", "a\tb", value);
+        test_expect_true(test, "and its empty-valued line too", _reply_header(&reply, "x-raw-empty:", value, sizeof(value)));
+    }
+
+    /* send_file: seven malformed blocks, five refused types, then the well-formed call serves. */
+    _file_blocks_record[0] = '\0';
+
+    if (test_expect_true(test, "the send_file round trip is answered", _client_round_trip(port, "GET /file-blocks HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply))) {
+        test_expect_string(test, "send_file refuses every malformed block and every refused type, then serves the well-formed call", "0000000000001", _file_blocks_record);
+        test_expect_u(test, "the served file is a 200", 200, reply.status);
+        test_expect_u(test, "no injected header reaches the wire", 0, _reply_header_count(&reply, "x-injected"));
+        test_expect_u(test, "no line of a refused block reaches it either", 0, _reply_header_count(&reply, "x-raw:"));
+        test_expect_true(test, "the accepted block is emitted", _reply_header(&reply, "x-raw-good:", value, sizeof(value)));
+        test_expect_true(test, "the accepted type is emitted", _reply_header(&reply, "content-type:", value, sizeof(value)));
+        test_expect_string(test, "byte for byte, the HTAB included", _CONTENT_TYPE_ACCEPTED, value);
+        test_expect_u(test, "and the whole fixture arrived", _CHOKEPOINT_FIXTURE_SIZE, reply.body_size);
+    }
+
+    http_server_delete(&server);
+
+    test_expect_true(test, "the chokepoint fixture is removed", _fixture_remove(_stream_fixture_name));
+
+    test_case_end(test);
+}
+
+static void _test_send_file_handle_ownership(Test *const test) {
+    test_case_begin(test, "send_file_handle ownership: the handle is released on completion, on a mid-stream disconnect, on HEAD, and on truncation");
+
+    HTTP_Server *server = http_server_new();
+
+    http_server_route_add(server, "/stream", _route_stream);
+    http_server_route_add(server, "/exact", _route_exact);
+
+    U16 const port = _start(test, server);
+
+    _stream_fixture_names_set(port);
+
+    test_expect_true(test, "the 1 MiB + 1 fixture is written", _fixture_write(_stream_fixture_name, _STREAM_FIXTURE_SIZE));
+    test_expect_true(test, "the 2 MiB fixture is written", _fixture_write(_stream_big_fixture_name, _STREAM_BIG_FIXTURE_SIZE));
+
+    _stream_served  = _stream_fixture_name;
+    _stream_start   = 0;
+    _stream_size    = _STREAM_FIXTURE_SIZE;
+    _stream_status  = HTTP_SERVER_STATUS_CODE_OK;
+
+    _Reply      reply       = DEFAULT_INITIALIZATION;
+    USize       size        = 0;
+    bool        exact       = false;
+    bool        eof         = false;
+    Net_Socket  socket      = DEFAULT_INITIALIZATION;
+
+    /* Warm-up: whatever the first streamed request allocates lazily is allocated before the
+     * baseline is taken, so the counts below compare the seam's handle and nothing else. */
+    if (test_expect_true(test, "warm-up connection opens", _client_open(port, &socket))) {
+        bool const ok = _client_write(socket, _STREAM_REQUEST_CLOSE, CHAR_STATIC_SIZE(_STREAM_REQUEST_CLOSE));
+
+        test_expect_true(test, "the warm-up is answered", ok && _client_read_window(socket, &reply, 0, &size, &exact, &eof));
+
+        net_socket_close(socket);
+    }
+
+    USize baseline  = 0;
+    USize last      = 0;
+
+    if (!test_expect_true(test, "a stable handle-count baseline is read", _handles_baseline(&baseline))) {
+        http_server_delete(&server);
+
+        test_expect_true(test, "the stream fixture is removed", _fixture_remove(_stream_fixture_name));
+        test_expect_true(test, "the big stream fixture is removed", _fixture_remove(_stream_big_fixture_name));
+
+        test_case_end(test);
+
+        return;
+    }
+
+    /* (a) completion: the last chunk's own release. */
+    if (test_expect_true(test, "completion connection opens", _client_open(port, &socket))) {
+        bool const ok = _client_write(socket, _STREAM_REQUEST_CLOSE, CHAR_STATIC_SIZE(_STREAM_REQUEST_CLOSE));
+
+        if (test_expect_true(test, "the whole file is answered", ok && _client_read_window(socket, &reply, 0, &size, &exact, &eof))) {
+            test_expect_u(test, "every byte arrived", _STREAM_FIXTURE_SIZE, size);
+            test_expect_true(test, "byte-exact", exact);
+        }
+
+        net_socket_close(socket);
+
+        test_expect_true(test, "(a) the handle count is back at the baseline after completion", _handles_settle(baseline, &last));
+        test_expect_u(test, "(a) count", baseline, last);
+    }
+
+    /* (b) disconnect: the client reads the headers and one chunk of a 2 MiB body, then goes
+     * away. The stream is mid-flight; only the session reset on CLOSED_HTTP can release it. */
+    _stream_served  = _stream_big_fixture_name;
+    _stream_size    = _STREAM_BIG_FIXTURE_SIZE;
+
+    if (test_expect_true(test, "disconnect connection opens", _client_open(port, &socket))) {
+        static Byte buffer[_STREAM_READ_MAX] = DEFAULT_INITIALIZATION;
+
+        bool const ok = _client_write(socket, "GET /stream HTTP/1.1\r\nHost: t\r\n\r\n", CHAR_STATIC_SIZE("GET /stream HTTP/1.1\r\nHost: t\r\n\r\n"));
+
+        if (test_expect_true(test, "the 2 MiB stream starts", ok && _client_read_headers(socket, &reply))) {
+            USize received = reply.body_size;
+
+            test_expect_u(test, "it is a 200", 200, reply.status);
+
+            while (received < HTTP_SERVER_FILE_CHUNK_SIZE) {
+                USize got = 0;
+
+                if (result_is_error(net_socket_recv_1(socket, buffer, sizeof(buffer), &got)) || got == 0) {
+                    break;
+                }
+
+                received += got;
+            }
+
+            test_expect_true(test, "the client read at least one chunk before leaving", received >= HTTP_SERVER_FILE_CHUNK_SIZE);
+        }
+
+        net_socket_close(socket);
+
+        test_expect_true(test, "(b) the handle count is back at the baseline after a mid-stream disconnect", _handles_settle(baseline, &last));
+        test_expect_u(test, "(b) count", baseline, last);
+    }
+
+    if (test_expect_true(test, "a NEW connection is served after the disconnect", _client_round_trip(port, "GET /exact HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply))) {
+        test_expect_string(test, "and answered", "exact", reply.body);
+    }
+
+    /* (c) HEAD: closed synchronously inside the call. */
+    _stream_served  = _stream_fixture_name;
+    _stream_size    = _STREAM_FIXTURE_SIZE;
+
+    if (test_expect_true(test, "HEAD connection opens", _client_open(port, &socket))) {
+        bool const ok = _client_write(socket, "HEAD /stream HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+                                      CHAR_STATIC_SIZE("HEAD /stream HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"));
+
+        if (test_expect_true(test, "HEAD is answered", ok && _client_read_headers(socket, &reply))) {
+            test_expect_u(test, "HEAD is 200", 200, reply.status);
+            test_expect_u(test, "HEAD carries no body", 0, reply.body_size);
+        }
+
+        net_socket_close(socket);
+
+        test_expect_true(test, "(c) the handle count is back at the baseline after HEAD", _handles_settle(baseline, &last));
+        test_expect_u(test, "(c) count", baseline, last);
+    }
+
+    /* Truncation: the 2 MiB fixture is cut to 1 KiB once the headers are on the wire. The
+     * server cannot honour its Content-Length, closes, and survives. */
+    _stream_served  = _stream_big_fixture_name;
+    _stream_size    = _STREAM_BIG_FIXTURE_SIZE;
+
+    if (test_expect_true(test, "truncation connection opens", _client_open(port, &socket))) {
+        bool const ok = _client_write(socket, _STREAM_REQUEST_CLOSE, CHAR_STATIC_SIZE(_STREAM_REQUEST_CLOSE));
+
+        if (test_expect_true(test, "the stream's headers arrive", ok && _client_read_headers(socket, &reply))) {
+            static Byte buffer[_STREAM_READ_MAX] = DEFAULT_INITIALIZATION;
+
+            test_expect_u(test, "Content-Length promises 2 MiB", _STREAM_BIG_FIXTURE_SIZE, _reply_content_length(&reply));
+
+            File *cut = file_open_try_1(_stream_big_fixture_name, "wb");
+
+            if (test_expect_true(test, "the fixture can be truncated under the server's handle", !memory_empty(cut))) {
+                static Byte const stub[_STREAM_TRUNCATE_TO] = DEFAULT_INITIALIZATION;
+
+                file_write_1(cut, stub, 1, sizeof(stub));
+                file_close(&cut);
+            }
+
+            ChronoInstant   const   start       = chrono_now();
+            USize                   received    = reply.body_size;
+            bool                    closed      = false;
+
+            while (received < _STREAM_BIG_FIXTURE_SIZE) {
+                USize           got     = 0;
+                Result  const   result  = net_socket_recv_1(socket, buffer, sizeof(buffer), &got);
+
+                /* An orderly EOF or a reset both mean the server closed; a 4 s timeout does not. */
+                if (result_is_error(result) || got == 0) {
+                    closed = chrono_duration_milliseconds(chrono_elapsed(start)) < _STREAM_CLOSE_MAX_MS;
+
+                    break;
+                }
+
+                received += got;
+            }
+
+            test_expect_true(test, "the client sees the connection close before Content-Length", received < _STREAM_BIG_FIXTURE_SIZE);
+            test_expect_true(test, "closed by the server, not by the client's timeout", closed);
+        }
+
+        net_socket_close(socket);
+
+        test_expect_true(test, "the truncation released the handle", _handles_settle(baseline, &last));
+        test_expect_u(test, "truncation count", baseline, last);
+    }
+
+    if (test_expect_true(test, "the server survives the truncated stream", _client_round_trip(port, "GET /exact HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply))) {
+        test_expect_string(test, "and still answers", "exact", reply.body);
+    }
+
+    http_server_delete(&server);
+
+    test_expect_true(test, "the stream fixture is removed", _fixture_remove(_stream_fixture_name));
+    test_expect_true(test, "the big stream fixture is removed", _fixture_remove(_stream_big_fixture_name));
+
+    test_case_end(test);
+}
+
+/**
+ * @brief Read a streamed reply until the peer closes, timing the close. Answers the body bytes
+ *        received (pattern-checked from offset 0) and whether the close came from the server
+ *        - inside _STREAM_CLOSE_MAX_MS - rather than from the client's own IO timeout.
+ */
+static bool _client_read_until_close(Net_Socket const socket, _Reply *const reply, USize *const out_size, bool *const out_exact, bool *const out_closed) {
+    ChronoInstant const start = chrono_now();
+
+    bool eof = false;
+
+    if (!_client_read_window(socket, reply, 0, out_size, out_exact, &eof)) {
+        return false;
+    }
+
+    *out_closed = chrono_duration_milliseconds(chrono_elapsed(start)) < _STREAM_CLOSE_MAX_MS;
+
+    return true;
+}
+
+/*
+ * The documented LIMIT of send_file_handle (see its header note): bytes a client sends while
+ * a body streams - a pipelined request, a stray CRLF - close the connection, because
+ * libwebsockets' HTTP/1 reader has no case for them in the transaction state the seam
+ * leaves the wsi in. These pins hold the contract to exactly that: the response is cut
+ * short and no second reply follows, the handle is released as on any disconnect, and the
+ * server goes on serving. A libwebsockets that one day parks those bytes fails the
+ * "cut short" pins, which is the signal to lift the note.
+ */
+static void _test_send_file_handle_client_bytes(Test *const test) {
+    test_case_begin(test, "send_file_handle: client bytes mid-stream (pipelined GET, stray CRLF) close the connection, release the handle, leave the server up");
+
+    HTTP_Server *server = http_server_new();
+
+    http_server_route_add(server, "/stream", _route_stream);
+    http_server_route_add(server, "/exact", _route_exact);
+
+    U16 const port = _start(test, server);
+
+    _stream_fixture_names_set(port);
+
+    test_expect_true(test, "the 2 MiB fixture is written", _fixture_write(_stream_big_fixture_name, _STREAM_BIG_FIXTURE_SIZE));
+
+    _stream_served  = _stream_big_fixture_name;
+    _stream_start   = 0;
+    _stream_size    = _STREAM_BIG_FIXTURE_SIZE;
+    _stream_status  = HTTP_SERVER_STATUS_CODE_OK;
+
+    _Reply      reply       = DEFAULT_INITIALIZATION;
+    USize       size        = 0;
+    bool        exact       = false;
+    bool        closed      = false;
+    Net_Socket  socket      = DEFAULT_INITIALIZATION;
+
+    /* Warm-up, as in the ownership case: lazy allocations happen before the baseline. */
+    if (test_expect_true(test, "warm-up connection opens", _client_open(port, &socket))) {
+        bool const ok = _client_write(socket, _STREAM_REQUEST_CLOSE, CHAR_STATIC_SIZE(_STREAM_REQUEST_CLOSE));
+
+        test_expect_true(test, "the warm-up is answered", ok && _client_read_until_close(socket, &reply, &size, &exact, &closed));
+
+        net_socket_close(socket);
+    }
+
+    USize baseline  = 0;
+    USize last      = 0;
+
+    if (!test_expect_true(test, "a stable handle-count baseline is read", _handles_baseline(&baseline))) {
+        http_server_delete(&server);
+
+        test_expect_true(test, "the big stream fixture is removed", _fixture_remove(_stream_big_fixture_name));
+
+        test_case_end(test);
+
+        return;
+    }
+
+    /* Pipelined: the second request rides in the same write as the first. */
+    if (test_expect_true(test, "pipelined connection opens", _client_open(port, &socket))) {
+        bool const ok = _client_write(socket, "GET /stream HTTP/1.1\r\nHost: t\r\n\r\nGET /exact HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+                                      CHAR_STATIC_SIZE("GET /stream HTTP/1.1\r\nHost: t\r\n\r\nGET /exact HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"));
+
+        if (test_expect_true(test, "the first response starts", ok && _client_read_until_close(socket, &reply, &size, &exact, &closed))) {
+            test_expect_u(test, "the first response is a 200", 200, reply.status);
+            test_expect_u(test, "with the whole file promised", _STREAM_BIG_FIXTURE_SIZE, _reply_content_length(&reply));
+            test_expect_true(test, "the pipelined request cuts the first response short (the documented limit)", size < _STREAM_BIG_FIXTURE_SIZE);
+            test_expect_true(test, "what did arrive is byte-exact", exact);
+            test_expect_true(test, "the server closed the connection, the client did not time out", closed);
+        }
+
+        net_socket_close(socket);
+
+        test_expect_true(test, "the handle count is back at the baseline after the pipelined close", _handles_settle(baseline, &last));
+        test_expect_u(test, "pipelined count", baseline, last);
+    }
+
+    if (test_expect_true(test, "a NEW connection is served after the pipelined close", _client_round_trip(port, "GET /exact HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply))) {
+        test_expect_string(test, "and answered", "exact", reply.body);
+    }
+
+    /* A stray CRLF once the headers have arrived - mid-stream, not in the request. */
+    if (test_expect_true(test, "stray-CRLF connection opens", _client_open(port, &socket))) {
+        bool ok = _client_write(socket, _STREAM_REQUEST_CLOSE, CHAR_STATIC_SIZE(_STREAM_REQUEST_CLOSE));
+
+        ok = ok && _client_read_headers(socket, &reply);
+
+        if (test_expect_true(test, "the stream's headers arrive", ok)) {
+            test_expect_u(test, "it is a 200", 200, reply.status);
+        }
+
+        ok = ok && _client_write(socket, "\r\n", CHAR_STATIC_SIZE("\r\n"));
+
+        if (test_expect_true(test, "the CRLF is sent mid-stream", ok)) {
+            ChronoInstant const start = chrono_now();
+
+            static Byte buffer[_STREAM_READ_MAX] = DEFAULT_INITIALIZATION;
+
+            USize received = reply.body_size;
+
+            while (received < _STREAM_BIG_FIXTURE_SIZE) {
+                USize got = 0;
+
+                if (result_is_error(net_socket_recv_1(socket, buffer, sizeof(buffer), &got)) || got == 0) {
+                    break;
+                }
+
+                received += got;
+            }
+
+            test_expect_true(test, "the stray CRLF cuts the response short (the documented limit)", received < _STREAM_BIG_FIXTURE_SIZE);
+            test_expect_true(test, "the server closed the connection, the client did not time out", chrono_duration_milliseconds(chrono_elapsed(start)) < _STREAM_CLOSE_MAX_MS);
+        }
+
+        net_socket_close(socket);
+
+        test_expect_true(test, "the handle count is back at the baseline after the CRLF close", _handles_settle(baseline, &last));
+        test_expect_u(test, "CRLF count", baseline, last);
+    }
+
+    if (test_expect_true(test, "a NEW connection is served after the CRLF close", _client_round_trip(port, "GET /exact HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &reply))) {
+        test_expect_string(test, "and answered", "exact", reply.body);
+    }
+
+    http_server_delete(&server);
+
+    test_expect_true(test, "the big stream fixture is removed", _fixture_remove(_stream_big_fixture_name));
+
+    test_case_end(test);
+}
+
+/*
+ * The two transaction shapes the payload/stream split opened. A POST route is dispatched from
+ * BODY_COMPLETION, whose reset must release the payload ONLY: the full session reset it used
+ * to run closed a send_file_handle handle before its first chunk, and the connection hung on a
+ * Content-Length it could never deliver. And a streamed body on a keep-alive connection ends
+ * with the transaction completed, so the SAME socket answers its next request - sent only once
+ * the whole body is read, because a request sent earlier is the documented LIMIT.
+ */
+static void _test_send_file_handle_transactions(Test *const test) {
+    test_case_begin(test, "send_file_handle: a POST route's hand-over streams in full; a keep-alive connection answers its next request after a streamed body");
+
+    HTTP_Server *server = http_server_new();
+
+    http_server_route_add(server, "/stream", _route_stream);
+    http_server_route_add(server, "/exact", _route_exact);
+
+    U16 const port = _start(test, server);
+
+    _stream_fixture_names_set(port);
+
+    test_expect_true(test, "the 1 MiB + 1 fixture is written", _fixture_write(_stream_fixture_name, _STREAM_FIXTURE_SIZE));
+
+    _stream_served  = _stream_fixture_name;
+    _stream_start   = 0;
+    _stream_size    = _STREAM_FIXTURE_SIZE;
+    _stream_status  = HTTP_SERVER_STATUS_CODE_OK;
+
+    _Reply      reply   = DEFAULT_INITIALIZATION;
+    USize       size    = 0;
+    bool        exact   = false;
+    bool        eof     = false;
+    Net_Socket  socket  = DEFAULT_INITIALIZATION;
+
+    /* POST: a declared body, so the route runs from BODY_COMPLETION, not from the header callback. */
+    _stream_ok = false;
+
+    if (test_expect_true(test, "POST connection opens", _client_open(port, &socket))) {
+        bool const success = _client_write(socket, "POST /stream HTTP/1.1\r\nHost: t\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody",
+                                           CHAR_STATIC_SIZE("POST /stream HTTP/1.1\r\nHost: t\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody"));
+
+        if (test_expect_true(test, "the POST is answered", success && _client_read_window(socket, &reply, 0, &size, &exact, &eof))) {
+            test_expect_true(test, "the POST route's seam call answered true", _stream_ok);
+            test_expect_u(test, "the POST's reply is a 200", 200, reply.status);
+            test_expect_u(test, "Content-Length is the file size", _STREAM_FIXTURE_SIZE, _reply_content_length(&reply));
+            test_expect_u(test, "every byte of the POST's streamed body arrived", _STREAM_FIXTURE_SIZE, size);
+            test_expect_true(test, "the POST's body is byte-exact", exact);
+            test_expect_false(test, "the POST's connection was not cut short", eof);
+        }
+
+        net_socket_close(socket);
+    }
+
+    /* Keep-alive: no Connection: close on the streamed GET. */
+    if (test_expect_true(test, "keep-alive connection opens", _client_open(port, &socket))) {
+        bool success = _client_write(socket, "GET /stream HTTP/1.1\r\nHost: t\r\n\r\n", CHAR_STATIC_SIZE("GET /stream HTTP/1.1\r\nHost: t\r\n\r\n"));
+
+        success = success && _client_read_window(socket, &reply, 0, &size, &exact, &eof);
+
+        if (test_expect_true(test, "the keep-alive GET is answered", success)) {
+            test_expect_u(test, "the streamed body arrived whole", _STREAM_FIXTURE_SIZE, size);
+            test_expect_true(test, "the streamed body is byte-exact", exact);
+        }
+
+        success = success && _client_write(socket, "GET /exact HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+                                           CHAR_STATIC_SIZE("GET /exact HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"));
+
+        success = success && _client_read(socket, &reply);
+
+        if (test_expect_true(test, "the SAME socket answers a second request after the streamed body", success)) {
+            test_expect_u(test, "the second reply is a 200", 200, reply.status);
+            test_expect_string(test, "with its own body", "exact", reply.body);
+        }
+
+        net_socket_close(socket);
+    }
+
+    http_server_delete(&server);
+
+    test_expect_true(test, "the stream fixture is removed", _fixture_remove(_stream_fixture_name));
+
+    test_case_end(test);
+}
+
+/*
+ * The minimum read rate. libwebsockets re-arms no timeout while it drains a chunk's unsent
+ * tail and does not ask for the next chunk until that tail is gone, so the content timeout
+ * armed when a chunk is written must cover draining ALL of it: a fixed 20 s dropped every
+ * reader slower than ~3.2 KiB/s. This reader holds a 4 KiB receive window, reads NOTHING for
+ * 23 s, past the old window, then drains the rest: the stalled chunk reaches it at ~2.8 KiB/s,
+ * under the old floor and over the 1 KiB/s one. A full stall rather than a trickle on purpose:
+ * under a trickle a partly-buffered chunk can drain and re-arm the timer once before the drop,
+ * which puts the old code's drop anywhere from 20 to 40 s; a stall leaves the last write - and
+ * so the armed timer - at the start, so the old code is dropped at 20 s every time.
+ *
+ * The pin is only meaningful while the stream is IN FLIGHT: a kernel that took the whole body
+ * into its send buffer would let the server finish in under a second, no content timer would
+ * run during the stall, and the old code would pass as well. So the body is 32 MiB, and after
+ * the stall - before a byte is read - the server must still hold the accepted socket and the
+ * stream's FILE*. That check fails on the old code too (it dropped both at 20 s), and on an
+ * absorbing kernel it fails loudly instead of the pin passing for the wrong reason.
+ */
+static void _test_send_file_handle_slow_reader(Test *const test) {
+    test_case_begin(test, "send_file_handle: a reader under the old 3.2 KiB/s floor but over the minimum rate receives the whole body");
+
+    HTTP_Server *server = http_server_new();
+
+    http_server_route_add(server, "/stream", _route_stream);
+
+    U16 const port = _start(test, server);
+
+    _stream_fixture_names_set(port);
+
+    test_expect_true(test, "the 32 MiB fixture is written", _fixture_write(_stream_big_fixture_name, _STREAM_SLOW_FIXTURE_SIZE));
+
+    _stream_served  = _stream_big_fixture_name;
+    _stream_start   = 0;
+    _stream_size    = _STREAM_WINDOW_SIZE;
+    _stream_status  = HTTP_SERVER_STATUS_CODE_OK;
+
+    _Reply      reply   = DEFAULT_INITIALIZATION;
+    USize       size    = 0;
+    bool        exact   = false;
+    bool        eof     = false;
+    Net_Socket  socket  = DEFAULT_INITIALIZATION;
+
+    /* Warm-up: whatever the first streamed request allocates lazily is allocated before the
+     * baseline is taken, so the held count below is the slow stream's and nothing else. */
+    test_expect_true(test, "the warm-up is answered", _client_round_trip(port, _STREAM_REQUEST_CLOSE, &reply));
+
+    USize baseline = 0;
+
+    if (!test_expect_true(test, "a stable handle-count baseline is read", _handles_baseline(&baseline))) {
+        http_server_delete(&server);
+
+        test_expect_true(test, "the big stream fixture is removed", _fixture_remove(_stream_big_fixture_name));
+
+        test_case_end(test);
+
+        return;
+    }
+
+    _stream_size = _STREAM_SLOW_FIXTURE_SIZE;
+
+    if (test_expect_true(test, "the small-window connection opens", _client_open_receive_buffer(port, _STREAM_SLOW_BUFFER, &socket))) {
+        bool const sent = _client_write(socket, _STREAM_REQUEST_CLOSE, CHAR_STATIC_SIZE(_STREAM_REQUEST_CLOSE));
+
+        test_expect_true(test, "the request is sent", sent);
+
+        thread_sleep(_STREAM_SLOW_STALL_MS);
+
+        USize       held    = 0;
+        bool const  counted = _handle_count(&held);
+
+        log_message_1(LOG_LEVEL_ERROR,
+                      "MEASUREMENT slow reader: handle count %llu at the baseline, %llu after the %llu ms stall (in flight = baseline + %llu)\n",
+                      (unsigned long long) baseline, (unsigned long long) held, (unsigned long long) _STREAM_SLOW_STALL_MS,
+                      (unsigned long long) _STREAM_SLOW_HELD_HANDLES);
+
+        test_expect_true(test, "after the stall the server still holds the accepted socket and the FILE* (the body is in flight)", counted && held >= baseline + _STREAM_SLOW_HELD_HANDLES);
+
+        if (test_expect_true(test, "the reply is read after the stall", sent && _client_read_window(socket, &reply, 0, &size, &exact, &eof))) {
+            test_expect_u(test, "it is a 200", 200, reply.status);
+            test_expect_u(test, "every byte arrived, past the old 20 s window", _STREAM_SLOW_FIXTURE_SIZE, size);
+            test_expect_true(test, "byte-exact", exact);
+            test_expect_false(test, "the server did not drop the slow reader", eof);
+        }
+
+        net_socket_close(socket);
+    }
+
+    http_server_delete(&server);
+
+    test_expect_true(test, "the big stream fixture is removed", _fixture_remove(_stream_big_fixture_name));
+
+    test_case_end(test);
+}
+
 static void _test_lifecycle(Test *const test) {
     test_case_begin(test, "lifecycle: run twice refused, register after run refused, stop, delete joins");
 
@@ -1877,6 +3214,12 @@ I32 main(void) {
     _test_request_accessors_full(&test);
     _test_owning_tiers(&test);
     _test_responses(&test);
+    _test_send_file_handle(&test);
+    _test_header_chokepoint(&test);
+    _test_send_file_handle_ownership(&test);
+    _test_send_file_handle_client_bytes(&test);
+    _test_send_file_handle_transactions(&test);
+    _test_send_file_handle_slow_reader(&test);
     _test_client_ip(&test);
     _test_client_ip_hostile(&test);
     _test_default_callback(&test);

@@ -1,6 +1,7 @@
 #include <string.h>
 
 #include <char/char.h>
+#include <container/str/str.h>
 #include <http/query/query.h>
 #include <test/test.h>
 
@@ -14,6 +15,11 @@
  * key_size, a malformed "%" escape, a sized-query bound) is coded as an ordinary runtime
  * branch, never routed through error_check - this build proves each one refuses identically
  * whether ERROR_CHECK_ENABLED is defined or not.
+ *
+ * The 0.4.0 zero-allocation tier (next / find / decode) error-checks only its contract
+ * pointers (cursor, out_*, and a null query/key/dest/encoded behind a non-zero size); its
+ * by-value refusals - a too-small dest, an exhausted walk, an absent key - are pinned here
+ * the same way.
  */
 
 int main(void) {
@@ -57,6 +63,33 @@ int main(void) {
     test_expect_u(&test, "char_length still stops at the embedded NUL (the exact truncation out_size guards against)", 1, char_length(decoded));
 
     arena_uninit(&arena, ARENA_TYPE_LINEAR);
+
+    test_case_end(&test);
+
+    test_case_begin(&test, "0.4.0 zero-allocation tier: by-value refusals hold without ERROR_CHECK_ENABLED");
+
+    char dest[4] = DEFAULT_INITIALIZATION;
+
+    memset(dest, 'Z', sizeof(dest));
+
+    test_expect_u(&test, "decode: a too-small dest is still refused", USIZE_MAX, http_query_decode(dest, 2, "%41%42", 6, false));
+    test_expect_true(&test, "decode: the refusal still leaves only dest[0] == '\\0'", dest[0] == '\0' && dest[1] == 'Z');
+    test_expect_u(&test, "decode: dest_size 0 is still refused", USIZE_MAX, http_query_decode(nullptr, 0, "a", 1, false));
+    test_expect_u(&test, "decode: an exact fit still decodes", 2, http_query_decode(dest, 3, "%41%42", 6, false));
+
+    USize cursor = 0;
+    Str   name   = str_init_1();
+    Str   value  = str_init_1();
+
+    test_expect_false(&test, "next: an empty query still answers no pair", http_query_next(nullptr, 0, &cursor, &name, &value));
+    test_expect_true(&test, "next: a pair is still answered", http_query_next("a=1", 3, &cursor, &name, &value));
+    test_expect_false(&test, "next: the cursor at the end still answers no pair", http_query_next("a=1", 3, &cursor, &name, &value));
+    test_expect_u(&test, "next: the cursor still ends at query_size", 3, cursor);
+
+    test_expect_false(&test, "find: an absent key is still false", http_query_find("a=1", 3, "zzz", 3, &value));
+    test_expect_true(&test, "find: a present-but-empty key is still true", http_query_find("k=", 2, "k", 1, &value));
+    test_expect_false(&test, "find: a null query of size 0 still finds nothing", http_query_find(nullptr, 0, "a", 1, &value));
+    test_expect_false(&test, "find: an oversized key_size still fails closed", http_query_find("cod=1", 5, key, 32, &value));
 
     test_case_end(&test);
     test_suite_end(&test);

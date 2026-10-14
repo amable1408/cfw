@@ -321,7 +321,20 @@ static void _test_origin_shape(Test *const test) {
     test_expect_false(test, "an empty host is refused", http_service_cors_origin_add(&cors, "https://"));
     test_expect_false(test, "an empty port is refused", http_service_cors_origin_add(&cors, "https://a:"));
     test_expect_false(test, "an unclosed IPv6 literal is refused", http_service_cors_origin_add(&cors, "http://[::1"));
+    test_expect_false(test, "a userinfo '@' host is refused", http_service_cors_origin_add(&cors, "http://u@h"));
+    test_expect_false(test, "a backslash host is refused", http_service_cors_origin_add(&cors, "http://h\\x"));
+    test_expect_false(test, "a stray ']' host is refused", http_service_cors_origin_add(&cors, "http://a]b"));
+    test_expect_false(test, "a stray '[' host is refused", http_service_cors_origin_add(&cors, "http://a[b"));
+    test_expect_false(test, "a percent host is refused", http_service_cors_origin_add(&cors, "http://h%41"));
+    test_expect_false(test, "a caret host is refused", http_service_cors_origin_add(&cors, "http://h^x"));
+    test_expect_false(test, "a pipe host is refused", http_service_cors_origin_add(&cors, "http://h|x"));
+    test_expect_false(test, "a '<' host is refused", http_service_cors_origin_add(&cors, "http://h<x"));
+    test_expect_false(test, "a '>' host is refused", http_service_cors_origin_add(&cors, "http://h>x"));
+    test_expect_false(test, "a spaced host is refused", http_service_cors_origin_add(&cors, "http://h x"));
     test_expect_u(test, "none of the misshapen origins reached the list", 0, al_str_get_size(&cors.origins));
+
+    test_expect_true(test, "a plain host is accepted", http_service_cors_origin_add(&cors, "http://h"));
+    test_expect_true(test, "a host with a port is accepted", http_service_cors_origin_add(&cors, "https://h:8443"));
 
     test_expect_true(test, "a port is accepted", http_service_cors_origin_add(&cors, "https://a:8443"));
     test_expect_true(test, "a localhost dev origin is accepted", http_service_cors_origin_add(&cors, "http://localhost:3000"));

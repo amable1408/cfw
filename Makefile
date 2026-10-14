@@ -138,17 +138,23 @@ test: $(TEST_BIN) check
 # observable with ERROR_CHECK_ENABLED compiled OUT - checked, the arena's own bounds check
 # aborts before the API can degrade - so those binaries link libcfw_unchecked.a and build with
 # CPPFLAGS_UNCHECKED, set per target above.
-$(subst .c,$(EXE),tests/container/hashset/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
-$(subst .c,$(EXE),tests/container/map/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
-$(subst .c,$(EXE),tests/container/slotmap/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
-$(subst .c,$(EXE),tests/container/str/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
-$(subst .c,$(EXE),tests/dir/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc
-$(subst .c,$(EXE),tests/env/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
-$(subst .c,$(EXE),tests/http/service/body_parser/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
-$(subst .c,$(EXE),tests/http/service/multipart/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
-$(subst .c,$(EXE),tests/http/service/permission/test_oom.c): OOM_LIB := libcfw_unchecked.a
-$(subst .c,$(EXE),tests/http/service/permission/test_oom.c): CPPFLAGS := $(CPPFLAGS_UNCHECKED)
-$(subst .c,$(EXE),tests/memory/test_oom.c): OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=realloc
+$(subst .c,$(EXE),tests/container/hashset/test_oom.c): private OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
+$(subst .c,$(EXE),tests/container/map/test_oom.c): private OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
+$(subst .c,$(EXE),tests/container/slotmap/test_oom.c): private OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
+$(subst .c,$(EXE),tests/container/str/test_oom.c): private OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
+$(subst .c,$(EXE),tests/dir/test_oom.c): private OOM_WRAP := -Wl,--wrap=calloc
+$(subst .c,$(EXE),tests/env/test_oom.c): private OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
+$(subst .c,$(EXE),tests/file/test_oom.c): private OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free -Wl,--wrap=malloc -Wl,--wrap=memory_alloc -Wl,--wrap=realloc
+$(subst .c,$(EXE),tests/file/test_oom.c): private OOM_LIB := libcfw_unchecked.a
+$(subst .c,$(EXE),tests/file/test_oom.c): private CPPFLAGS := $(CPPFLAGS_UNCHECKED)
+$(subst .c,$(EXE),tests/http/service/body_parser/test_oom.c): private OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
+$(subst .c,$(EXE),tests/http/service/multipart/test_oom.c): private OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
+$(subst .c,$(EXE),tests/http/service/permission/test_oom.c): private OOM_LIB := libcfw_unchecked.a
+$(subst .c,$(EXE),tests/http/service/permission/test_oom.c): private CPPFLAGS := $(CPPFLAGS_UNCHECKED)
+$(subst .c,$(EXE),tests/memory/test_oom.c): private OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=realloc
+$(subst .c,$(EXE),tests/process/test_oom.c): private OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free -Wl,--wrap=malloc
+$(subst .c,$(EXE),tests/process/test_oom.c): private OOM_LIB := libcfw_unchecked.a
+$(subst .c,$(EXE),tests/process/test_oom.c): private CPPFLAGS := $(CPPFLAGS_UNCHECKED)
 $(OOM_BIN): %$(EXE): %.c $(HARNESS) libcfw.a libcfw_unchecked.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(HARNESS) $(OOM_LIB) $(OOM_WRAP) $(LDLIBS)
 
@@ -179,6 +185,16 @@ tests/http/service/captcha/test_all$(EXE) tests/http/service/captcha/test_unchec
 tests/http/service/oauth/test_all$(EXE) tests/http/service/oauth/test_unchecked$(EXE): SUITE_EXTRA_INC := -Itests/http/client
 tests/http/service/oauth/test_all$(EXE) tests/http/service/oauth/test_unchecked$(EXE): SUITE_EXTRA_SRC := tests/http/client/fixture.c
 tests/http/service/oauth/test_all$(EXE) tests/http/service/oauth/test_unchecked$(EXE): tests/http/client/fixture.c tests/http/client/fixture.h
+
+# A suite whose module guards test-only symbols behind a macro compiles its own copy of that
+# module under the macro, ahead of the archive - set per target here, AFTER the fixture rules
+# above, since these append to the SUITE_EXTRA_SRC those set.
+# tests/http/service/static compiles its own copy of include/http/service/static under HTTP_SERVICE_STATIC_TEST_HOOKS; libcfw.a's copy is
+# built without it and is never pulled, since this copy defines every symbol first.
+tests/http/service/static/test_all$(EXE) tests/http/service/static/test_unchecked$(EXE): SUITE_EXTRA_SRC += include/http/service/static/static.c
+tests/http/service/static/test_all$(EXE) tests/http/service/static/test_unchecked$(EXE): private CPPFLAGS += -DHTTP_SERVICE_STATIC_TEST_HOOKS
+tests/http/service/static/test_all$(EXE) tests/http/service/static/test_unchecked$(EXE): private CPPFLAGS_UNCHECKED += -DHTTP_SERVICE_STATIC_TEST_HOOKS
+tests/http/service/static/test_all$(EXE) tests/http/service/static/test_unchecked$(EXE): include/http/service/static/static.c
 
 test-unchecked: $(UNCHECKED_BIN)
 	@status=0; failed=""; \

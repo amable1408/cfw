@@ -224,6 +224,75 @@ static String _string_init(void)
     return string;
 }
 
+/* The one growth body behind string_reserve and string_try_reserve; try_mode picks the
+ * borrow. allocator_borrow ENDS the process on an exhausted arena or a failed heap
+ * allocation (string_reserve's contract, unchanged); allocator_try_borrow answers nullptr
+ * instead. Either way a null borrow returns false BEFORE any field of self is written, so
+ * the String is untouched on failure - the atomicity string_try_reserve promises. */
+static bool _string_reserve(String *const self, USize const capacity, bool const try_mode) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+
+    /* Already big enough (capacity 0 included): no borrow, no syscall. */
+    if (capacity <= self->capacity) {
+        trace_log_pop();
+
+        return true;
+    }
+
+    char *const buffer = self->data;
+    /* Captured BEFORE the flag is overwritten. Growing a VIEW copies the borrowed
+     * bytes into a buffer this String does own, but the ORIGINAL must not be
+     * released - it belongs to the caller. */
+    bool const buffer_owned = self->owned;
+
+#ifdef ARENA_IMPLEMENTATION
+    char *const grown = try_mode
+        ? (char*) allocator_try_borrow(capacity, self->allocator)
+        : (char*) allocator_borrow(capacity, self->allocator);
+#else
+    char *const grown = try_mode
+        ? (char*) allocator_try_borrow(capacity)
+        : (char*) allocator_borrow(capacity);
+#endif // ARENA_IMPLEMENTATION
+
+    /* Null from a REFUSED arena in both modes, and from an exhausted arena or a failed
+     * heap allocation in try_mode. self still holds its old buffer and capacity
+     * untouched, so refusing here leaves the object fully intact - assigning first (as
+     * this code once did) grew capacity, nulled data and marked it owned before anything
+     * could notice. */
+    if (memory_empty(grown)) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    self->capacity = capacity;
+    self->data = grown;
+    self->owned = true;
+
+    if (self->size > 0) {
+        char_copy_2(self->data, buffer, self->size);
+    }
+
+    /* Unconditional (the terminator rule): the grown buffer can be arena-backed, and only
+     * memory_alloc owes the zero fill. */
+    self->data[self->size] = '\0';
+
+    if (buffer_owned && !memory_empty(buffer)) {
+#ifdef ARENA_IMPLEMENTATION
+        allocator_release(buffer, self->allocator);
+#else
+        allocator_release(buffer);
+#endif // ARENA_IMPLEMENTATION
+    }
+
+    trace_log_pop();
+
+    return true;
+}
+
 #ifdef ARENA_IMPLEMENTATION
 static void _string_uninit(String *const self, Arena *const allocator)
 #else
@@ -2634,49 +2703,10 @@ void string_reserve(String *const self, USize const capacity) {
     error_check_null(LOG_METADATA, "self", (void*) self);
     error_check_non_value_uint(LOG_METADATA, "capacity", capacity);
 
-    if (capacity > self->capacity) {
-        char *buffer = self->data;
-        /* Captured BEFORE the flag is overwritten. Growing a VIEW copies the borrowed
-         * bytes into a buffer this String does own, but the ORIGINAL must not be
-         * released - it belongs to the caller. */
-        bool const buffer_owned = self->owned;
-
-#ifdef ARENA_IMPLEMENTATION
-        char *const grown = (char*) allocator_borrow(capacity, self->allocator);
-#else
-        char *const grown = (char*) allocator_borrow(capacity);
-#endif // ARENA_IMPLEMENTATION
-
-        /* Null only from a REFUSED arena. self still holds its old buffer and
-         * capacity untouched, so refusing here leaves the object fully intact -
-         * assigning first (as this code once did) grew capacity, nulled data and
-         * marked it owned before anything could notice. */
-        if (memory_empty(grown)) {
-            trace_log_pop();
-
-            return;
-        }
-
-        self->capacity = capacity;
-        self->data = grown;
-        self->owned = true;
-
-        if (self->size > 0) {
-            char_copy_2(self->data, buffer, self->size);
-        }
-
-        /* Unconditional (the terminator rule): the grown buffer can be arena-backed, and only
-         * memory_alloc owes the zero fill. */
-        self->data[self->size] = '\0';
-
-        if (buffer_owned && !memory_empty(buffer)) {
-#ifdef ARENA_IMPLEMENTATION
-            allocator_release(buffer, self->allocator);
-#else
-            allocator_release(buffer);
-#endif // ARENA_IMPLEMENTATION
-        }
-    }
+    /* The aborting borrow: an exhausted arena or a failed heap allocation ends the process,
+     * and only a refused arena returns - as a no-op leaving self intact. The answer is
+     * deliberately dropped; string_try_reserve is the caller that reports it. */
+    (void) _string_reserve(self, capacity, false);
 
     trace_log_pop();
 }
@@ -3103,6 +3133,19 @@ void string_trim(String *const self) {
     *self = buffer;
 
     trace_log_pop();
+}
+
+bool string_try_reserve(String *const self, USize const capacity) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+
+    /* capacity is a VALUE here: 0 falls into the helper's already-big-enough no-op. */
+    bool const reserved = _string_reserve(self, capacity, true);
+
+    trace_log_pop();
+
+    return reserved;
 }
 
 void string_uninit(String *const self) {

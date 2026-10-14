@@ -1,6 +1,6 @@
 /*
  * traceparent.h - HTTP traceparent service for the C Libraries Framework
- * @version 0.3.0
+ * @version 0.3.1
  *
  * Creates, validates, and propagates W3C Trace Context traceparent (and tracestate)
  * values. The service stays transport-focused and does not depend on logging,
@@ -284,7 +284,12 @@ bool http_service_traceparent_context_valid(HTTP_Service_Traceparent_Context con
  * @param context Traceparent context.
  * @return Header block, to be released with string_uninit. Carries the traceparent line
  *         and, when the context holds one, the tracestate line. Empty when the context is
- *         invalid - an invalid context has no value to name.
+ *         invalid - an invalid context has no value to name - and when a hand-set
+ *         header_name is unterminated within its array or is not an HTTP token (one WARN,
+ *         the name never echoed). The tracestate is RE-CHECKED
+ *         here (a hand-filled context bypasses the inbound check): one that is unterminated
+ *         within its array, or carries a control byte, over-long or over-many members, is
+ *         omitted with a WARN while the traceparent line still ships.
  */
 String http_service_traceparent_header_create(HTTP_Service_Traceparent const *const self, HTTP_Service_Traceparent_Context const *const context);
 

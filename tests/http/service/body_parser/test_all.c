@@ -118,7 +118,7 @@ static void _test_regression_pair_with_no_equals_before_a_later_one(Test *const 
 }
 
 static void _test_regression_empty_value(Test *const test) {
-    test_case_begin(test, "\"k=\" - an empty value is stored as \"\" (present, not absent), url_decode(size=0) no longer aborts");
+    test_case_begin(test, "\"k=\" - an empty value is stored as \"\" (present, not absent), http_query_decode(size=0) no longer aborts");
 
     char const *const body = "k=&next=1";
 
@@ -249,6 +249,7 @@ static void _test_max_pairs_bound(Test *const test) {
     char const *const body = "a=1&b=2&c=3";
 
     HTTP_Service_Body_Parser parser = http_service_body_parser_init();
+
     parser.max_pairs = 2;
 
     bool const parsed = http_service_body_parser_parse(&parser, HTTP_SERVICE_BODY_PARSER_CONTENT_TYPE_FORM, (Byte const*) body, char_length(body));
@@ -343,7 +344,7 @@ static void _test_explicit_zero_max_pairs_is_unbounded(Test *const test) {
 }
 
 static void _test_regression_empty_key(Test *const test) {
-    test_case_begin(test, "regression: \"=v\" - an empty key is skipped, not passed to url_decode(size=0)");
+    test_case_begin(test, "regression: \"=v\" - an empty key is skipped, not passed to http_query_decode(size=0)");
 
     char const *const body = "=v&next=1";
 
@@ -397,6 +398,155 @@ static void _test_reparse_resets_previous_state(Test *const test) {
     test_case_end(test);
 }
 
+/*==============================================================================
+ * MARK: - Characterisation Pins (form decode + pair split)
+ *============================================================================*/
+
+/* Recorded on the hand-rolled decoder and '&' splitter BEFORE they moved onto
+ * http/query's http_query_decode / http_query_next, and required to hold unchanged
+ * after: every expectation below is what the old code answered, not what a spec says. */
+
+static bool _parse_form_sized(HTTP_Service_Body_Parser *const self, char const *const body, USize const body_size) {
+    return http_service_body_parser_parse(self, HTTP_SERVICE_BODY_PARSER_CONTENT_TYPE_FORM, (Byte const*) body, body_size);
+}
+
+static void _test_pin_decode_escapes(Test *const test) {
+    test_case_begin(test, "pin: percent and '+' decoding of a form value");
+
+    HTTP_Service_Body_Parser parser = http_service_body_parser_init();
+
+    test_expect_true(test, "truncated escape: parse succeeds", _parse_form_sized(&parser, "a=x%4", 5));
+    test_expect_string(test, "a truncated \"%4\" at the end passes through literally", "x%4", http_service_body_parser_form_get(&parser, "a"));
+
+    test_expect_true(test, "lone '%': parse succeeds", _parse_form_sized(&parser, "a=%", 3));
+    test_expect_string(test, "a lone trailing '%' passes through literally", "%", http_service_body_parser_form_get(&parser, "a"));
+
+    test_expect_true(test, "invalid escape: parse succeeds", _parse_form_sized(&parser, "a=%zz", 5));
+    test_expect_string(test, "an invalid \"%zz\" passes through literally", "%zz", http_service_body_parser_form_get(&parser, "a"));
+
+    test_expect_true(test, "half-invalid escape: parse succeeds", _parse_form_sized(&parser, "a=%4g", 5));
+    test_expect_string(test, "a half-hex \"%4g\" passes through literally", "%4g", http_service_body_parser_form_get(&parser, "a"));
+
+    test_expect_true(test, "'%' then '+': parse succeeds", _parse_form_sized(&parser, "a=%+41", 6));
+    test_expect_string(test, "the '%' stays literal and the '+' still becomes a space", "% 41", http_service_body_parser_form_get(&parser, "a"));
+
+    test_expect_true(test, "'+': parse succeeds", _parse_form_sized(&parser, "a=b+c", 5));
+    test_expect_string(test, "'+' decodes to a space", "b c", http_service_body_parser_form_get(&parser, "a"));
+
+    test_expect_true(test, "encoded '+': parse succeeds", _parse_form_sized(&parser, "a=%2B", 5));
+    test_expect_string(test, "\"%2B\" decodes to a literal '+', not a space", "+", http_service_body_parser_form_get(&parser, "a"));
+
+    test_expect_true(test, "two escapes: parse succeeds", _parse_form_sized(&parser, "a=%41%42", 8));
+    test_expect_string(test, "\"%41%42\" decodes to \"AB\"", "AB", http_service_body_parser_form_get(&parser, "a"));
+
+    test_expect_true(test, "lowercase hex: parse succeeds", _parse_form_sized(&parser, "a=%6b", 5));
+    test_expect_string(test, "lowercase hex digits decode", "k", http_service_body_parser_form_get(&parser, "a"));
+
+    test_expect_true(test, "\"%00\": parse succeeds", _parse_form_sized(&parser, "a=x%00y", 7));
+    test_expect_string(test, "a decoded \"%00\" ends the stored C string", "x", http_service_body_parser_form_get(&parser, "a"));
+
+    test_expect_true(test, "encoded key: parse succeeds", _parse_form_sized(&parser, "%6B=1", 5));
+    test_expect_string(test, "the KEY is decoded too: \"%6B\" is stored as \"k\"", "1", http_service_body_parser_form_get(&parser, "k"));
+    test_expect_null(test, "the raw encoded key is not what is stored", http_service_body_parser_form_get(&parser, "%6B"));
+
+    test_expect_true(test, "'+' in a key: parse succeeds", _parse_form_sized(&parser, "a+b=1", 5));
+    test_expect_string(test, "'+' in a key decodes to a space", "1", http_service_body_parser_form_get(&parser, "a b"));
+
+    http_service_body_parser_uninit(&parser);
+
+    test_case_end(test);
+}
+
+static void _test_pin_pair_split(Test *const test) {
+    test_case_begin(test, "pin: '&' splitting, empty segments, missing '=', empty key and value");
+
+    HTTP_Service_Body_Parser parser = http_service_body_parser_init();
+
+    test_expect_true(test, "\"&&\": parse succeeds", _parse_form_sized(&parser, "a=1&&b=2", 8));
+    test_expect_u(test, "an empty segment adds nothing", 2, map_char_char_get_size(&parser.form_data));
+    test_expect_string(test, "the pair before \"&&\" parses", "1", http_service_body_parser_form_get(&parser, "a"));
+    test_expect_string(test, "the pair after \"&&\" parses", "2", http_service_body_parser_form_get(&parser, "b"));
+
+    test_expect_true(test, "leading and trailing '&': parse succeeds", _parse_form_sized(&parser, "&a=1&", 5));
+    test_expect_u(test, "only the one real pair is kept", 1, map_char_char_get_size(&parser.form_data));
+    test_expect_string(test, "the pair between them parses", "1", http_service_body_parser_form_get(&parser, "a"));
+
+    test_expect_true(test, "\"=v\": parse succeeds", _parse_form_sized(&parser, "=v", 2));
+    test_expect_u(test, "an empty key is skipped", 0, map_char_char_get_size(&parser.form_data));
+
+    test_expect_true(test, "\"k=\": parse succeeds", _parse_form_sized(&parser, "k=", 2));
+    test_expect_u(test, "an empty value is kept", 1, map_char_char_get_size(&parser.form_data));
+    test_expect_string(test, "an empty value is stored as \"\"", "", http_service_body_parser_form_get(&parser, "k"));
+
+    test_expect_true(test, "\"k\": parse succeeds", _parse_form_sized(&parser, "k", 1));
+    test_expect_u(test, "a pair with no '=' is skipped", 0, map_char_char_get_size(&parser.form_data));
+    test_expect_null(test, "a pair with no '=' is absent, not empty", http_service_body_parser_form_get(&parser, "k"));
+
+    test_expect_true(test, "\"a==b\": parse succeeds", _parse_form_sized(&parser, "a==b", 4));
+    test_expect_string(test, "the split is at the FIRST '='; the rest is the value", "=b", http_service_body_parser_form_get(&parser, "a"));
+
+    test_expect_true(test, "leading '?': parse succeeds", _parse_form_sized(&parser, "?a=1", 4));
+    test_expect_null(test, "a leading '?' is NOT stripped from a form body", http_service_body_parser_form_get(&parser, "a"));
+    test_expect_string(test, "it stays part of the first key", "1", http_service_body_parser_form_get(&parser, "?a"));
+
+    test_expect_true(test, "duplicate after decode: parse succeeds", _parse_form_sized(&parser, "k=1&%6B=2", 9));
+    test_expect_string(test, "a key equal only AFTER decoding still counts as a duplicate (first wins)", "1", http_service_body_parser_form_get(&parser, "k"));
+
+    http_service_body_parser_uninit(&parser);
+
+    test_case_end(test);
+}
+
+static void _test_pin_raw_nul_bytes(Test *const test) {
+    test_case_begin(test, "pin: a RAW NUL byte inside the sized payload is data, not an end marker");
+
+    HTTP_Service_Body_Parser parser = http_service_body_parser_init();
+
+    char const key_nul[] = { 'a', '\0', 'b', '=', '1' };
+
+    test_expect_true(test, "raw NUL in a key: parse succeeds", _parse_form_sized(&parser, key_nul, sizeof(key_nul)));
+    test_expect_u(test, "the pair is kept (the '=' after the NUL is still found)", 1, map_char_char_get_size(&parser.form_data));
+    test_expect_string(test, "the stored C-string key ends at the NUL", "1", http_service_body_parser_form_get(&parser, "a"));
+
+    char const value_nul[] = { 'a', '=', '1', '\0', '&', 'b', '=', '2' };
+
+    test_expect_true(test, "raw NUL in a value: parse succeeds", _parse_form_sized(&parser, value_nul, sizeof(value_nul)));
+    test_expect_string(test, "the value ends at the NUL as a C string", "1", http_service_body_parser_form_get(&parser, "a"));
+    test_expect_string(test, "the pair AFTER the NUL is still parsed", "2", http_service_body_parser_form_get(&parser, "b"));
+
+    http_service_body_parser_uninit(&parser);
+
+    test_case_end(test);
+}
+
+static void _test_pin_max_pairs_counting(Test *const test) {
+    test_case_begin(test, "pin: what max_pairs counts - only '='-bearing pairs, checked before the empty-key skip");
+
+    HTTP_Service_Body_Parser parser = http_service_body_parser_init();
+
+    parser.max_pairs = 2;
+
+    test_expect_true(test, "a pair with no '=' never trips the budget", _parse_form_sized(&parser, "a=1&x&b=2", 9));
+    test_expect_u(test, "both '='-bearing pairs are kept", 2, map_char_char_get_size(&parser.form_data));
+
+    test_expect_true(test, "a no-'=' pair after the budget is full is ignored, not refused", _parse_form_sized(&parser, "a=1&b=2&k", 9));
+
+    test_expect_false(test, "an EMPTY-KEY pair after the budget is full still refuses (the check precedes the skip)", _parse_form_sized(&parser, "a=1&b=2&=v", 10));
+    test_expect_u(test, "the pairs before the refusal remain", 2, map_char_char_get_size(&parser.form_data));
+
+    test_expect_false(test, "a third real pair refuses", _parse_form_sized(&parser, "a=1&b=2&c=3", 11));
+    test_expect_null(test, "the pair past the budget was never added", http_service_body_parser_form_get(&parser, "c"));
+
+    test_expect_false(test, "a duplicate key IS stored (it grows the map), so a=1&a=2&b=2 refuses at b", _parse_form_sized(&parser, "a=1&a=2&b=2", 11));
+    test_expect_u(test, "both duplicates occupy the budget", 2, map_char_char_get_size(&parser.form_data));
+    test_expect_string(test, "lookup still answers the first-parsed duplicate", "1", http_service_body_parser_form_get(&parser, "a"));
+    test_expect_null(test, "b was refused", http_service_body_parser_form_get(&parser, "b"));
+
+    http_service_body_parser_uninit(&parser);
+
+    test_case_end(test);
+}
+
 int main(void) {
     LogConfig const log_config = {
         .level             = LOG_LEVEL_ERROR,
@@ -429,6 +579,10 @@ int main(void) {
     _test_uninit_without_parse(&test);
     _test_reparse_resets_previous_state(&test);
     _test_parse_reuse_without_uninit_resets_state(&test);
+    _test_pin_decode_escapes(&test);
+    _test_pin_pair_split(&test);
+    _test_pin_raw_nul_bytes(&test);
+    _test_pin_max_pairs_counting(&test);
     test_suite_end(&test);
 
     return test_uninit(&test);

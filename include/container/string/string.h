@@ -1,5 +1,6 @@
 /*
  * string.h - Canonical String Object for the C Libraries Framework
+ * @version 0.5.0
  *
  * Provides a high-level, mutable string object with dynamic or arena-backed memory management.
  *
@@ -8,6 +9,8 @@
  *   - Interoperability with Str and C strings
  *   - API for construction, mutation, comparison, slicing, and conversion
  *   - Canonical error checking and memory safety
+ *   - Non-aborting growth (0.5.0): string_try_reserve answers false and leaves the String
+ *     untouched where string_reserve would end the process on an exhausted allocator
  *
  * Usage Examples:
  *   @code
@@ -1314,7 +1317,14 @@ void string_replace_4(String *const self, String const *const data, USize const 
  * @param capacity Desired buffer capacity. Must be non-zero; a zero capacity is
  *        a programming error and aborts.
  * @note Never shrinks. A refused arena is a no-op leaving self intact. Growing a VIEW copies
- *       its bytes into a fresh buffer and PROMOTES it to an OWNER.
+ *       its bytes into a fresh buffer and PROMOTES it to an OWNER. An exhausted arena or a
+ *       failed heap allocation ENDS the process; string_try_reserve is the non-aborting twin
+ *       for capacities that arrive from outside the program.
+ * @note To make a following string_add_* of n bytes allocate nothing, reserve
+ *       string_get_size(self) + n + CHAR_END_CHARACTER - the append needs the terminator's
+ *       byte too, and reserving only size + n leaves it growing at max(required,
+ *       2 x capacity). Not a pre-check for string_format, whose rendered length is unknown
+ *       up front (see string_try_reserve).
  */
 void string_reserve(String *const self, USize const capacity);
 
@@ -1500,6 +1510,28 @@ USize string_to_numbers_uint(String const *const self);
  *       or an owned zero-length one - collapses straight to the EMPTY String instead.
  */
 void string_trim(String *const self);
+
+/**
+ * @brief Grow a String's capacity to at least the requested value WITHOUT aborting - the
+ *        non-aborting twin of string_reserve, for capacities derived from external input.
+ * @param self Pointer to the String object.
+ * @param capacity Desired buffer capacity. A VALUE, not a programming error: 0 (and any
+ *        capacity self already holds) answers true as a no-op, with no allocation.
+ * @return true when self now holds at least `capacity` bytes - including the no-op when it
+ *         already did; false when the allocator could not provide them (an exhausted or
+ *         refused arena, a failed heap allocation), and then self is UNTOUCHED: data, size,
+ *         capacity and ownership exactly as before the call.
+ * @note Never shrinks. Growing a VIEW copies its bytes into a fresh buffer and PROMOTES it to
+ *       an OWNER, exactly as string_reserve does; the caller's original buffer is never
+ *       released or written. Where string_reserve ENDS the process on an exhausted arena or a
+ *       failed heap allocation, this answers false.
+ * @note RESERVE FIRST, WITH THE TERMINATOR: to make a following string_add_* of n bytes
+ *       allocate nothing, reserve string_get_size(self) + n + CHAR_END_CHARACTER. Reserving
+ *       size + n answers true, yet the append still grows - through the ABORTING path, at
+ *       max(required, 2 x capacity), a larger borrow than the one just checked. Reserving
+ *       first does not cover string_format: its rendered length is unknown up front.
+ */
+bool string_try_reserve(String *const self, USize const capacity);
 
 /**
  * @brief Uninitialize a String, freeing its resources.

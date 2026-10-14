@@ -1,5 +1,6 @@
 /*
  * headers.h - HTTP header helpers for the C Libraries Framework
+ * @version 0.4.1
  *
  * Builds common response headers: Cache-Control, Content-*, and browser
  * security policy headers.
@@ -31,6 +32,8 @@
  *     LOG_LEVEL_WARN. The by-value http_headers_security_init_2 cannot refuse, so it omits only
  *     that field's header; http_headers_security_alloc_init_2 CAN refuse and does - the whole
  *     policy is refused (false, *self zeroed), the same shape as their arena-refusal path below.
+ *     http_headers_security_create_2 RE-CHECKS the four policy Strings (a field written after
+ *     init bypasses the init-time check) and, like init_2, omits only a failing field's line.
  *   - http_headers_security_alloc_init_1/_2 also refuse the WHOLE policy (false, *self zeroed)
  *     when a starved arena would otherwise silently drop a security header for the process
  *     lifetime; the heap tiers stay by-value since memory_alloc aborts rather than degrading to
@@ -338,7 +341,9 @@ String http_headers_security_create_1(void);
 /**
  * @brief Build security headers from a policy.
  * @param self Security policy.
- * @return Header block.
+ * @return Header block. The four policy Strings are public, so each is re-checked here: one
+ *         carrying a control byte loses only its own line (LOG_LEVEL_WARN naming the field,
+ *         never the value) and the rest of the block still ships.
  */
 String http_headers_security_create_2(HTTP_Headers_Security const *const self);
 

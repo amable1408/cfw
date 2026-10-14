@@ -14,7 +14,12 @@
  * and without "+" -> space, sized and unsized), plus the writing side added in 0.2.0 -
  * http_query_encode_1/_2 (RFC 3986, space -> "%20"), http_query_add_1/_2 (0.3.0: the
  * query-string pair builder, space -> "%20") and http_query_form_add_1/_2 (the
- * x-www-form-urlencoded body builder, space -> "+").
+ * x-www-form-urlencoded body builder, space -> "+"), and the 0.4.0 zero-allocation tier -
+ * http_query_next (the VIEW pair enumerator), http_query_find (the VIEW lookup that tells
+ * "key=" from an absent key) and http_query_decode (the whole-or-nothing caller-buffer
+ * decoder). The "pin:" cases were recorded on the 0.3.2 code before the alloc tier was
+ * re-based on those three, and must hold unchanged - except the delimiter-carrying keys, which
+ * 0.4.0's whole-name match flipped on purpose (see _test_pin_get_keys_carrying_delimiters).
  *
  * The writing side takes its destination String FIRST as of 0.3.0 (encode's `out` moved from
  * last to first, matching form_add and string_add_last_*); every call below is in that order.
@@ -575,6 +580,326 @@ static void _test_form_add_refusals(Test *const test) {
 }
 
 /*==============================================================================
+ * MARK: - Characterisation Pins (shared with body_parser)
+ *============================================================================*/
+
+/* The same inputs body_parser's characterisation pins record, run through this module's
+ * alloc tier BEFORE 0.4.0 re-based it on http_query_next / http_query_decode. Recorded
+ * on the old code and required to hold unchanged after (the delimiter-carrying-key pin
+ * excepted: flipped on purpose, see its own note). */
+
+static bool _form_decodes_to(Arena *const arena, char const *const encoded, USize const encoded_size, char const *const expected, USize const expected_size) {
+    USize out_size = 0;
+    char const *const decoded = http_query_alloc_form_decode_2(encoded, encoded_size, &out_size, arena);
+
+    return decoded != nullptr && out_size == expected_size && memcmp(decoded, expected, expected_size) == 0 && decoded[out_size] == '\0';
+}
+
+static void _test_pin_form_decode_matches_body_parser(Test *const test) {
+    test_case_begin(test, "pin: form_decode_2 on body_parser's characterisation inputs");
+
+    Arena arena = arena_init_1(4096, ARENA_TYPE_LINEAR);
+
+    test_expect_true(test, "a truncated \"%4\" passes through literally", _form_decodes_to(&arena, "x%4", 3, "x%4", 3));
+    test_expect_true(test, "a lone trailing '%' passes through literally", _form_decodes_to(&arena, "%", 1, "%", 1));
+    test_expect_true(test, "an invalid \"%zz\" passes through literally", _form_decodes_to(&arena, "%zz", 3, "%zz", 3));
+    test_expect_true(test, "a half-hex \"%4g\" passes through literally", _form_decodes_to(&arena, "%4g", 3, "%4g", 3));
+    test_expect_true(test, "\"%+41\": the '%' stays literal and the '+' still becomes a space", _form_decodes_to(&arena, "%+41", 4, "% 41", 4));
+    test_expect_true(test, "'+' decodes to a space", _form_decodes_to(&arena, "b+c", 3, "b c", 3));
+    test_expect_true(test, "\"%2B\" decodes to a literal '+'", _form_decodes_to(&arena, "%2B", 3, "+", 1));
+    test_expect_true(test, "\"%41%42\" decodes to \"AB\"", _form_decodes_to(&arena, "%41%42", 6, "AB", 2));
+    test_expect_true(test, "lowercase hex digits decode", _form_decodes_to(&arena, "%6b", 3, "k", 1));
+    test_expect_true(test, "\"%6B\" decodes to \"k\"", _form_decodes_to(&arena, "%6B", 3, "k", 1));
+    test_expect_true(test, "\"x%00y\" decodes to three bytes, the NUL kept", _form_decodes_to(&arena, "x%00y", 5, "x\0y", 3));
+    test_expect_true(test, "an empty value decodes to \"\"", _form_decodes_to(&arena, "", 0, "", 0));
+
+    arena_uninit(&arena, ARENA_TYPE_LINEAR);
+
+    test_case_end(test);
+}
+
+static void _test_pin_get_5_on_body_parser_inputs(Test *const test) {
+    test_case_begin(test, "pin: alloc_get_5's split semantics on body_parser's characterisation inputs");
+
+    Arena arena = arena_init_1(4096, ARENA_TYPE_LINEAR);
+
+    test_expect_string(test, "\"&&\": the pair after an empty segment is found", "2", http_query_alloc_get_5("a=1&&b=2", 8, "b", 1, &arena));
+    test_expect_string(test, "leading/trailing '&': the pair between is found", "1", http_query_alloc_get_5("&a=1&", 5, "a", 1, &arena));
+    test_expect_null(test, "\"k=\": an empty value answers nullptr (alloc_get's absent-or-empty rule)", http_query_alloc_get_5("k=", 2, "k", 1, &arena));
+    test_expect_null(test, "\"k\": a pair with no '=' does not match", http_query_alloc_get_5("k", 1, "k", 1, &arena));
+    test_expect_string(test, "\"k&k=2\": a no-'=' pair does not shadow a later real one", "2", http_query_alloc_get_5("k&k=2", 5, "k", 1, &arena));
+    test_expect_string(test, "\"a==b\": the split is at the first '='", "=b", http_query_alloc_get_5("a==b", 4, "a", 1, &arena));
+    test_expect_string(test, "\"?a=1\": a leading '?' IS stripped here (unlike body_parser)", "1", http_query_alloc_get_5("?a=1", 4, "a", 1, &arena));
+    test_expect_null(test, "\"??a=1\": only ONE leading '?' is stripped", http_query_alloc_get_5("??a=1", 5, "a", 1, &arena));
+    test_expect_string(test, "\"%6B=1\": keys match RAW, never decoded", "1", http_query_alloc_get_5("%6B=1", 5, "%6B", 3, &arena));
+    test_expect_null(test, "\"%6B=1\": the decoded spelling does not match", http_query_alloc_get_5("%6B=1", 5, "k", 1, &arena));
+    test_expect_string(test, "values come back RAW, never decoded", "x%00y", http_query_alloc_get_5("a=x%00y", 7, "a", 1, &arena));
+
+    char const value_nul[] = { 'a', '=', '1', '\0', '&', 'b', '=', '2' };
+
+    test_expect_string(test, "a raw NUL ends the value", "1", http_query_alloc_get_5(value_nul, sizeof(value_nul), "a", 1, &arena));
+    test_expect_null(test, "a raw NUL ends the WHOLE query: the pair after it is not found (unlike body_parser)", http_query_alloc_get_5(value_nul, sizeof(value_nul), "b", 1, &arena));
+
+    char const key_nul[] = { 'a', '\0', 'b', '=', '1' };
+
+    test_expect_null(test, "a raw NUL inside a key ends the query before its '='", http_query_alloc_get_5(key_nul, sizeof(key_nul), "a", 1, &arena));
+
+    arena_uninit(&arena, ARENA_TYPE_LINEAR);
+
+    test_case_end(test);
+}
+
+/* The one DELIBERATE flip among the pins: through 0.3.x these three keys matched across the
+ * delimiters they carry ("c", "1", "1"). 0.4.0 matches a key against a pair's WHOLE name, so
+ * a key holding '=' or '&' can never equal one, and all three now answer absent. */
+static void _test_pin_get_keys_carrying_delimiters(Test *const test) {
+    test_case_begin(test, "pin: a lookup KEY that itself contains '=' or '&' matches no name");
+
+    Arena arena = arena_init_1(4096, ARENA_TYPE_LINEAR);
+
+    test_expect_null(test, "key \"a=b\" in \"a=b=c\" is absent (the name is \"a\")", http_query_alloc_get_5("a=b=c", 5, "a=b", 3, &arena));
+    test_expect_null(test, "key \"a&b\" in \"a&b=1\" is absent (the names are \"a\" and \"b\")", http_query_alloc_get_5("a&b=1", 5, "a&b", 3, &arena));
+    test_expect_null(test, "key \"&b\" in \"a&&b=1\" is absent (the names are \"a\" and \"b\")", http_query_alloc_get_5("a&&b=1", 6, "&b", 2, &arena));
+    test_expect_string(test, "the plain key \"b\" in \"a&&b=1\" is still found", "1", http_query_alloc_get_5("a&&b=1", 6, "b", 1, &arena));
+
+    arena_uninit(&arena, ARENA_TYPE_LINEAR);
+
+    test_case_end(test);
+}
+
+/*==============================================================================
+ * MARK: - Cursor and Buffer Tier (0.4.0)
+ *============================================================================*/
+
+// True when `slice` holds exactly expected[0..expected_size) - compared by size and bytes,
+// never char_length, since next/find slices are unterminated VIEWs into the query.
+static bool _slice_is(Str const *const slice, char const *const expected, USize const expected_size) {
+    if (str_get_size(slice) != expected_size) {
+        return false;
+    }
+
+    return expected_size == 0 || memcmp(str_get_data(slice), expected, expected_size) == 0;
+}
+
+static void _test_next_empty_and_single(Test *const test) {
+    test_case_begin(test, "next: an empty query, a single pair, and the cursor at the end");
+
+    USize cursor = 0;
+    Str   name   = str_init_1();
+    Str   value  = str_init_1();
+
+    test_expect_false(test, "an empty query has no pair", http_query_next("", 0, &cursor, &name, &value));
+    test_expect_false(test, "a null query of size 0 is a legal empty value", http_query_next(nullptr, 0, &cursor, &name, &value));
+    test_expect_u(test, "the cursor stays at 0", 0, cursor);
+    test_expect_true(test, "an exhausted walk answers EMPTY name and value", str_get_data(&name) == nullptr && str_get_data(&value) == nullptr);
+
+    char const *const query = "a=1";
+
+    test_expect_true(test, "a single pair is answered", http_query_next(query, 3, &cursor, &name, &value));
+    test_expect_true(test, "name slice is \"a\"", _slice_is(&name, "a", 1));
+    test_expect_true(test, "value slice is \"1\"", _slice_is(&value, "1", 1));
+    test_expect_true(test, "the slices are VIEWs into the query, not copies", str_get_data(&name) == query && str_get_data(&value) == query + 2);
+    test_expect_false(test, "a VIEW is never owned", name.owned || value.owned);
+    test_expect_u(test, "the cursor ends at query_size", 3, cursor);
+    test_expect_false(test, "the cursor at the end answers no pair", http_query_next(query, 3, &cursor, &name, &value));
+    test_expect_u(test, "the cursor stays at query_size", 3, cursor);
+
+    cursor = 10;
+
+    test_expect_false(test, "a cursor past query_size answers no pair", http_query_next(query, 3, &cursor, &name, &value));
+    test_expect_u(test, "a cursor past query_size is left untouched", 10, cursor);
+
+    test_case_end(test);
+}
+
+static void _test_next_segments_and_shapes(Test *const test) {
+    test_case_begin(test, "next: \"&&\", a trailing '&', no '=', \"=v\", \"a==b\", a leading '?'");
+
+    USize cursor = 0;
+    Str   name   = str_init_1();
+    Str   value  = str_init_1();
+
+    char const *const doubled = "&a=1&&b=2&";
+
+    test_expect_true(test, "the first pair after a leading '&'", http_query_next(doubled, 10, &cursor, &name, &value));
+    test_expect_true(test, "it is a=1", _slice_is(&name, "a", 1) && _slice_is(&value, "1", 1));
+    test_expect_u(test, "the cursor sits past the '&' that ended it", 5, cursor);
+    test_expect_true(test, "\"&&\" is stepped over to the next pair", http_query_next(doubled, 10, &cursor, &name, &value));
+    test_expect_true(test, "it is b=2", _slice_is(&name, "b", 1) && _slice_is(&value, "2", 1));
+    test_expect_u(test, "a trailing '&' leaves the cursor at query_size", 10, cursor);
+    test_expect_false(test, "nothing follows the trailing '&'", http_query_next(doubled, 10, &cursor, &name, &value));
+
+    char const *const bare = "k&k=";
+
+    cursor = 0;
+
+    test_expect_true(test, "a pair with no '=' is answered", http_query_next(bare, 4, &cursor, &name, &value));
+    test_expect_true(test, "its name is \"k\"", _slice_is(&name, "k", 1));
+    test_expect_true(test, "\"k\": its value is the EMPTY Str (size 0, data nullptr - the contract)", str_get_size(&value) == 0 && str_get_data(&value) == nullptr);
+    test_expect_true(test, "\"k=\" is answered", http_query_next(bare, 4, &cursor, &name, &value));
+    test_expect_true(test, "its name is \"k\" too", _slice_is(&name, "k", 1));
+    test_expect_true(test, "\"k=\": its value is size 0 with NON-null data (the contract)", str_get_size(&value) == 0 && str_get_data(&value) != nullptr);
+    test_expect_true(test, "the empty view points just past the '='", str_get_data(&value) == bare + 4);
+
+    cursor = 0;
+
+    test_expect_true(test, "\"=\" alone is answered (a present pair)", http_query_next("=", 1, &cursor, &name, &value));
+    test_expect_true(test, "\"=\": an empty name with NON-null data", str_get_size(&name) == 0 && str_get_data(&name) != nullptr);
+    test_expect_true(test, "\"=\": an empty value with NON-null data (it had an '=')", str_get_size(&value) == 0 && str_get_data(&value) != nullptr);
+    test_expect_false(test, "\"=\": nothing follows", http_query_next("=", 1, &cursor, &name, &value));
+
+    cursor = 0;
+
+    test_expect_true(test, "\"=v\" is answered", http_query_next("=v", 2, &cursor, &name, &value));
+    test_expect_true(test, "with an empty name and value \"v\"", str_get_size(&name) == 0 && _slice_is(&value, "v", 1));
+
+    cursor = 0;
+
+    test_expect_true(test, "\"a==b\" is answered", http_query_next("a==b", 4, &cursor, &name, &value));
+    test_expect_true(test, "the name stops at the FIRST '='; the value keeps the rest", _slice_is(&name, "a", 1) && _slice_is(&value, "=b", 2));
+
+    cursor = 0;
+
+    test_expect_true(test, "\"?a=1\" is answered", http_query_next("?a=1", 4, &cursor, &name, &value));
+    test_expect_true(test, "a leading '?' is NOT skipped: it is part of the name", _slice_is(&name, "?a", 2));
+
+    cursor = 0;
+
+    test_expect_true(test, "\"a=%41+\" is answered", http_query_next("a=%41+", 6, &cursor, &name, &value));
+    test_expect_true(test, "the slices are raw, never decoded", _slice_is(&value, "%41+", 4));
+
+    test_case_end(test);
+}
+
+static void _test_next_sized_with_embedded_nul(Test *const test) {
+    test_case_begin(test, "next: a sized query carrying a raw NUL walks past it (byte-transparent)");
+
+    char const query[] = { 'a', '=', '1', '\0', '2', '&', 'b', '=', 'x', 'X', 'X' };
+    USize      cursor  = 0;
+    Str        name    = str_init_1();
+    Str        value   = str_init_1();
+
+    test_expect_true(test, "the first pair", http_query_next(query, 9, &cursor, &name, &value));
+    test_expect_true(test, "its value carries the NUL and the byte after it", _slice_is(&value, "1\0" "2", 3));
+    test_expect_true(test, "the pair after the NUL is still answered", http_query_next(query, 9, &cursor, &name, &value));
+    test_expect_true(test, "it is b=x", _slice_is(&name, "b", 1) && _slice_is(&value, "x", 1));
+    test_expect_false(test, "nothing past query_size is read", http_query_next(query, 9, &cursor, &name, &value));
+
+    test_case_end(test);
+}
+
+static void _test_find(Test *const test) {
+    test_case_begin(test, "find: present, present-but-empty, absent, first match, prefix keys");
+
+    Str value = str_init_1();
+
+    test_expect_true(test, "a present key is found", http_query_find("a=1&b=2", 7, "b", 1, &value));
+    test_expect_true(test, "its raw value", _slice_is(&value, "2", 1));
+
+    test_expect_true(test, "a present-but-empty \"key=\" is found (unlike alloc_get)", http_query_find("key=&b=1", 8, "key", 3, &value));
+    test_expect_u(test, "with an empty slice", 0, str_get_size(&value));
+
+    value = str_init_3((char*) "stale", 5);
+
+    test_expect_false(test, "an absent key is not found", http_query_find("a=1", 3, "zzz", 3, &value));
+    test_expect_true(test, "an absent key resets out_value to the EMPTY Str", str_get_size(&value) == 0 && str_get_data(&value) == nullptr);
+
+    test_expect_true(test, "duplicate keys: found", http_query_find("a=1&a=2", 7, "a", 1, &value));
+    test_expect_true(test, "the first match wins", _slice_is(&value, "1", 1));
+
+    test_expect_true(test, "\"a\" is found past \"ab\"", http_query_find("ab=1&a=2", 8, "a", 1, &value));
+    test_expect_true(test, "\"a\" does not false-match inside \"ab\"'s pair", _slice_is(&value, "2", 1));
+    test_expect_false(test, "\"ab\" is not found when only \"a\" is present", http_query_find("a=1", 3, "ab", 2, &value));
+
+    test_expect_true(test, "an exact whole-name hit", http_query_find("ab=1&abc=2", 10, "abc", 3, &value) && _slice_is(&value, "2", 1));
+    test_expect_false(test, "a key that is a PREFIX of the name is absent (\"a\" vs \"ab=1\")", http_query_find("ab=1", 4, "a", 1, &value));
+    test_expect_false(test, "a key LONGER than the name is absent (\"abc\" vs \"ab=1\")", http_query_find("ab=1", 4, "abc", 3, &value));
+    test_expect_false(test, "a key carrying '=' matches no name (\"a=b\" vs \"a=b=c\")", http_query_find("a=b=c", 5, "a=b", 3, &value));
+    test_expect_false(test, "a key carrying '&' matches no name (\"&b\" vs \"a&&b=1\")", http_query_find("a&&b=1", 6, "&b", 2, &value));
+    test_expect_true(test, "an empty key finds an empty name (\"=v\")", http_query_find("a=1&=v", 6, "", 0, &value) && _slice_is(&value, "v", 1));
+
+    test_expect_false(test, "a pair with no '=' is not a match", http_query_find("k", 1, "k", 1, &value));
+    test_expect_true(test, "nor does it shadow a later real one", http_query_find("k&k=2", 5, "k", 1, &value) && _slice_is(&value, "2", 1));
+    test_expect_true(test, "one leading '?' is skipped, as in alloc_get", http_query_find("?a=1", 4, "a", 1, &value) && _slice_is(&value, "1", 1));
+    test_expect_false(test, "a null query of size 0 finds nothing", http_query_find(nullptr, 0, "a", 1, &value));
+
+    char const key[4] = "cod";
+
+    test_expect_false(test, "an oversized key_size fails closed", http_query_find("cod=1", 5, key, 32, &value));
+
+    char const with_nul[] = { 'a', '=', '1', '\0', '&', 'b', '=', '2' };
+
+    test_expect_false(test, "the query ends at its first NUL, as in alloc_get", http_query_find(with_nul, sizeof(with_nul), "b", 1, &value));
+
+    test_case_end(test);
+}
+
+static void _test_decode_bounds(Test *const test) {
+    test_case_begin(test, "decode: exact fit, one byte short, dest_size 0, in place");
+
+    char dest[8] = DEFAULT_INITIALIZATION;
+
+    memset(dest, 'Z', sizeof(dest));
+
+    test_expect_u(test, "\"%41%42\" into exactly 3 bytes decodes", 2, http_query_decode(dest, 3, "%41%42", 6, false));
+    test_expect_string(test, "to \"AB\", terminated", "AB", dest);
+
+    memset(dest, 'Z', sizeof(dest));
+
+    test_expect_u(test, "one byte short is refused", USIZE_MAX, http_query_decode(dest, 2, "%41%42", 6, false));
+    test_expect_true(test, "the refusal leaves dest[0] == '\\0'", dest[0] == '\0');
+    test_expect_true(test, "and writes nothing else (no truncated decode)", dest[1] == 'Z');
+
+    memset(dest, 'Z', sizeof(dest));
+
+    test_expect_u(test, "dest_size 0 is refused", USIZE_MAX, http_query_decode(dest, 0, "a", 1, false));
+    test_expect_true(test, "and writes nothing at all", dest[0] == 'Z');
+    test_expect_u(test, "dest_size 0 is refused even for an empty value", USIZE_MAX, http_query_decode(nullptr, 0, nullptr, 0, false));
+    test_expect_u(test, "an empty value into one byte decodes to 0", 0, http_query_decode(dest, 1, nullptr, 0, false));
+    test_expect_true(test, "as \"\"", dest[0] == '\0');
+
+    test_expect_u(test, "the no-measure fast path (dest > encoded)", 1, http_query_decode(dest, sizeof(dest), "%41", 3, false));
+    test_expect_string(test, "decodes the same", "A", dest);
+
+    char in_place[] = "a%20b+c";
+
+    test_expect_u(test, "an in-place decode (dest == encoded) is safe", 5, http_query_decode(in_place, sizeof(in_place), in_place, 7, true));
+    test_expect_string(test, "and correct", "a b c", in_place);
+
+    test_case_end(test);
+}
+
+static void _test_decode_modes(Test *const test) {
+    test_case_begin(test, "decode: both conventions on the pinned semantics");
+
+    char dest[16] = DEFAULT_INITIALIZATION;
+
+    test_expect_u(test, "form mode: '+' -> space, \"%2B\" -> '+'", 4, http_query_decode(dest, sizeof(dest), "a+b%2B", 6, true));
+    test_expect_string(test, "form mode result", "a b+", dest);
+    test_expect_u(test, "plain mode: '+' stays '+'", 4, http_query_decode(dest, sizeof(dest), "a+b%2B", 6, false));
+    test_expect_string(test, "plain mode result", "a+b+", dest);
+
+    test_expect_u(test, "an invalid \"%zz\" passes through", 3, http_query_decode(dest, sizeof(dest), "%zz", 3, true));
+    test_expect_string(test, "literally", "%zz", dest);
+    test_expect_u(test, "a truncated \"%4\" passes through", 3, http_query_decode(dest, sizeof(dest), "x%4", 3, false));
+    test_expect_string(test, "literally", "x%4", dest);
+    test_expect_u(test, "\"%+41\" in form mode", 4, http_query_decode(dest, sizeof(dest), "%+41", 4, true));
+    test_expect_string(test, "keeps the '%' and spaces the '+'", "% 41", dest);
+    test_expect_u(test, "lowercase hex decodes", 1, http_query_decode(dest, sizeof(dest), "%6b", 3, false));
+    test_expect_string(test, "to 'k'", "k", dest);
+
+    test_expect_u(test, "\"a%00b\" counts the decoded NUL", 3, http_query_decode(dest, sizeof(dest), "a%00b", 5, false));
+    test_expect_true(test, "the NUL sits at [1] and 'b' survives at [2]", dest[1] == '\0' && dest[2] == 'b' && dest[3] == '\0');
+
+    char const raw_nul[] = { 'a', '\0', '+' };
+
+    test_expect_u(test, "a RAW NUL in encoded is decoded like any byte", 3, http_query_decode(dest, sizeof(dest), raw_nul, 3, true));
+    test_expect_true(test, "and the '+' after it still becomes a space", dest[1] == '\0' && dest[2] == ' ');
+
+    test_case_end(test);
+}
+
+/*==============================================================================
  * MARK: - Entry Point
  *============================================================================*/
 
@@ -610,6 +935,15 @@ int main(void) {
     _test_form_add_chained_body(&test);
     _test_form_add_encodes_both_sides(&test);
     _test_form_add_refusals(&test);
+    _test_pin_form_decode_matches_body_parser(&test);
+    _test_pin_get_5_on_body_parser_inputs(&test);
+    _test_pin_get_keys_carrying_delimiters(&test);
+    _test_next_empty_and_single(&test);
+    _test_next_segments_and_shapes(&test);
+    _test_next_sized_with_embedded_nul(&test);
+    _test_find(&test);
+    _test_decode_bounds(&test);
+    _test_decode_modes(&test);
     test_suite_end(&test);
 
     return test_uninit(&test);

@@ -4,10 +4,15 @@
 
 #include <http/service/oauth/oauth.h>
 
-// char.h is singled out because it declares no TYPES at all: no header's API can ever name one,
-// so every chain that happens to reach it is accidental and a file using char_* owes it directly.
 #include <char/char.h>
+#include <crypto/hash/hash.h>
+#include <crypto/hmac/hmac.h>
+#include <crypto/random/random.h>
+#include <datetime/datetime.h>
+#include <encoding/base64/base64.h>
 #include <http/query/query.h>
+#include <json/json.h>
+#include <log/log.h>
 
 /*==============================================================================
  * MARK: - Constants
@@ -1278,9 +1283,6 @@ bool http_service_oauth_alloc_init_2(HTTP_Service_OAuth *const self, Arena *cons
     return constructed;
 }
 
-bool http_service_oauth_alloc_init(HTTP_Service_OAuth *const self, Arena *const allocator) {
-    return http_service_oauth_alloc_init_1(self, allocator);
-}
 #endif // ARENA_IMPLEMENTATION
 
 HTTP_Service_OAuth_Token http_service_oauth_exchange_code_1(HTTP_Service_OAuth *const self, char const *const provider, char const *const code) {
@@ -1390,10 +1392,6 @@ HTTP_Service_OAuth_Token http_service_oauth_exchange_code_2(HTTP_Service_OAuth *
     return token;
 }
 
-HTTP_Service_OAuth_Token http_service_oauth_exchange_code(HTTP_Service_OAuth *const self, char const *const provider, char const *const code) {
-    return http_service_oauth_exchange_code_1(self, provider, code);
-}
-
 String http_service_oauth_get_authorize_url_1(HTTP_Service_OAuth *const self, char const *const provider, char const *const state) {
     return http_service_oauth_get_authorize_url_2(self, provider, state, "", "");
 }
@@ -1422,7 +1420,7 @@ String http_service_oauth_get_authorize_url_2(HTTP_Service_OAuth *const self, ch
     /* The state is DATA the caller usually read off a request, so an absent one is a null
      * pointer, not an abort: string_get_data of an empty String is null in this tree. An empty
      * state would build "&state=" - a URL the provider echoes back with nothing for
-     * http_service_oauth_state_verify to check. Refused as the unknown provider is: empty URL. */
+     * http_service_oauth_state_verify_1 / _2 to check. Refused as the unknown provider is: empty URL. */
     if (_http_service_oauth_char_empty(state)) {
         trace_log_pop();
 
@@ -1522,10 +1520,6 @@ String http_service_oauth_get_authorize_url_2(HTTP_Service_OAuth *const self, ch
     trace_log_pop();
 
     return url;
-}
-
-String http_service_oauth_get_authorize_url(HTTP_Service_OAuth *const self, char const *const provider, char const *const state) {
-    return http_service_oauth_get_authorize_url_1(self, provider, state);
 }
 
 HTTP_Service_OAuth_Profile http_service_oauth_get_profile_1(HTTP_Service_OAuth *const self, char const *const provider, HTTP_Service_OAuth_Token const *const token) {
@@ -1689,10 +1683,6 @@ HTTP_Service_OAuth_Profile http_service_oauth_get_profile_2(HTTP_Service_OAuth *
     return profile;
 }
 
-HTTP_Service_OAuth_Profile http_service_oauth_get_profile(HTTP_Service_OAuth *const self, char const *const provider, HTTP_Service_OAuth_Token const *const token) {
-    return http_service_oauth_get_profile_1(self, provider, token);
-}
-
 bool http_service_oauth_init_1(HTTP_Service_OAuth *const self) {
     trace_log_push(LOG_METADATA);
 
@@ -1745,10 +1735,6 @@ bool http_service_oauth_init_2(HTTP_Service_OAuth *const self, U8 const *const k
     trace_log_pop();
 
     return constructed;
-}
-
-bool http_service_oauth_init(HTTP_Service_OAuth *const self) {
-    return http_service_oauth_init_1(self);
 }
 
 bool http_service_oauth_pkce_challenge_create(char const *const verifier, char *const out) {
@@ -1903,32 +1889,6 @@ bool http_service_oauth_provider_add_1(HTTP_Service_OAuth *const self, HTTP_Serv
     trace_log_pop();
 
     return true;
-}
-
-bool http_service_oauth_provider_add_2(HTTP_Service_OAuth *const self,
-    char const *const name, char const *const client_id, char const *const client_secret, char const *const redirect_uri, char const *const authorize_url, char const *const token_url,
-    char const *const profile_url, char const *const revoke_url, char const *const scope) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "self", (void*) self);
-
-    HTTP_Service_OAuth_Provider const provider = {
-        .authorize_url  = authorize_url,
-        .client_id      = client_id,
-        .client_secret  = client_secret,
-        .name           = name,
-        .profile_url    = profile_url,
-        .redirect_uri   = redirect_uri,
-        .revoke_url     = revoke_url,
-        .scope          = scope,
-        .token_url      = token_url
-    };
-
-    bool const registered = http_service_oauth_provider_add_1(self, &provider);
-
-    trace_log_pop();
-
-    return registered;
 }
 
 HTTP_Service_OAuth_Token http_service_oauth_refresh(HTTP_Service_OAuth *const self, char const *const provider, char const *const refresh_token) {
@@ -2129,10 +2089,6 @@ bool http_service_oauth_state_issue_2(HTTP_Service_OAuth *const self, char const
     return _http_service_oauth_state_issue(self, provider, binding, binding_size, ttl_seconds, out);
 }
 
-bool http_service_oauth_state_issue(HTTP_Service_OAuth *const self, char const *const provider, USize const ttl_seconds, char *const out) {
-    return http_service_oauth_state_issue_1(self, provider, ttl_seconds, out);
-}
-
 bool http_service_oauth_state_verify_1(HTTP_Service_OAuth *const self, char const *const provider, char const *const state) {
     return _http_service_oauth_state_verify(self, provider, "", 0, state);
 }
@@ -2146,10 +2102,6 @@ bool http_service_oauth_state_verify_2(HTTP_Service_OAuth *const self, char cons
     }
 
     return _http_service_oauth_state_verify(self, provider, binding, binding_size, state);
-}
-
-bool http_service_oauth_state_verify(HTTP_Service_OAuth *const self, char const *const provider, char const *const state) {
-    return http_service_oauth_state_verify_1(self, provider, state);
 }
 
 bool http_service_oauth_token_is_ok(HTTP_Service_OAuth_Token const *const self) {

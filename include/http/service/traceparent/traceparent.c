@@ -135,6 +135,24 @@ static bool _http_service_traceparent_tracestate_valid(char const *const data, U
     return valid;
 }
 
+/* A hand-filled public struct may leave any of its char arrays without a NUL, so the
+ * length is measured inside the array: the result is CAPACITY when no terminator is found. */
+static USize _http_service_traceparent_bounded_size(char const *const data, USize const capacity) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "data", (void*) data);
+
+    USize size = 0;
+
+    while (size < capacity && data[size] != '\0') {
+        size += 1;
+    }
+
+    trace_log_pop();
+
+    return size;
+}
+
 static void _http_service_traceparent_tracestate_set(HTTP_Service_Traceparent_Context *const out, char const *const tracestate) {
     trace_log_push(LOG_METADATA);
 
@@ -349,9 +367,9 @@ bool http_service_traceparent_context_valid(HTTP_Service_Traceparent_Context con
 
     error_check_null(LOG_METADATA, "self", (void*) self);
 
-    bool const trace_id_valid   = char_length(self->trace_id) == HTTP_SERVICE_TRACEPARENT_TRACE_ID_SIZE &&
+    bool const trace_id_valid   = _http_service_traceparent_bounded_size(self->trace_id, sizeof(self->trace_id)) == HTTP_SERVICE_TRACEPARENT_TRACE_ID_SIZE &&
         _http_service_traceparent_hex_valid(self->trace_id, HTTP_SERVICE_TRACEPARENT_TRACE_ID_SIZE, true);
-    bool const parent_id_valid  = char_length(self->parent_id) == HTTP_SERVICE_TRACEPARENT_PARENT_ID_SIZE &&
+    bool const parent_id_valid  = _http_service_traceparent_bounded_size(self->parent_id, sizeof(self->parent_id)) == HTTP_SERVICE_TRACEPARENT_PARENT_ID_SIZE &&
         _http_service_traceparent_hex_valid(self->parent_id, HTTP_SERVICE_TRACEPARENT_PARENT_ID_SIZE, true);
     bool const success          = trace_id_valid && parent_id_valid;
 
@@ -375,6 +393,18 @@ String http_service_traceparent_header_create(HTTP_Service_Traceparent const *co
     String header = string_init_1();
 #endif // ARENA_IMPLEMENTATION
 
+    /* header_name is a public array too: a hand-set one is re-checked here with the same
+     * token rule init_2 applies, and never echoed. */
+    USize const header_name_size = _http_service_traceparent_bounded_size(self->header_name, sizeof(self->header_name));
+
+    if (header_name_size >= sizeof(self->header_name) || !http_headers_token_valid_2(self->header_name, header_name_size)) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_service_traceparent: the service's header_name is unterminated or not an HTTP token - an empty block is emitted instead");
+
+        trace_log_pop();
+
+        return header;
+    }
+
     char value[HTTP_SERVICE_TRACEPARENT_VALUE_CAPACITY] = DEFAULT_INITIALIZATION;
 
     if (!http_service_traceparent_value_write_1(context, value)) {
@@ -388,7 +418,7 @@ String http_service_traceparent_header_create(HTTP_Service_Traceparent const *co
      * by a "\r\n" that fits the existing slack ships "traceparent: \r\n" - well-formed,
      * empty, and every peer downstream restarts the trace. An empty String says "untraced",
      * which the caller can see; a half-written header does not. */
-    USize expected = char_length(self->header_name) + CHAR_STATIC_SIZE(": ") +
+    USize expected = header_name_size + CHAR_STATIC_SIZE(": ") +
         HTTP_SERVICE_TRACEPARENT_VALUE_SIZE + CHAR_STATIC_SIZE("\r\n");
 
     _http_service_traceparent_string_add(&header, self->header_name);
@@ -398,9 +428,19 @@ String http_service_traceparent_header_create(HTTP_Service_Traceparent const *co
 
     /* The tracestate line always carries the SPEC name: the header_name knob renames the
      * traceparent only, and a peer looking for vendor state looks for "tracestate". */
-    if (context->tracestate[0] != '\0') {
+    USize const tracestate_size = _http_service_traceparent_bounded_size(context->tracestate, sizeof(context->tracestate));
+    bool const  tracestate_ok   = tracestate_size != 0 && tracestate_size < HTTP_SERVICE_TRACEPARENT_TRACESTATE_CAPACITY &&
+        _http_service_traceparent_tracestate_valid(context->tracestate, tracestate_size);
+
+    /* A hand-filled Context never went through the inbound check: an unterminated or
+     * control-carrying tracestate loses only its own line (and its bytes are never echoed). */
+    if (tracestate_size != 0 && !tracestate_ok) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_service_traceparent: the context's tracestate is unterminated or invalid - its line is omitted");
+    }
+
+    if (tracestate_ok) {
         expected += CHAR_STATIC_SIZE(HTTP_SERVICE_TRACEPARENT_TRACESTATE_HEADER_NAME) + CHAR_STATIC_SIZE(": ") +
-            char_length(context->tracestate) + CHAR_STATIC_SIZE("\r\n");
+            tracestate_size + CHAR_STATIC_SIZE("\r\n");
 
         _http_service_traceparent_string_add(&header, HTTP_SERVICE_TRACEPARENT_TRACESTATE_HEADER_NAME);
         _http_service_traceparent_string_add(&header, ": ");

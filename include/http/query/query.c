@@ -1,11 +1,22 @@
 #include <http/query/query.h>
 
+#include <char/char.h>
+
 /* Staging buffer the encoder fills before handing bytes to the String. Sized so the flush
  * cost amortizes away (one string_add_last_2 per ~64-192 input bytes instead of one per
  * byte) while still living on the stack; measured on a 64 KiB binary value, 11 interleaved
  * warmed rounds, the chunked form is 5.2-6.5x faster than the per-byte appends. Must be at
  * least 3, the widest single encoding ("%XX"). */
 #define _HTTP_QUERY_ENCODE_CHUNK_SIZE 192
+
+// Width of one "%XX" percent escape: the '%' plus two hex digits.
+#define _HTTP_QUERY_ESCAPE_SIZE 3
+
+// char_raw_to_hex's answer for a byte that is not a hex digit.
+#define _HTTP_QUERY_HEX_INVALID 0xFF
+
+// The two separator bytes a pair adds around its encoded halves: the "&" and the "=".
+#define _HTTP_QUERY_PAIR_SEPARATORS_SIZE 2
 
 /*==============================================================================
  * MARK: - Private Functions
@@ -27,6 +38,47 @@ static bool _http_query_char_unreserved(char const value) {
     }
 
     return value == '-' || value == '.' || value == '_' || value == '~';
+}
+
+// The one percent-decoder behind http_query_decode and, through it, the whole alloc_decode
+// family. plus_as_space selects the application/x-www-form-urlencoded convention ('+' ->
+// space). A malformed "%" escape (not two hex digits, or fewer than two bytes left) passes
+// through as the literal '%', never refusing the whole value. With dest nullptr nothing is
+// written and the decoded size is only MEASURED - decode's whole-or-nothing refusal asks
+// first so it never leaves a partial decode behind. Writing never outruns reading (one output
+// byte per one or three input bytes), so dest may be encoded itself.
+static USize _http_query_decode(char *const dest, char const *const encoded, USize const encoded_size, bool const plus_as_space) {
+    USize in  = 0;
+    USize out = 0;
+
+    while (in < encoded_size) {
+        char  byte     = encoded[in];
+        USize consumed = 1;
+
+        // "encoded_size - in >= ESCAPE_SIZE", not "in + ESCAPE_SIZE <= encoded_size": the same
+        // test without an addition that could wrap for an `in` within two of USIZE_MAX.
+        if (byte == '%' && encoded_size - in >= _HTTP_QUERY_ESCAPE_SIZE) {
+            U8 const hi_nibble = char_raw_to_hex(encoded[in + 1]);
+            U8 const lo_nibble = char_raw_to_hex(encoded[in + 2]);
+
+            if (hi_nibble != _HTTP_QUERY_HEX_INVALID && lo_nibble != _HTTP_QUERY_HEX_INVALID) {
+                byte     = (char) ((hi_nibble << 4) | lo_nibble);
+                consumed = _HTTP_QUERY_ESCAPE_SIZE;
+            }
+        }
+        else if (plus_as_space && byte == '+') {
+            byte = ' ';
+        }
+
+        if (dest != nullptr) {
+            dest[out] = byte;
+        }
+
+        in += consumed;
+        out += 1;
+    }
+
+    return out;
 }
 
 // Argument gate shared by every writing-side entry point. A null String handle, a null
@@ -86,7 +138,7 @@ static void _http_query_encode(String *const out, char const *const value, USize
         // Flushed BEFORE the byte is examined, never after it is written: the widest single
         // encoding is three bytes, so the chunk must be known to hold three before the
         // branch below picks one.
-        if (used + 3 > sizeof(chunk)) {
+        if (used + _HTTP_QUERY_ESCAPE_SIZE > sizeof(chunk)) {
             string_add_last_2(out, chunk, used);
 
             used = 0;
@@ -111,7 +163,7 @@ static void _http_query_encode(String *const out, char const *const value, USize
         chunk[used]     = '%';
         chunk[used + 1] = hex_digits[(byte >> 4) & 0x0F];
         chunk[used + 2] = hex_digits[byte & 0x0F];
-        used += 3;
+        used += _HTTP_QUERY_ESCAPE_SIZE;
     }
 
     if (used > 0) {
@@ -119,6 +171,53 @@ static void _http_query_encode(String *const out, char const *const value, USize
     }
 
     trace_log_pop();
+}
+
+// Shared lookup behind http_query_find and http_query_alloc_get_1..5. The query is bounded
+// by its first NUL (the C-string tier never read past one) and a single leading '?' is
+// skipped; http_query_next then supplies every pair. A key matches a pair's WHOLE name - the
+// bytes before its first '=' - never a raw prefix of the pair, so a key carrying '=' or '&'
+// matches nothing ("a=b" in "a=b=c" is absent: the name is "a"). A pair with no '=' (value
+// data nullptr, next's contract) is never a match. Names hold no NUL (the query was bounded
+// above), so the byte compare stops at key's own NUL at the latest and a key_size longer than
+// key's real extent fails closed without reading past it. First match wins.
+static bool _http_query_find(char const *const query, USize const query_size, char const *const key, USize const key_size, Str *const out_value) {
+    trace_log_push(LOG_METADATA);
+
+    USize size = 0;
+
+    while (size < query_size && query[size] != '\0') {
+        size += 1;
+    }
+
+    USize cursor = (size > 0 && query[0] == '?') ? 1 : 0;
+    Str   name   = str_init_1();
+    Str   value  = str_init_1();
+
+    while (http_query_next(query, size, &cursor, &name, &value)) {
+        if (memory_empty(str_get_data(&value)) || str_get_size(&name) != key_size) {
+            continue;
+        }
+
+        char const *const name_data = str_get_data(&name);
+        USize             i         = 0;
+
+        while (i < key_size && name_data[i] == key[i]) {
+            i += 1;
+        }
+
+        if (i == key_size) {
+            *out_value = value;
+
+            trace_log_pop();
+
+            return true;
+        }
+    }
+
+    trace_log_pop();
+
+    return false;
 }
 
 // Shared pair builder behind http_query_add and http_query_form_add: identical but for the
@@ -152,7 +251,7 @@ static bool _http_query_pair_add(String *const out, char const *const name, USiz
      * then silently drop the value while still answering true, against a header that
      * promises a whole pair or an untouched destination. Reserving up front makes the
      * refusal whole, and on a live allocator it removes every mid-pair realloc. */
-    USize const needed = size + 2 + 3 * (name_size + value_size) + CHAR_END_CHARACTER;
+    USize const needed = size + _HTTP_QUERY_PAIR_SEPARATORS_SIZE + _HTTP_QUERY_ESCAPE_SIZE * (name_size + value_size) + CHAR_END_CHARACTER;
 
     string_reserve(out, needed);
 
@@ -194,6 +293,39 @@ bool http_query_add_2(String *const out, char const *const name, USize const nam
     return _http_query_pair_add(out, name, name_size, value, value_size, false);
 }
 
+USize http_query_decode(char *const dest, USize const dest_size, char const *const encoded, USize const encoded_size, bool const plus_as_space) {
+    trace_log_push(LOG_METADATA);
+
+    // Each pointer is a contract only while its size says bytes live there: a zero-size
+    // dest or encoded is a legal VALUE and may be null.
+    error_check_null(LOG_METADATA, "dest", dest_size > 0 ? (void const*) dest : (void const*) 1);
+    error_check_null(LOG_METADATA, "encoded", encoded_size > 0 ? (void const*) encoded : (void const*) 1);
+
+    /* Decoding never grows, so a dest strictly larger than encoded always fits and skips the
+     * measuring pass. Anything smaller is measured FIRST, so a refusal leaves only the empty
+     * string behind rather than a truncated decode a caller could mistake for the value.
+     * "dest_size > encoded_size" rather than "dest_size >= encoded_size + 1": no addition, so
+     * nothing can wrap. A zero dest_size always lands in the refusal (even "" needs its
+     * terminator) and writes nothing at all. */
+    if (dest_size <= encoded_size && _http_query_decode(nullptr, encoded, encoded_size, plus_as_space) >= dest_size) {
+        if (dest_size > 0) {
+            dest[0] = '\0';
+        }
+
+        trace_log_pop();
+
+        return USIZE_MAX;
+    }
+
+    USize const decoded_size = _http_query_decode(dest, encoded, encoded_size, plus_as_space);
+
+    dest[decoded_size] = '\0';
+
+    trace_log_pop();
+
+    return decoded_size;
+}
+
 bool http_query_encode_1(String *const out, char const *const value) {
     if (value == nullptr) {
         return false;
@@ -217,7 +349,7 @@ bool http_query_encode_2(String *const out, char const *const value, USize const
      * where nothing is appended and an empty value is a legal VALUE that must answer true
      * even when the destination could not grow. */
     if (value_size > 0) {
-        USize const needed = string_get_size(out) + 3 * value_size + CHAR_END_CHARACTER;
+        USize const needed = string_get_size(out) + _HTTP_QUERY_ESCAPE_SIZE * value_size + CHAR_END_CHARACTER;
 
         string_reserve(out, needed);
 
@@ -235,6 +367,25 @@ bool http_query_encode_2(String *const out, char const *const value, USize const
     return true;
 }
 
+bool http_query_find(char const *const query, USize const query_size, char const *const key, USize const key_size, Str *const out_value) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "query", query_size > 0 ? (void const*) query : (void const*) 1);
+    error_check_null(LOG_METADATA, "key", key_size > 0 ? (void const*) key : (void const*) 1);
+    error_check_null(LOG_METADATA, "out_value", (void*) out_value);
+
+    bool const found = _http_query_find(query, query_size, key, key_size, out_value);
+
+    // An absent key leaves no stale slice behind from whatever the caller held before.
+    if (!found) {
+        *out_value = str_init_1();
+    }
+
+    trace_log_pop();
+
+    return found;
+}
+
 bool http_query_form_add_1(String *const body, char const *const name, char const *const value) {
     if (name == nullptr || value == nullptr) {
         return false;
@@ -247,17 +398,76 @@ bool http_query_form_add_2(String *const body, char const *const name, USize con
     return _http_query_pair_add(body, name, name_size, value, value_size, true);
 }
 
+bool http_query_next(char const *const query, USize const query_size, USize *const cursor, Str *const out_name, Str *const out_value) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "query", query_size > 0 ? (void const*) query : (void const*) 1);
+    error_check_null(LOG_METADATA, "cursor", (void*) cursor);
+    error_check_null(LOG_METADATA, "out_name", (void*) out_name);
+    error_check_null(LOG_METADATA, "out_value", (void*) out_value);
+
+    USize position = *cursor;
+
+    // Empty segments ("&&", a leading or trailing '&') carry no pair and are stepped over.
+    while (position < query_size && query[position] == '&') {
+        position += 1;
+    }
+
+    /* Exhausted. A cursor already past query_size is left exactly where it was (the loop
+     * above never ran), so a caller's out-of-range cursor is never pulled back into range
+     * and re-read. */
+    if (position >= query_size) {
+        *cursor    = position;
+        *out_name  = str_init_1();
+        *out_value = str_init_1();
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    USize const pair_start = position;
+    USize       equals     = USIZE_MAX;
+
+    while (position < query_size && query[position] != '&') {
+        if (equals == USIZE_MAX && query[position] == '=') {
+            equals = position;
+        }
+
+        position += 1;
+    }
+
+    /* VIEW slices into the caller's const query: str_init_3 takes `char *` only because a
+     * Str view CAN be handed to the in-place mutators, which these never are (documented
+     * read-only in the header). Nothing is copied or decoded. */
+    if (equals == USIZE_MAX) {
+        *out_name  = str_init_3((char*) &query[pair_start], position - pair_start);
+        *out_value = str_init_1();
+    }
+    else {
+        *out_name  = str_init_3((char*) &query[pair_start], equals - pair_start);
+        *out_value = str_init_3((char*) &query[equals + 1], position - equals - 1);
+    }
+
+    // Past the '&' that ended the pair, or at query_size when the pair ran to the end.
+    *cursor = position < query_size ? position + 1 : position;
+
+    trace_log_pop();
+
+    return true;
+}
+
 #ifdef ARENA_IMPLEMENTATION
 
 /*==============================================================================
  * MARK: - Private Functions (Arena Tier)
  *============================================================================*/
 
-// Shared decode core for http_query_alloc_decode(_2) and
-// http_query_alloc_form_decode(_2). plus_as_space selects the form-encoding
-// convention ("+" -> space); out_size, when non-null, receives the exact
-// decoded byte count, so a decoded "%00" is not silently truncated away by a
-// later char_length on the result.
+// Shared allocate-then-decode core for http_query_alloc_decode(_2) and
+// http_query_alloc_form_decode(_2); the decoding itself is http_query_decode's.
+// plus_as_space selects the form-encoding convention ("+" -> space); out_size, when
+// non-null, receives the exact decoded byte count, so a decoded "%00" is not silently
+// truncated away by a later char_length on the result.
 static char* _http_query_alloc_decode(char const *const encoded, USize const encoded_size, bool const plus_as_space, USize *const out_size, Arena *const allocator) {
     trace_log_push(LOG_METADATA);
 
@@ -270,7 +480,7 @@ static char* _http_query_alloc_decode(char const *const encoded, USize const enc
     // Hardening: encoded_size this close to USIZE_MAX cannot be a real query string, but
     // refuse it explicitly rather than let "+ CHAR_END_CHARACTER" below wrap to a tiny
     // allocation that the decode loop then overruns.
-    if (encoded_size > USIZE_MAX - 2) {
+    if (encoded_size >= USIZE_MAX - CHAR_END_CHARACTER) {
         trace_log_pop();
 
         return nullptr;
@@ -287,86 +497,17 @@ static char* _http_query_alloc_decode(char const *const encoded, USize const enc
         return nullptr;
     }
 
-    USize in = 0;
-    USize out = 0;
-
-    while (in < encoded_size) {
-        if (encoded[in] == '%' && in + 2 < encoded_size) {
-            U8 const hi_nibble = char_raw_to_hex(encoded[in + 1]);
-            U8 const lo_nibble = char_raw_to_hex(encoded[in + 2]);
-
-            if (hi_nibble != 0xFF && lo_nibble != 0xFF) {
-                decoded[out] = (char) ((hi_nibble << 4) | lo_nibble);
-                in += 3;
-                out += 1;
-
-                continue;
-            }
-        }
-
-        // A malformed "%" escape (invalid hex, or too few bytes left) is not decoded -
-        // it passes through as literal bytes rather than refusing the whole string.
-        decoded[out] = (plus_as_space && encoded[in] == '+') ? ' ' : encoded[in];
-        in += 1;
-        out += 1;
-    }
-
-    decoded[out] = '\0';
+    // Always fits: a dest one byte larger than encoded is decode's no-measure fast path, so
+    // this never answers USIZE_MAX.
+    USize const decoded_size = http_query_decode(decoded, encoded_size + CHAR_END_CHARACTER, encoded, encoded_size, plus_as_space);
 
     if (out_size != nullptr) {
-        *out_size = out;
+        *out_size = decoded_size;
     }
 
     trace_log_pop();
 
     return decoded;
-}
-
-// Scans query[0..query_size) for key[0..key_size), stopping the comparison at whichever
-// of key_size or key's own NUL comes first, so a caller-supplied key_size longer than key's
-// real extent fails closed instead of reading past it. On a match, *out_value
-// / *out_value_size describe the raw (undecoded) value slice, which may be empty ("key=").
-static bool _http_query_find(char const *const query, USize const query_size, char const *const key, USize const key_size, char const **const out_value, USize *const out_value_size) {
-    trace_log_push(LOG_METADATA);
-
-    char const *const query_end = query + query_size;
-    char const *pos = (query < query_end && *query == '?') ? query + 1 : query;
-
-    while (pos < query_end && *pos != '\0') {
-        USize i = 0;
-
-        while (i < key_size && key[i] != '\0' && pos + i < query_end && pos[i] != '\0' && pos[i] == key[i]) {
-            i += 1;
-        }
-
-        if (i == key_size && pos + key_size < query_end && pos[key_size] == '=') {
-            char const *const value_start = pos + key_size + 1;
-            char const *value_end = value_start;
-
-            while (value_end < query_end && *value_end != '\0' && *value_end != '&') {
-                value_end += 1;
-            }
-
-            *out_value = value_start;
-            *out_value_size = (USize) (value_end - value_start);
-
-            trace_log_pop();
-
-            return true;
-        }
-
-        while (pos < query_end && *pos != '\0' && *pos != '&') {
-            pos += 1;
-        }
-
-        if (pos < query_end && *pos == '&') {
-            pos += 1;
-        }
-    }
-
-    trace_log_pop();
-
-    return false;
 }
 
 // Shared lookup+allocate core for http_query_alloc_get_1..5. An empty value ("key=")
@@ -381,10 +522,10 @@ static char* _http_query_alloc_get(char const *const query, USize const query_si
         return nullptr;
     }
 
-    char const *value = nullptr;
-    USize value_size = 0;
+    Str value = str_init_1();
 
-    bool const found = _http_query_find(query, query_size, key, key_size, &value, &value_size);
+    bool const  found      = _http_query_find(query, query_size, key, key_size, &value);
+    USize const value_size = str_get_size(&value);
 
     trace_log_pop();
 
@@ -392,7 +533,7 @@ static char* _http_query_alloc_get(char const *const query, USize const query_si
         return nullptr;
     }
 
-    return char_alloc_new_3(value, value_size, allocator);
+    return char_alloc_new_3(str_get_data(&value), value_size, allocator);
 }
 
 /*==============================================================================

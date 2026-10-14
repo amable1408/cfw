@@ -49,13 +49,37 @@ static bool _http_service_cors_ipv6_byte(char const value) {
     return valid;
 }
 
+/* One byte an UNBRACKETED host may not hold: the URL Standard's forbidden host code points
+ * that can reach this scan (the space and the control bytes were refused before it). A
+ * browser's Origin never carries one - it would have parsed the URL differently - so an
+ * entry holding one ("http://u@h", "http://h%41") could only store dead. */
+static bool _http_service_cors_host_byte_forbidden(char const value) {
+    trace_log_push(LOG_METADATA);
+
+    bool const forbidden = value == '@'  ||
+                           value == '\\' ||
+                           value == '['  ||
+                           value == ']'  ||
+                           value == '^'  ||
+                           value == '|'  ||
+                           value == '%'  ||
+                           value == '<'  ||
+                           value == '>'  ||
+                           value == ' ';
+
+    trace_log_pop();
+
+    return forbidden;
+}
+
 /* An origin is not a token ("https://host:8080"), so it gets its own rule, and it is the
  * one cors.h and the WARN both spell out. First the bytes: a space, a comma, a control byte
  * (CR and LF included), DEL, or any byte above 0x7E is refused, so a stored entry can never
  * carry a header break, whatever a configuration file holds. Then the SHAPE, "*" and "null"
  * exempt: scheme "://" host [":" port], with scheme = ALPHA *(ALPHA / DIGIT / "+" / "-" / "."),
  * a non-empty host holding none of '/', '?', '#' or ':' (a bracketed IPv6 literal such as
- * "[::1]" is the one host that may hold ':'), and a port, when present, of digits only. A
+ * "[::1]" is the one host that may hold ':') nor a forbidden host byte ('@', '\', '[', ']',
+ * '^', '|', '%', '<', '>'), and a port, when present, of digits only. A
  * browser's Origin is exactly that shape, so "https://example.com/" (the commonest config
  * typo), "example.com" or "https://example.com/app" could only ever store a dead entry that
  * matches nothing - refused here instead, loudly. */
@@ -125,7 +149,8 @@ static bool _http_service_cors_origin_valid(char const *const data, USize const 
                data[cursor] != '/'   &&
                data[cursor] != '?'   &&
                data[cursor] != '#'   &&
-               data[cursor] != ':') {
+               data[cursor] != ':'   &&
+               !_http_service_cors_host_byte_forbidden(data[cursor])) {
             cursor += 1;
         }
     }
@@ -985,7 +1010,7 @@ bool http_service_cors_origin_add(HTTP_Service_CORS *const self, char const *con
     if (!_http_service_cors_origin_valid(origin, origin_size)) {
         log_message_2(LOG_LEVEL_WARN, LOG_METADATA,
             "http_service_cors: origin refused - empty, carrying a space, a comma, a control byte (CR and LF included), DEL, or any byte above 0x7E,"
-            " or not shaped scheme://host[:port] (no path, query, fragment or trailing slash; a port is 1-65535 with no leading zero; \"*\" and \"null\" exempt)");
+            " or not shaped scheme://host[:port] (no path, query, fragment or trailing slash, and no forbidden host byte; a port is 1-65535 with no leading zero; \"*\" and \"null\" exempt)");
 
         trace_log_pop();
 

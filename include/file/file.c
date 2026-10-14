@@ -1,9 +1,12 @@
 #include <file/file.h>
 
-#ifdef __linux__
+// Both platforms: open's O_* flags on Linux, _open_osfhandle's _O_* flags on Windows.
 #include <fcntl.h>
+
+#ifdef __linux__
+#include <limits.h>
 #include <utime.h>
-#endif
+#endif // __linux__
 
 #include <char/char.h>
 
@@ -28,8 +31,17 @@
  * refused when the process code page IS UTF-8.
  *
  * Linux has no such split: paths there are bytes, and the byte string IS the name.
+ *
+ * THREE ANSWERS, not two, and the third is why this returns a Result rather than a bool:
+ * RESULT_SUCCESS when the path can be acted on; ARGUMENT with FILE_ARGUMENT_UNADDRESSABLE_PATH
+ * when the two readings genuinely differ; MEMORY when the two conversion buffers could not be
+ * taken. The bool this used to return folded the last into the second, so a transient
+ * out-of-memory reached the caller as the one ARGUMENT refusal file.h gives a remedy for - and a
+ * delete tool would have sent a perfectly addressable file to the trash path because the
+ * process was briefly short of memory. Every answer but SUCCESS still fails closed: nothing is
+ * acted on.
  */
-static bool _file_path_addressable(char const *const path) {
+static Result _file_path_addressable(char const *const path) {
 #ifdef _WIN32
     trace_log_push(LOG_METADATA);
 
@@ -47,8 +59,10 @@ static bool _file_path_addressable(char const *const path) {
     if (ascii) {
         trace_log_pop();
 
-        return true;
+        return RESULT_SUCCESS;
     }
+
+    Result const unaddressable = result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_UNADDRESSABLE_PATH, 0);
 
     // Invalid UTF-8 is refused outright: there is no reading of it this module can honour.
     int const utf8_size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, nullptr, 0);
@@ -56,7 +70,7 @@ static bool _file_path_addressable(char const *const path) {
     if (utf8_size <= 0) {
         trace_log_pop();
 
-        return false;
+        return unaddressable;
     }
 
     int const acp_size = MultiByteToWideChar(CP_ACP, 0, path, -1, nullptr, 0);
@@ -65,7 +79,7 @@ static bool _file_path_addressable(char const *const path) {
         // Different lengths already prove the two readings disagree.
         trace_log_pop();
 
-        return false;
+        return unaddressable;
     }
 
     WCHAR *const as_utf8 = (WCHAR*) memory_try_alloc((USize) utf8_size * sizeof(WCHAR));
@@ -80,10 +94,11 @@ static bool _file_path_addressable(char const *const path) {
             memory_free(as_acp);
         }
 
-        // Refused rather than assumed safe: this predicate only ever fails closed.
+        /* Refused rather than assumed safe - but as MEMORY, not as unaddressable: nothing is
+         * known about this path yet, and a retry with memory to spare may well act on it. */
         trace_log_pop();
 
-        return false;
+        return result_make(RESULT_CATEGORY_MEMORY, 0, 0);
     }
 
     bool addressable = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, as_utf8, utf8_size) > 0
@@ -98,11 +113,11 @@ static bool _file_path_addressable(char const *const path) {
 
     trace_log_pop();
 
-    return addressable;
+    return addressable ? RESULT_SUCCESS : unaddressable;
 #else
     (void) path;
 
-    return true;
+    return RESULT_SUCCESS;
 #endif
 }
 
@@ -422,12 +437,38 @@ void file_close(File **const self) {
 // without holding a whole large file in memory the way the module's whole-file readers do.
 #define _FILE_COPY_BUFFER_BYTES ((USize) 64 * 1024)
 
+// FILETIME counts 100ns ticks: ten million of them make one second.
+#define _FILE_FILETIME_TICKS_PER_SECOND 10000000ULL
+
 // Text of a USize: at most 20 digits plus the terminator, rounded up.
 #define _FILE_NUMBER_TEXT_MAX 32
 
 // How many temp names file_replace_1 will try before giving up. Only a stale temp from a
 // killed run makes attempt 0 fail, so this is generous by orders of magnitude.
 #define _FILE_REPLACE_ATTEMPTS_MAX 64
+
+#ifdef _WIN32
+// Length of the "X:" drive spec dropped from a final component before the device-name check.
+#define _FILE_DRIVE_SPEC_SIZE CHAR_STATIC_SIZE("X:")
+
+// The NT object-namespace prefix Win32 passes through verbatim, and its length.
+#define _FILE_NT_PREFIX "\\??\\"
+#define _FILE_NT_PREFIX_SIZE CHAR_STATIC_SIZE(_FILE_NT_PREFIX)
+
+// Length of the prefix every path the nofollow opener refuses as UNC begins with: two separators,
+// '/' and '\' alike in either place - \\server, //server, \/server, and the namespaces \\. and \\?.
+#define _FILE_UNC_PREFIX_SIZE CHAR_STATIC_SIZE("\\\\")
+
+// The long-path prefix GetFinalPathNameByHandleW puts in front of a drive path, and its length.
+#define _FILE_WIDE_PREFIX L"\\\\?\\"
+// In WCHAR units, less one terminator unit (CHAR_END_CHARACTER).
+#define _FILE_WIDE_PREFIX_SIZE (sizeof(_FILE_WIDE_PREFIX) / sizeof(WCHAR) - CHAR_END_CHARACTER)
+
+// Its UNC form, and how many of its units go when `\\?\UNC\server` becomes `\\server`: all of
+// them but the `\\` a UNC path begins with.
+#define _FILE_WIDE_PREFIX_UNC L"\\\\?\\UNC\\"
+#define _FILE_WIDE_PREFIX_UNC_DROPPED (sizeof(_FILE_WIDE_PREFIX_UNC) / sizeof(WCHAR) - sizeof(L"\\\\") / sizeof(WCHAR))
+#endif // _WIN32
 
 /*
  * Stream one open handle into another, reporting a read failure as a failure.
@@ -514,11 +555,22 @@ static Result _file_copy_exclusive(char const *const source, char const *const d
     /* Refused rather than mis-targeted - see _file_path_addressable. ARGUMENT because the
      * path is one this build cannot name, which is a fact about the call, not about the disk.
      * BOTH ends are checked: a readable source copied onto an unaddressable destination would
-     * write over whatever the code page happens to name. */
-    if (!_file_path_addressable(source) || !_file_path_addressable(destination)) {
+     * write over whatever the code page happens to name. The check's own MEMORY answer is
+     * passed through as it is, never relabelled as this refusal. */
+    Result const source_addressable = _file_path_addressable(source);
+
+    if (result_is_error(source_addressable)) {
         trace_log_pop();
 
-        return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_UNADDRESSABLE_PATH, 0);
+        return source_addressable;
+    }
+
+    Result const destination_addressable = _file_path_addressable(destination);
+
+    if (result_is_error(destination_addressable)) {
+        trace_log_pop();
+
+        return destination_addressable;
     }
 
     File *reader = file_open_try_1(source, "rb");
@@ -848,6 +900,382 @@ char* file_extension_1(char const *const path) {
     return (char*) (!memory_empty((void*) dot) ? dot : "");
 }
 
+#ifdef _WIN32
+/*
+ * Whether the first units of a wide string spell PREFIX (terminated). Used to strip the `\\?\`
+ * and `\\?\UNC\` forms GetFinalPathNameByHandleW prepends.
+ */
+static bool _file_wide_has_prefix(WCHAR const *const wide, USize const wide_size, WCHAR const *const prefix) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "wide", (void*) wide);
+    error_check_null(LOG_METADATA, "prefix", (void*) prefix);
+
+    bool matched = true;
+    USize i      = 0;
+
+    for (; matched && prefix[i] != L'\0'; i += 1) {
+        matched = i < wide_size && wide[i] == prefix[i];
+    }
+
+    trace_log_pop();
+
+    return matched;
+}
+
+/*
+ * Where an open Win32 HANDLE physically lives, as UTF-8 in the caller's buffer, in the shape
+ * file_final_path_1 documents: GetFinalPathNameByHandleW's `\\?\` stripped, `\\?\UNC\server`
+ * rewritten to `\\server`. Answers false - leaving the caller to empty the buffer - when the
+ * query fails, the wide answer does not fit FILE_PATH_WIDE_MAX, or the UTF-8 answer and its
+ * terminator do not fit CAPACITY. Never a truncated path: the size is asked first and compared,
+ * so the second conversion only runs when the whole answer fits.
+ */
+static bool _file_final_path_wide(HANDLE const handle, char *const buffer, USize const capacity) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "buffer", (void*) buffer);
+
+    WCHAR wide[FILE_PATH_WIDE_MAX] = DEFAULT_INITIALIZATION;
+
+    // A return of FILE_PATH_WIDE_MAX or more is the REQUIRED size, terminator included: too long.
+    DWORD const units = GetFinalPathNameByHandleW(handle, wide, FILE_PATH_WIDE_MAX, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+
+    if (units == 0 || units >= FILE_PATH_WIDE_MAX) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    WCHAR const *start = wide;
+    USize length       = (USize) units;
+
+    if (_file_wide_has_prefix(wide, length, _FILE_WIDE_PREFIX_UNC)) {
+        // `\\?\UNC\server\share` -> `\\server\share`: keep the last two units of the prefix and
+        // turn the 'C' in front of them into the second backslash.
+        wide[_FILE_WIDE_PREFIX_UNC_DROPPED] = L'\\';
+        start                               = &wide[_FILE_WIDE_PREFIX_UNC_DROPPED];
+        length                             -= _FILE_WIDE_PREFIX_UNC_DROPPED;
+    }
+    else if (_file_wide_has_prefix(wide, length, _FILE_WIDE_PREFIX)) {
+        start   = &wide[_FILE_WIDE_PREFIX_SIZE];
+        length -= _FILE_WIDE_PREFIX_SIZE;
+    }
+
+    int const bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, start, (int) length, nullptr, 0, nullptr, nullptr);
+
+    if (bytes <= 0 || (USize) bytes >= capacity) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    bool const converted = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, start, (int) length, buffer, bytes, nullptr, nullptr) == bytes;
+
+    if (converted) {
+        buffer[bytes] = '\0';
+    }
+
+    trace_log_pop();
+
+    return converted;
+}
+
+/*
+ * UTF-8 bytes -> a terminated UTF-16 path in the caller's FILE_PATH_WIDE_MAX buffer, for the wide
+ * functions below. Takes a SIZE rather than a terminator so a Str need not be copied first.
+ * Fails closed and leaves the error state the callers document:
+ *   - an embedded NUL -> ERROR_INVALID_NAME: the W-API would stop at it and open the SHORTER
+ *     name in front of it, a name the caller never passed;
+ *   - invalid UTF-8 -> ERROR_NO_UNICODE_TRANSLATION, set by the conversion itself;
+ *   - a path that does not fit -> ERROR_FILENAME_EXCED_RANGE.
+ * A zero-size path converts to an empty wide string; the open that follows reports it as the
+ * OS reports any missing path.
+ */
+static bool _file_path_wide(char const *const path, USize const path_size, WCHAR *const wide) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "path", (void*) path);
+    error_check_null(LOG_METADATA, "wide", (void*) wide);
+
+    for (USize i = 0; i < path_size; i += 1) {
+        if (path[i] == '\0') {
+            SetLastError(ERROR_INVALID_NAME);
+
+            trace_log_pop();
+
+            return false;
+        }
+    }
+
+    if (path_size > (USize) I32_MAX) {
+        SetLastError(ERROR_FILENAME_EXCED_RANGE);
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    if (path_size == 0) {
+        wide[0] = L'\0';
+
+        trace_log_pop();
+
+        return true;
+    }
+
+    // One unit short of the buffer, so the terminator always has a slot.
+    int const units = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, (int) path_size, wide, FILE_PATH_WIDE_MAX - 1);
+
+    if (units <= 0) {
+        if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+            SetLastError(ERROR_FILENAME_EXCED_RANGE);
+        }
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    wide[units] = L'\0';
+
+    trace_log_pop();
+
+    return true;
+}
+
+/*
+ * Open an EXISTING path with the caller's ACCESS and FLAGS, every share mode granted
+ * (FILE_SHARE_DELETE: a file replaced while it is being read keeps reading from this handle), and
+ * an identification-only security QoS: a path naming a named pipe - `\\.\pipe\x`, or a UNC path a
+ * peer controls - cannot let the pipe's server impersonate this process, only learn who asked.
+ *
+ * CreateFile2, not CreateFileW: CreateFileW packs flags and QoS into one DWORD, where
+ * SECURITY_SQOS_PRESENT and FILE_FLAG_OPEN_NO_RECALL are the same bit (0x00100000) - asking for the
+ * QoS there also tells a cloud placeholder's filter driver NOT to recall the data the nofollow
+ * re-open exists to read. CreateFile2 carries the two in separate fields. The OS error state is
+ * CreateFile2's own on INVALID_HANDLE_VALUE.
+ */
+static HANDLE _file_open_wide(WCHAR const *const wide, DWORD const access, DWORD const flags) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "wide", (void*) wide);
+
+    CREATEFILE2_EXTENDED_PARAMETERS parameters = DEFAULT_INITIALIZATION;
+
+    parameters.dwSize             = sizeof(parameters);
+    parameters.dwFileAttributes   = FILE_ATTRIBUTE_NORMAL;
+    parameters.dwFileFlags        = flags;
+    parameters.dwSecurityQosFlags = SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION;
+
+    HANDLE const handle = CreateFile2(wide, access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, OPEN_EXISTING, &parameters);
+
+    trace_log_pop();
+
+    return handle;
+}
+#else
+// The symlink naming an open descriptor, followed by the descriptor's decimal text.
+#define _FILE_PROC_FD_PREFIX "/proc/self/fd/"
+
+/*
+ * Where an open descriptor physically lives, by readlink on its /proc/self/fd entry. Answers
+ * false - leaving the caller to empty the buffer - when /proc is not mounted, the descriptor is
+ * not open, or the answer and its terminator do not fit CAPACITY. readlink never terminates and
+ * silently truncates to the size it is given, so an answer that FILLS the buffer is treated as
+ * truncated: it might be.
+ */
+static bool _file_final_path_descriptor(int const descriptor, char *const buffer, USize const capacity) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "buffer", (void*) buffer);
+
+    if (descriptor < 0) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    char link[sizeof(_FILE_PROC_FD_PREFIX) + _FILE_NUMBER_TEXT_MAX] = _FILE_PROC_FD_PREFIX;
+    USize const prefix_size                                         = CHAR_STATIC_SIZE(_FILE_PROC_FD_PREFIX);
+
+    char_from_numbers_uint_1(&link[prefix_size], sizeof(link) - prefix_size, (USize) descriptor);
+
+    ssize_t const written = readlink(link, buffer, capacity);
+
+    if (written < 0 || (USize) written >= capacity) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    buffer[written] = '\0';
+
+    trace_log_pop();
+
+    return true;
+}
+
+/*
+ * PATH_SIZE bytes -> a terminated path in the caller's PATH_MAX buffer, so a Str need not carry
+ * a terminator. Fails closed, setting errno: an embedded NUL -> EINVAL (the kernel would stop at
+ * it and open the SHORTER name in front of it), a path that does not fit -> ENAMETOOLONG.
+ */
+static bool _file_path_narrow(char const *const path, USize const path_size, char *const narrow) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "path", (void*) path);
+    error_check_null(LOG_METADATA, "narrow", (void*) narrow);
+
+    if (path_size >= (USize) PATH_MAX) {
+        errno = ENAMETOOLONG;
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    for (USize i = 0; i < path_size; i += 1) {
+        if (path[i] == '\0') {
+            errno = EINVAL;
+
+            trace_log_pop();
+
+            return false;
+        }
+
+        narrow[i] = path[i];
+    }
+
+    narrow[path_size] = '\0';
+
+    trace_log_pop();
+
+    return true;
+}
+#endif // _WIN32
+
+/*
+ * The by-path final path, shared by file_final_path_1/2/3: a size rather than a terminator, so
+ * the Str form needs no copy. CAPACITY 0 answers false without touching the buffer (there is no
+ * byte to empty); otherwise the buffer is empty on every false.
+ */
+static bool _file_final_path(char const *const path, USize const path_size, char *const buffer, USize const capacity) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "path", (void*) path);
+    error_check_null(LOG_METADATA, "buffer", (void*) buffer);
+
+    if (capacity == 0) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    bool found = false;
+#ifdef _WIN32
+    WCHAR wide[FILE_PATH_WIDE_MAX] = DEFAULT_INITIALIZATION;
+
+    if (_file_path_wide(path, path_size, wide)) {
+        // Zero access and FILE_FLAG_BACKUP_SEMANTICS: a DIRECTORY opens too (a root is asked
+        // here), and every link on the way is followed - the target is the answer.
+        HANDLE const handle = _file_open_wide(wide, 0, FILE_FLAG_BACKUP_SEMANTICS);
+
+        if (handle != INVALID_HANDLE_VALUE) {
+            found = _file_final_path_wide(handle, buffer, capacity);
+
+            CloseHandle(handle);
+        }
+    }
+#else
+    char narrow[PATH_MAX]   = DEFAULT_INITIALIZATION;
+    char resolved[PATH_MAX] = DEFAULT_INITIALIZATION;
+
+    if (_file_path_narrow(path, path_size, narrow)) {
+        // Named rather than tested inline, so the null check reads through memory_empty.
+        char const *const canonical_path = realpath(narrow, resolved);
+
+        USize const length = !memory_empty((void*) canonical_path) ? char_length(resolved) : 0;
+
+        if (length > 0 && length < capacity) {
+            memory_copy_1(buffer, resolved, length + CHAR_END_CHARACTER);
+
+            found = true;
+        }
+    }
+#endif // _WIN32
+
+    if (!found) {
+        buffer[0] = '\0';
+    }
+
+    trace_log_pop();
+
+    return found;
+}
+
+bool file_final_path_1(char const *const path, char *const buffer, USize const capacity) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "path", (void*) path);
+    error_check_null(LOG_METADATA, "buffer", (void*) buffer);
+
+    bool const found = _file_final_path(path, char_length(path), buffer, capacity);
+
+    trace_log_pop();
+
+    return found;
+}
+
+bool file_final_path_2(Str const *const path, char *const buffer, USize const capacity) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "path", (void*) path);
+    error_check_null(LOG_METADATA, "buffer", (void*) buffer);
+
+    // An empty Str carries a nullptr buffer: refused by value before it reaches the core's own
+    // pointer check, with no syscall.
+    if (str_get_size(path) == 0) {
+        if (capacity > 0) {
+            buffer[0] = '\0';
+        }
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    bool const found = _file_final_path(str_get_data(path), str_get_size(path), buffer, capacity);
+
+    trace_log_pop();
+
+    return found;
+}
+
+bool file_final_path_3(String const *const path, char *const buffer, USize const capacity) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "path", (void*) path);
+    error_check_null(LOG_METADATA, "buffer", (void*) buffer);
+
+    // See file_final_path_2.
+    if (string_get_size(path) == 0) {
+        if (capacity > 0) {
+            buffer[0] = '\0';
+        }
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    bool const found = _file_final_path(string_get_data(path), string_get_size(path), buffer, capacity);
+
+    trace_log_pop();
+
+    return found;
+}
+
 bool file_flush(File *const self) {
     trace_log_push(LOG_METADATA);
 
@@ -861,6 +1289,95 @@ bool file_flush(File *const self) {
     trace_log_pop();
 
     return flushed;
+}
+
+bool file_get_final_path(File *const self, char *const buffer, USize const capacity) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+    error_check_null(LOG_METADATA, "buffer", (void*) buffer);
+
+    if (capacity == 0) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    bool found = false;
+#ifdef _WIN32
+    // The handle under the stream, asked directly: nothing is re-resolved by path.
+    HANDLE const handle = (HANDLE) _get_osfhandle(fileno(self));
+
+    if (handle != INVALID_HANDLE_VALUE) {
+        found = _file_final_path_wide(handle, buffer, capacity);
+    }
+#else
+    found = _file_final_path_descriptor(fileno(self), buffer, capacity);
+#endif // _WIN32
+
+    if (!found) {
+        buffer[0] = '\0';
+    }
+
+    trace_log_pop();
+
+    return found;
+}
+
+#ifdef _WIN32
+/*
+ * FILETIME ticks -> Unix epoch seconds, shared by the by-handle and by-path mtime getters so the
+ * two cannot drift apart. FILETIME counts 100ns ticks since 1601-01-01; 116444736000000000 of
+ * them reach the Unix epoch. Truncates toward zero on both sides of the epoch.
+ */
+static I64 _file_epoch_from_filetime(FILETIME const filetime) {
+    trace_log_push(LOG_METADATA);
+
+    ULARGE_INTEGER ticks = DEFAULT_INITIALIZATION;
+
+    ticks.LowPart  = filetime.dwLowDateTime;
+    ticks.HighPart = filetime.dwHighDateTime;
+
+    ULONGLONG const epoch_ticks = 116444736000000000ULL;
+
+    I64 const seconds = ticks.QuadPart < epoch_ticks
+        ? -(I64) ((epoch_ticks - ticks.QuadPart) / _FILE_FILETIME_TICKS_PER_SECOND)
+        : (I64) ((ticks.QuadPart - epoch_ticks) / _FILE_FILETIME_TICKS_PER_SECOND);
+
+    trace_log_pop();
+
+    return seconds;
+}
+#endif // _WIN32
+
+bool file_get_modified(File *const self, I64 *const out) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+    error_check_null(LOG_METADATA, "out", (void*) out);
+
+    bool success = false;
+#ifdef _WIN32
+    HANDLE const handle = (HANDLE) _get_osfhandle(fileno(self));
+    FILETIME written    = DEFAULT_INITIALIZATION;
+
+    // Only the last-write slot is asked for, matching file_modified_1's ftLastWriteTime.
+    if (handle != INVALID_HANDLE_VALUE && GetFileTime(handle, nullptr, nullptr, &written)) {
+        *out    = _file_epoch_from_filetime(written);
+        success = true;
+    }
+#else
+    struct stat status = DEFAULT_INITIALIZATION;
+
+    if (fstat(fileno(self), &status) == 0) {
+        *out    = (I64) status.st_mtime;
+        success = true;
+    }
+#endif // _WIN32
+
+    trace_log_pop();
+
+    return success;
 }
 
 USize file_get_size(File *const self) {
@@ -912,15 +1429,7 @@ bool file_modified_1(char const *const file_name, I64 *const out) {
     WIN32_FILE_ATTRIBUTE_DATA data = DEFAULT_INITIALIZATION;
 
     if (GetFileAttributesExA((LPCSTR) file_name, GetFileExInfoStandard, &data)) {
-        ULARGE_INTEGER ticks = DEFAULT_INITIALIZATION;
-
-        ticks.LowPart  = data.ftLastWriteTime.dwLowDateTime;
-        ticks.HighPart = data.ftLastWriteTime.dwHighDateTime;
-
-        // FILETIME counts 100ns ticks since 1601-01-01; 116444736000000000 of them reach the Unix epoch.
-        ULONGLONG const epoch_ticks = 116444736000000000ULL;
-
-        *out = ticks.QuadPart < epoch_ticks ? -(I64) ((epoch_ticks - ticks.QuadPart) / 10000000ULL) : (I64) ((ticks.QuadPart - epoch_ticks) / 10000000ULL);
+        *out    = _file_epoch_from_filetime(data.ftLastWriteTime);
         success = true;
     }
 #else
@@ -1083,6 +1592,322 @@ File* file_open_3(String const *const file_name, char const *const file_mode) {
     error_check_null(LOG_METADATA, "file_name", (void*) file_name);
 
     File *file = file_open_1(string_get_data(file_name), file_mode);
+
+    trace_log_pop();
+
+    return file;
+}
+
+#ifdef _WIN32
+/*
+ * Close a handle the nofollow opener is refusing and leave ERROR as the thread's error state -
+ * set AFTER the close, which is free to overwrite whatever was there before it.
+ */
+static File* _file_nofollow_refuse(HANDLE const handle, DWORD const error) {
+    trace_log_push(LOG_METADATA);
+
+    CloseHandle(handle);
+    SetLastError(error);
+
+    trace_log_pop();
+
+    return nullptr;
+}
+
+/*
+ * Whether the nofollow opener must refuse PATH on its spelling alone, before any open. For a
+ * device the OPEN is the hazard - it can block on a console, connect to a named pipe's server,
+ * or hand back a stream that is not the on-disk file the name meant - and for a UNC path it is
+ * too: the open connects to the named host (SMB, authenticating with NTLM as this process), or
+ * through the loopback (\\localhost\pipe\x, \\127.0.0.1\pipe\x) to a local named pipe. So the
+ * handle-type check after it comes too late. Three shapes, all pure bytes:
+ *   - two leading separators, '/' and '\' read alike in either place as Win32 reads them: every
+ *     UNC path, and with it the device namespaces \\.\ and \\?\ - which reach devices and pipes
+ *     by name, \\?\ also skipping the name rewrites every other check relies on - so even a real
+ *     file spelled that way is refused.
+ *   - the NT \??\ that Win32 passes through verbatim. It starts with ONE separator, so the rule
+ *     above does not see it.
+ *   - a final component Win32 opens as a device (file_name_reserved_windows). Trailing
+ *     separators are skipped first, and any "X:" prefix is dropped from the component, since
+ *     "C:nul" opens NUL exactly as "nul" does - which also refuses a one-letter file's
+ *     device-named stream ("C:\a\b:con"), a deliberate over-refusal.
+ */
+static bool _file_path_device_windows(char const *const path, USize const path_size) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "path", (void*) path);
+
+    bool const unc         = path_size >= _FILE_UNC_PREFIX_SIZE && (path[0] == '/' || path[0] == '\\') && (path[1] == '/' || path[1] == '\\');
+    bool const passthrough = path_size >= _FILE_NT_PREFIX_SIZE && char_compare_equal_2(path, _FILE_NT_PREFIX_SIZE, _FILE_NT_PREFIX, _FILE_NT_PREFIX_SIZE);
+
+    if (unc || passthrough) {
+        trace_log_pop();
+
+        return true;
+    }
+
+    USize end = path_size;
+
+    while (end > 0 && (path[end - 1] == '/' || path[end - 1] == '\\')) {
+        end -= 1;
+    }
+
+    USize start = end;
+
+    while (start > 0 && path[start - 1] != '/' && path[start - 1] != '\\') {
+        start -= 1;
+    }
+
+    if (end - start >= _FILE_DRIVE_SPEC_SIZE && path[start + _FILE_DRIVE_SPEC_SIZE - 1] == ':') {
+        start += _FILE_DRIVE_SPEC_SIZE;
+    }
+
+    bool const reserved = file_name_reserved_windows(path + start, end - start);
+
+    trace_log_pop();
+
+    return reserved;
+}
+#endif // _WIN32
+
+/*
+ * The nofollow open, shared by file_open_nofollow_try_1/2/3: a size rather than a terminator, so
+ * the Str form needs no copy. See file_open_nofollow_try_1 (file.h) for the refusal table; the
+ * comments here say only why each step has the shape it has.
+ */
+static File* _file_open_nofollow(char const *const path, USize const path_size) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "path", (void*) path);
+
+#ifdef _WIN32
+    // Before any open: for a device or a UNC path the open IS the hazard, so the post-open
+    // FILE_TYPE_DISK check below cannot be the one that refuses it. Same code as that check.
+    if (_file_path_device_windows(path, path_size)) {
+        SetLastError(ERROR_INVALID_HANDLE);
+
+        trace_log_pop();
+
+        return nullptr;
+    }
+
+    WCHAR wide[FILE_PATH_WIDE_MAX] = DEFAULT_INITIALIZATION;
+
+    if (!_file_path_wide(path, path_size, wide)) {
+        trace_log_pop();
+
+        return nullptr;
+    }
+
+    // FILE_FLAG_OPEN_REPARSE_POINT opens a link ITSELF instead of its target, so the attribute
+    // query below sees the link; without FILE_FLAG_BACKUP_SEMANTICS a directory fails to open.
+    HANDLE handle = _file_open_wide(wide, GENERIC_READ, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN);
+
+    if (handle == INVALID_HANDLE_VALUE) {
+        // CreateFile2's own error state stands - ERROR_FILE_NOT_FOUND stays "not there".
+        trace_log_pop();
+
+        return nullptr;
+    }
+
+    FILE_ATTRIBUTE_TAG_INFO tag = DEFAULT_INITIALIZATION;
+
+    if (!GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &tag, sizeof(tag))) {
+        trace_log_pop();
+
+        return _file_nofollow_refuse(handle, GetLastError());
+    }
+
+    // CreateFile2 already refuses a directory without BACKUP_SEMANTICS; re-checked here so the
+    // refusal does not rest on that flag's absence alone.
+    if ((tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        trace_log_pop();
+
+        return _file_nofollow_refuse(handle, ERROR_ACCESS_DENIED);
+    }
+
+    if ((tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        // A name surrogate - a symlink or a junction - is a LINK: refused. The same rule
+        // dir_list_entries uses for is_link, so the two never disagree about what a link is.
+        if (IsReparseTagNameSurrogate(tag.ReparseTag)) {
+            trace_log_pop();
+
+            return _file_nofollow_refuse(handle, ERROR_STOPPED_ON_SYMLINK);
+        }
+
+        /* Any other reparse point (a Dropbox / OneDrive placeholder, dedup, WOF) is a FILE whose
+         * data a filter driver serves - and opening the reparse point itself bypasses that
+         * driver. Re-opened without the flag, which makes the re-open a second path resolution:
+         * between the close and the re-open the entry can be swapped for a symlink, and the
+         * unflagged re-open would FOLLOW it. So the re-open is pinned to the first handle's
+         * identity - volume serial plus 128-bit file ID (FILE_ID_INFO; the 32-bit serial and 64-bit index
+         * of BY_HANDLE_FILE_INFORMATION are not unique on ReFS) - and anything else is refused AS a link. A
+         * placeholder hydrated by the re-open keeps its file ID, so a real one still opens.
+         * Re-opening WITH the flag to re-check the tag cannot replace the pin: the flagged open
+         * is exactly the one that bypasses the driver. */
+        FILE_ID_INFO first = DEFAULT_INITIALIZATION;
+
+        if (!GetFileInformationByHandleEx(handle, FileIdInfo, &first, sizeof(first))) {
+            trace_log_pop();
+
+            return _file_nofollow_refuse(handle, ERROR_STOPPED_ON_SYMLINK);
+        }
+
+        CloseHandle(handle);
+
+        handle = _file_open_wide(wide, GENERIC_READ, FILE_FLAG_SEQUENTIAL_SCAN);
+
+        if (handle == INVALID_HANDLE_VALUE) {
+            trace_log_pop();
+
+            return nullptr;
+        }
+
+        FILE_ID_INFO second = DEFAULT_INITIALIZATION;
+
+        /* The identifier is 16 raw bytes; the size-explicit compare never stops at a NUL. */
+        bool const same = GetFileInformationByHandleEx(handle, FileIdInfo, &second, sizeof(second)) != 0                            &&
+                          second.VolumeSerialNumber == first.VolumeSerialNumber                                                     &&
+                          char_compare_equal_2((char const*) first.FileId.Identifier, sizeof(first.FileId.Identifier),
+                                               (char const*) second.FileId.Identifier, sizeof(second.FileId.Identifier));
+
+        if (!same) {
+            trace_log_pop();
+
+            return _file_nofollow_refuse(handle, ERROR_STOPPED_ON_SYMLINK);
+        }
+    }
+
+    // A pipe, a console, a character device the spelling check cannot see (a device name
+    // file_name_reserved_windows does not list): not a file, whatever its name says.
+    if (GetFileType(handle) != FILE_TYPE_DISK) {
+        trace_log_pop();
+
+        return _file_nofollow_refuse(handle, ERROR_INVALID_HANDLE);
+    }
+
+    // On success the descriptor OWNS the handle, and the stream the descriptor: one fclose
+    // (file_close) releases all three.
+    int const descriptor = _open_osfhandle((intptr_t) handle, _O_RDONLY | _O_BINARY);
+
+    if (descriptor == -1) {
+        trace_log_pop();
+
+        return _file_nofollow_refuse(handle, ERROR_TOO_MANY_OPEN_FILES);
+    }
+
+    File *const file = _fdopen(descriptor, "rb");
+
+    if (memory_empty((void*) file)) {
+        // _close closes the HANDLE too - the descriptor owns it now.
+        _close(descriptor);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+    }
+#else
+    char narrow[PATH_MAX] = DEFAULT_INITIALIZATION;
+
+    if (!_file_path_narrow(path, path_size, narrow)) {
+        trace_log_pop();
+
+        return nullptr;
+    }
+
+    /* O_NOFOLLOW: a final-component symlink fails the open itself (ELOOP). O_NONBLOCK: a FIFO with
+     * no writer would otherwise block this open forever; it stays set, since a regular file never
+     * answers EAGAIN. O_NOCTTY: a terminal device cannot become the controlling terminal before
+     * fstat refuses it. O_CLOEXEC: a child spawned meanwhile does not inherit the descriptor. */
+    int const descriptor = open(narrow, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | O_NOCTTY);
+
+    if (descriptor < 0) {
+        trace_log_pop();
+
+        return nullptr;
+    }
+
+    struct stat info = DEFAULT_INITIALIZATION;
+
+    if (fstat(descriptor, &info) != 0) {
+        int const error = errno;
+
+        close(descriptor);
+        errno = error;
+
+        trace_log_pop();
+
+        return nullptr;
+    }
+
+    if (!S_ISREG(info.st_mode)) {
+        close(descriptor);
+        errno = S_ISDIR(info.st_mode) ? EISDIR : ENXIO;
+
+        trace_log_pop();
+
+        return nullptr;
+    }
+
+    File *const file = fdopen(descriptor, "rb");
+
+    if (memory_empty((void*) file)) {
+        int const error = errno;
+
+        close(descriptor);
+        errno = error;
+    }
+#endif // _WIN32
+
+    trace_log_pop();
+
+    return file;
+}
+
+File* file_open_nofollow_try_1(char const *const path) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "path", (void*) path);
+
+    // CONTRACT (file.h): nothing runs between the core's return and this one that could
+    // overwrite errno / GetLastError.
+    File *const file = _file_open_nofollow(path, char_length(path));
+
+    trace_log_pop();
+
+    return file;
+}
+
+File* file_open_nofollow_try_2(Str const *const path) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "path", (void*) path);
+
+    // An empty Str carries a nullptr buffer: refused by value, with no syscall and the OS error
+    // state untouched - file_open_try_2's shape.
+    if (str_get_size(path) == 0) {
+        trace_log_pop();
+
+        return nullptr;
+    }
+
+    File *const file = _file_open_nofollow(str_get_data(path), str_get_size(path));
+
+    trace_log_pop();
+
+    return file;
+}
+
+File* file_open_nofollow_try_3(String const *const path) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "path", (void*) path);
+
+    // See file_open_nofollow_try_2.
+    if (string_get_size(path) == 0) {
+        trace_log_pop();
+
+        return nullptr;
+    }
+
+    File *const file = _file_open_nofollow(string_get_data(path), string_get_size(path));
 
     trace_log_pop();
 
@@ -1537,11 +2362,13 @@ Result file_remove_1(char const *const path) {
 
     error_check_null(LOG_METADATA, "path", (void*) path);
 
-    // Refused rather than mis-targeted - see _file_path_addressable.
-    if (!_file_path_addressable(path)) {
+    // Refused rather than mis-targeted - see _file_path_addressable, whose MEMORY answer passes through.
+    Result const addressable = _file_path_addressable(path);
+
+    if (result_is_error(addressable)) {
         trace_log_pop();
 
-        return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_UNADDRESSABLE_PATH, 0);
+        return addressable;
     }
 
     // unlink/DeleteFileA both refuse a directory on their own (EISDIR / ERROR_ACCESS_DENIED),
@@ -1638,10 +2465,20 @@ Result file_rename_1(char const *const source, char const *const destination) {
 
     /* BOTH ends: renaming an addressable source onto an unaddressable destination would
      * replace whatever the code page names, which is the destructive half of this defect. */
-    if (!_file_path_addressable(source) || !_file_path_addressable(destination)) {
+    Result const source_addressable = _file_path_addressable(source);
+
+    if (result_is_error(source_addressable)) {
         trace_log_pop();
 
-        return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_UNADDRESSABLE_PATH, 0);
+        return source_addressable;
+    }
+
+    Result const destination_addressable = _file_path_addressable(destination);
+
+    if (result_is_error(destination_addressable)) {
+        trace_log_pop();
+
+        return destination_addressable;
     }
 
     // A bare Windows MoveFile refuses an existing destination, unlike POSIX rename() -
@@ -2083,11 +2920,13 @@ Result file_set_modified_1(char const *const path, I64 const seconds) {
 
     error_check_null(LOG_METADATA, "path", (void*) path);
 
-    // Refused rather than mis-targeted - see _file_path_addressable.
-    if (!_file_path_addressable(path)) {
+    // Refused rather than mis-targeted - see _file_path_addressable, whose MEMORY answer passes through.
+    Result const addressable = _file_path_addressable(path);
+
+    if (result_is_error(addressable)) {
         trace_log_pop();
 
-        return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_UNADDRESSABLE_PATH, 0);
+        return addressable;
     }
 
     bool success = false;
@@ -2107,8 +2946,8 @@ Result file_set_modified_1(char const *const path, I64 const seconds) {
          * expression to be correct rather than lucky. */
         ULONGLONG const magnitude   = seconds < 0 ? ~(ULONGLONG) seconds + 1ULL : (ULONGLONG) seconds;
         ULONGLONG const ticks       = seconds < 0
-            ? epoch_ticks - magnitude * 10000000ULL
-            : epoch_ticks + magnitude * 10000000ULL;
+            ? epoch_ticks - magnitude * _FILE_FILETIME_TICKS_PER_SECOND
+            : epoch_ticks + magnitude * _FILE_FILETIME_TICKS_PER_SECOND;
 
         ULARGE_INTEGER value = DEFAULT_INITIALIZATION;
 

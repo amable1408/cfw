@@ -3,7 +3,7 @@
  *  --------------------------------------------------------------------------
  *  @file    http_client.h
  *  @brief   Blocking HTTP client wrapper over libcurl, behind an opaque, reusable handle.
- *  @version 0.4.1
+ *  @version 0.5.0
  *  @license MIT (see LICENSE file)
  *
  *  General-purpose (no project coupling). Wraps one libcurl easy handle per
@@ -58,7 +58,9 @@
  *   reported through the HTTP_Client_Result returned by value - branch on `status`
  *   (or the convenience http_client_result_is_ok), treat `code` (the backend
  *   CURLcode) as diagnostics only. A malformed URL or an oversized response/header
- *   set is also reported through the Result, never aborted.
+ *   set is also reported through the Result, never aborted, and so is an arena-backed
+ *   `response` the module will not start (no cap, or an arena that cannot hold it -
+ *   see Memory Management).
  *
  * Thread Safety:
  *   One client per thread. A HTTP_Client owns its own request headers, its own
@@ -80,26 +82,33 @@
  *   response's header list are owned by the handle and released by
  *   http_client_header_clear / http_client_delete.
  *
- *   Arena-backed `response`: the arena must have room for max_response_size plus
- *   the Result's error text (which is copied into the same arena). A REFUSED arena
- *   (one that answers no memory without aborting) degrades: the body write stops
- *   with HTTP_CLIENT_STATUS_ERROR and the "arena refused to grow" error text, and
- *   the error copy falls back to the heap. A live but EXHAUSTED arena does NOT
- *   degrade - a linear arena aborts on exhaustion under error checks (the tree-wide
- *   allocate contract). With the cap at 0 (unbounded) the size is chosen by the
- *   remote peer, so an undersized arena is a process abort a server can trigger;
- *   with a cap set, the reserve below moves that abort to request start. "Room for the cap"
- *   is NOT the cap itself: a fresh String on a linear arena regrows by DOUBLING
- *   into a new borrow and the arena never reclaims the superseded buffer, so a
- *   body near the cap can consume about 4x the cap. The module therefore reserves the
- *   cap itself on every request for an arena-backed response (max_response_size + 1,
- *   once, before any I/O), so an undersized arena aborts there, at the caller's own
- *   cap, never at a size the remote peer chose. The DEFAULT cap is 16 MiB: an
- *   arena-backed response on a handle that never lowered it needs a 16 MiB arena per
- *   request, so lower the cap first (oauth and captcha set 64 KiB). A cap of 0 or
- *   USIZE_MAX means unbounded: nothing is reserved and the response stays
- *   remote-sized. Size the arena for the cap plus the error text, or use a
- *   heap-backed `response`.
+ *   Arena-backed `response` (0.5.0): no path a remote peer can reach ends the process.
+ *   Everything is settled BEFORE any I/O, so nothing is sent for a request that
+ *   cannot be stored:
+ *     - NO CAP is REFUSED. A max_response_size of 0 or USIZE_MAX (unbounded) would let
+ *       the remote peer choose how much of the arena the body takes, chunk by chunk
+ *       through an aborting growth, so the request answers HTTP_CLIENT_STATUS_ERROR
+ *       with an error naming the rule ("an arena-backed response needs a
+ *       max_response_size cap ..."). A behaviour change from 0.4.x, where an unbounded
+ *       arena-backed response ran and could abort mid-body. Unbounded downloads take a
+ *       heap-backed `response`.
+ *     - WITH A CAP, the cap is reserved once (max_response_size + 1, through
+ *       string_try_reserve). "Room for the cap" is NOT the cap itself grown on demand:
+ *       a String on a linear arena regrows by DOUBLING into a new borrow the arena never
+ *       reclaims, so a body near the cap would consume about 4x the cap; reserved up
+ *       front it takes the cap once and never grows in the write callback. An arena
+ *       that cannot hold the reservation - EXHAUSTED or REFUSED - answers
+ *       HTTP_CLIENT_STATUS_ERROR with "response arena cannot hold max_response_size + 1
+ *       bytes; lower it with http_client_set_max_response_size" (0.4.x aborted here).
+ *     - The Result's error text is copied into the same arena when it fits, and falls
+ *       back to the HEAP when it does not (a full or refused arena) - its
+ *       `error.allocator` is then nullptr; http_client_result_uninit releases either.
+ *   Both refusals leave `code` CURLE_OK (libcurl never ran) and `success` false, and
+ *   clear the handle's last-response status and headers. The DEFAULT cap is 16 MiB:
+ *   an arena-backed response on a handle that never lowered it needs about 16 MiB of
+ *   free arena per request and otherwise gets the named error above, so lower the cap
+ *   first (oauth and captcha set 64 KiB). Size the arena for the cap + 1 plus the
+ *   error text (or let the text take the heap), or use a heap-backed `response`.
  *
  * Defaults:
  *   TLS peer + host verification ON; no CA override (system trust store); redirects
@@ -229,8 +238,9 @@ typedef enum {
  */
 typedef struct {
 #ifdef ARENA_IMPLEMENTATION
-    /** @brief Optional arena used by the owned error string; taken from the
-     *         `response` String passed to the request, when it has one. */
+    /** @brief Arena of the `response` String passed to the request, when it has one.
+     *         The owned error string is copied into it when it fits, else onto the
+     *         heap (`error.allocator` is then nullptr). */
     Arena *allocator;
 #endif // ARENA_IMPLEMENTATION
     /** @brief Transport status code from the HTTP backend. For diagnostics and
@@ -573,8 +583,10 @@ void http_client_set_follow_redirects(HTTP_Client *const self, bool const follow
  * @param max_bytes Cap in bytes. 0 (or USIZE_MAX) means unlimited (an explicit
  *        opt-out, not a contract violation).
  * @note An arena-backed `response` reserves this cap + 1 from its arena at the start
- *       of every request (see Memory Management): the arena must hold it, so lower
- *       the 16 MiB default before the first request on such a handle.
+ *       of every request, before any I/O (see Memory Management). An arena that cannot
+ *       hold it answers HTTP_CLIENT_STATUS_ERROR naming this setter - never an abort -
+ *       so lower the 16 MiB default before the first request on such a handle. An
+ *       arena-backed `response` is REFUSED outright while the cap is 0 or USIZE_MAX.
  */
 void http_client_set_max_response_size(HTTP_Client *const self, USize const max_bytes);
 

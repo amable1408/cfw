@@ -59,13 +59,23 @@
  *      via vsnprintf(nullptr, 0) and grows - legal formatter input, no abort.
  *  19. Growth arithmetic is integer doubling (1 -> 2 -> 4 -> 8), not the old
  *      math_round_f float round-trip.
+ *
+ * string_try_reserve (0.5.0, the non-aborting twin of string_reserve):
+ *
+ *  20. Heap growth keeps data and size; an already-large-enough request is a true no-op
+ *      with no reallocation; capacity 0 is a VALUE answered true.
+ *  21. An EXHAUSTED LIVE linear arena answers false with the String byte-for-byte
+ *      unchanged - the request string_reserve ends the process on - and the same arena
+ *      still serves a request that fits (the exhaustion, not a dead arena, refused).
+ *  22. A refused arena answers false, unchanged; a VIEW that grows becomes an OWNER and
+ *      the caller's buffer is never written.
  */
 
 /*==============================================================================
  * MARK: - Anti-Vacuity Counters
  *============================================================================*/
 /** Closed-form number of case functions below; the final case asserts every one ran. */
-#define _EXPECTED_CASE_COUNT 60
+#define _EXPECTED_CASE_COUNT 66
 
 /** Incremented at the top of every case function; a case that silently never runs
  * (or a dispatcher edit that drops one) fails the closed-form check. */
@@ -1146,6 +1156,166 @@ static void _test_reserve_view_to_owner(Test *const test) {
     test_case_end(test);
 }
 
+/*==============================================================================
+ * MARK: - Cases: string_try_reserve (the non-aborting twin, 0.5.0)
+ *============================================================================*/
+static void _test_try_reserve_heap_grow(Test *const test) {
+    _case_entered_count += 1;
+
+    test_case_begin(test, "string_try_reserve on the heap: grows to the requested capacity and keeps data and size intact");
+
+    String value = string_init_static("grow me", 7);
+
+    test_expect_true(test, "the heap grow answered true", string_try_reserve(&value, 128));
+    test_expect_u(test, "capacity is the requested 128", 128, string_get_capacity(&value));
+    test_expect_u(test, "size is unchanged", 7, string_get_size(&value));
+    test_expect_string(test, "the bytes (and terminator) survived the move", "grow me", string_get_data(&value));
+    test_expect_true(test, "the grown String owns its buffer", value.owned);
+
+    string_uninit(&value);
+
+    test_case_end(test);
+}
+
+static void _test_try_reserve_already_large_enough(Test *const test) {
+    _case_entered_count += 1;
+
+    test_case_begin(test, "string_try_reserve when the capacity is already there: true, and no reallocation (same data pointer)");
+
+    String value = string_init_2(64);
+
+    string_add_last_1(&value, "abc");
+
+    char const *const before_data = string_get_data(&value);
+
+    test_expect_true(test, "a smaller request answered true", string_try_reserve(&value, 32));
+    test_expect_true(test, "the data pointer is unchanged after the smaller request", string_get_data(&value) == before_data);
+    test_expect_true(test, "an equal request answered true", string_try_reserve(&value, 64));
+    test_expect_true(test, "the data pointer is unchanged after the equal request", string_get_data(&value) == before_data);
+    test_expect_u(test, "capacity was not shrunk", 64, string_get_capacity(&value));
+    test_expect_string(test, "the content is intact", "abc", string_get_data(&value));
+
+    string_uninit(&value);
+
+    test_case_end(test);
+}
+
+static void _test_try_reserve_exhausted_arena(Test *const test) {
+    _case_entered_count += 1;
+
+    test_case_begin(test, "string_try_reserve on an EXHAUSTED live linear arena: false and the String byte-for-byte unchanged (string_reserve aborts here)");
+
+    Arena arena = arena_init_1(64, ARENA_TYPE_LINEAR);
+
+    test_expect_not_null(test, "the arena is LIVE (a refused one would make this the refused case)", arena.handler);
+
+    String value = string_alloc_init_static("hello", 5, &arena);
+
+    USize const before_capacity = string_get_capacity(&value);
+    char const *const before_data = string_get_data(&value);
+    USize const before_size = string_get_size(&value);
+    bool const before_owned = value.owned;
+    char before_bytes[8] = DEFAULT_INITIALIZATION;
+
+    memcpy(before_bytes, before_data, before_capacity < sizeof(before_bytes) ? before_capacity : sizeof(before_bytes));
+
+    test_expect_false(test, "a 4096-byte request against a 64-byte arena answered false", string_try_reserve(&value, 4096));
+    test_expect_u(test, "capacity unchanged", before_capacity, string_get_capacity(&value));
+    test_expect_true(test, "data pointer unchanged", string_get_data(&value) == before_data);
+    test_expect_u(test, "size unchanged", before_size, string_get_size(&value));
+    test_expect_bool(test, "owned flag unchanged", before_owned, value.owned);
+    test_expect_true(test, "contents unchanged, terminator included", memcmp(before_bytes, string_get_data(&value),
+        before_capacity < sizeof(before_bytes) ? before_capacity : sizeof(before_bytes)) == 0);
+    test_expect_string(test, "the String still reads \"hello\"", "hello", string_get_data(&value));
+
+    /* Positive anchor: the same arena still serves a request that fits, so the false above
+     * was exhaustion, not a dead arena. */
+    test_expect_true(test, "a 16-byte request on the same arena answers true", string_try_reserve(&value, 16));
+    test_expect_u(test, "and grew to 16", 16, string_get_capacity(&value));
+    test_expect_string(test, "carrying the content over", "hello", string_get_data(&value));
+
+    string_uninit(&value);
+    arena_uninit(&arena, ARENA_TYPE_LINEAR);
+
+    test_case_end(test);
+}
+
+static void _test_try_reserve_refused_arena(Test *const test) {
+    _case_entered_count += 1;
+
+    test_case_begin(test, "string_try_reserve on a REFUSED arena (arena_init_1(0, ...)): false and the String unchanged");
+
+    Arena refused = arena_init_1(0, ARENA_TYPE_LINEAR);
+
+    test_expect_null(test, "the arena really is refused (null handler)", refused.handler);
+
+    String degraded = string_alloc_init_1(&refused);
+
+    test_expect_false(test, "the request answered false", string_try_reserve(&degraded, 32));
+    test_expect_u(test, "capacity stayed 0", 0, string_get_capacity(&degraded));
+    test_expect_null(test, "data stayed null", degraded.data);
+    test_expect_u(test, "size stayed 0", 0, string_get_size(&degraded));
+    test_expect_false(test, "owned stayed false", degraded.owned);
+    test_expect_true(test, "the allocator is still the refused arena", degraded.allocator == &refused);
+
+    string_uninit(&degraded);
+    arena_uninit(&refused, ARENA_TYPE_LINEAR);
+
+    test_case_end(test);
+}
+
+static void _test_try_reserve_view_to_owner(Test *const test) {
+    _case_entered_count += 1;
+
+    test_case_begin(test, "string_try_reserve on a VIEW: true, now an OWNER, and the caller's buffer untouched byte for byte");
+
+    char stack_buffer[16] = "view";
+    char snapshot[16] = DEFAULT_INITIALIZATION;
+
+    memcpy(snapshot, stack_buffer, sizeof(stack_buffer));
+
+    String view = string_init_4(stack_buffer, 4);
+
+    test_expect_false(test, "the String starts as a VIEW", view.owned);
+    test_expect_true(test, "growing the view answered true", string_try_reserve(&view, 64));
+    test_expect_true(test, "the grown String is an OWNER", view.owned);
+    test_expect_true(test, "the owner's buffer is NOT the caller's buffer", string_get_data(&view) != stack_buffer);
+    test_expect_u(test, "capacity is the requested 64", 64, string_get_capacity(&view));
+    test_expect_string(test, "the borrowed bytes were copied over", "view", string_get_data(&view));
+    test_expect_true(test, "the caller's buffer is byte-for-byte untouched", memcmp(snapshot, stack_buffer, sizeof(stack_buffer)) == 0);
+
+    string_uninit(&view);
+
+    test_expect_true(test, "and survives the owner's uninit", memcmp(snapshot, stack_buffer, sizeof(stack_buffer)) == 0);
+
+    test_case_end(test);
+}
+
+static void _test_try_reserve_zero_capacity(Test *const test) {
+    _case_entered_count += 1;
+
+    test_case_begin(test, "string_try_reserve with capacity 0: a VALUE, answered true as a no-op (string_reserve aborts on it)");
+
+    String value = string_init_static("zero", 4);
+    char const *const before_data = string_get_data(&value);
+    USize const before_capacity = string_get_capacity(&value);
+
+    test_expect_true(test, "capacity 0 on a populated String answered true", string_try_reserve(&value, 0));
+    test_expect_true(test, "no reallocation", string_get_data(&value) == before_data);
+    test_expect_u(test, "capacity unchanged", before_capacity, string_get_capacity(&value));
+
+    String empty = string_init_1();
+
+    test_expect_true(test, "capacity 0 on the EMPTY String answered true", string_try_reserve(&empty, 0));
+    test_expect_null(test, "and allocated nothing", empty.data);
+    test_expect_u(test, "capacity stayed 0", 0, string_get_capacity(&empty));
+
+    string_uninit(&empty);
+    string_uninit(&value);
+
+    test_case_end(test);
+}
+
 static void _test_shrink_keeps_bytes(Test *const test) {
     _case_entered_count += 1;
 
@@ -1911,6 +2081,15 @@ int main(void) {
     test_suite_begin(&test, "string_reserve_shrink");
     _test_reserve_view_to_owner(&test);
     _test_shrink_keeps_bytes(&test);
+    test_suite_end(&test);
+
+    test_suite_begin(&test, "string_try_reserve");
+    _test_try_reserve_heap_grow(&test);
+    _test_try_reserve_already_large_enough(&test);
+    _test_try_reserve_exhausted_arena(&test);
+    _test_try_reserve_refused_arena(&test);
+    _test_try_reserve_view_to_owner(&test);
+    _test_try_reserve_zero_capacity(&test);
     test_suite_end(&test);
 
     test_suite_begin(&test, "string_remove_replace_refusals");

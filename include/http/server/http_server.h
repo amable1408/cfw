@@ -4,12 +4,17 @@
  *  @file    http_server.h
  *  @brief   HTTP/1.1 server over libwebsockets: routing, request accessors and
  *           response helpers.
+ *  @version 0.5.0
  *
  *  Features:
  *    - Exact and regex route registration on one server handle.
  *    - A regex route exposes its named group "file", or group 1, as route query data.
  *    - Request accessors for method, path, URL query, headers, client address and body.
  *    - Response helpers: sized/NUL-terminated bodies, empty bodies, native file streaming.
+ *    - http_server_response_send_file_handle streams a byte window of an OPEN File* in
+ *      HTTP_SERVER_FILE_CHUNK_SIZE chunks on the transport's write-readiness callback: the
+ *      response takes the handle over, at most one chunk is held per connection, and the
+ *      handle is released on completion, on a mid-stream disconnect, or on transaction reset.
  *    - Bodies are accumulated for any method that sends one, keyed on Content-Length
  *      rather than on the method, so PUT/PATCH/DELETE bodies reach the handler.
  *    - Extra libwebsockets subprotocols may be registered before the server starts.
@@ -60,13 +65,25 @@
  *
  *  Error Handling:
  *    - http_server_init, route_add, route_match_add, register_protocol,
- *      response_header_add and response_send_file answer false on refusal and
- *      log a WARN; they never abort on caller data.
+ *      response_header_add, response_header_add_raw, response_send_file and
+ *      response_send_file_handle answer false on refusal and log a WARN; they never abort on
+ *      caller data. The send_file_handle window (start, size) is request-derived data and is
+ *      refused BY VALUE: past the file's size, or overflowing, it answers false with nothing
+ *      written - never an error_check abort.
  *    - http_server_run / http_server_run_tls answer a Result; a bind or TLS
  *      failure is reported, not aborted.
  *    - Peer-derived data never aborts: an over-long request URI is answered 414,
  *      an over-long body 413, and a header carrying CR, LF or a control byte is
  *      refused rather than written to the wire.
+ *    - Every path a caller's bytes take into the header block is checked BY VALUE, because
+ *      libwebsockets copies them verbatim: a content type given to any sender, a
+ *      header_add_raw block, and send_file's extra_headers. A content type carrying CR, LF or
+ *      a control byte other than HTAB is refused; a raw block must be whole "Name: value\r\n"
+ *      lines with a token name - a bare CR or LF, a missing final CRLF, a missing ": ", or an
+ *      empty or non-token name refuses the block whole. The WARN echoes none of the refused
+ *      bytes. send_1/send_2 fail the response on a refused type (nothing is written, the
+ *      connection closes); header_add_raw, send_file and send_file_handle answer false with
+ *      nothing appended or written and leave the response to the caller's fallback.
  *    - A CONTENT-LENGTH is required for a request body. A chunked body is answered
  *      411 Length Required: libwebsockets' HTTP/1 role does not hand a chunked
  *      request body to this callback in ANY build - its h1 parser enters the body
@@ -134,6 +151,11 @@
  *      they answer an empty value (null at tier _1) when the arena is exhausted.
  *    - The body and content type given to http_server_set_payload_limit_response are
  *      BORROWED and must outlive the server.
+ *    - http_server_response_send_file_handle TAKES the File* it is handed when it answers
+ *      true (the caller's pointer is nulled): the server closes it when the last chunk has
+ *      been handed to the transport, when the connection closes first, or when the
+ *      connection's transaction state is reset - whichever comes first. On false the
+ *      handle is still the caller's to close.
  *
  *  Performance Characteristics:
  *    - Route lookup is O(routes): the list is scanned newest-first and every regex
@@ -156,6 +178,31 @@
  *      never fill.
  *    - http_server_response_send_file streams through libwebsockets' own write-
  *      readiness loop, so a multi-MB file costs no module-side buffer at all.
+ *    - http_server_response_send_file_handle reads one HTTP_SERVER_FILE_CHUNK_SIZE chunk
+ *      into a stack buffer per write-readiness callback and writes it: a 10 MB body is
+ *      ~160 read + write pairs instead of libwebsockets' ~2560 at its 4 KiB serving
+ *      buffer, and a slow reader holds at most ONE chunk in the transport's output list
+ *      (the choked check waits instead of appending), so 200 stalled connections bound
+ *      at ~12.8 MiB IN-PROCESS rather than a buffered body each. That bound is the
+ *      process's only: the kernel's send buffer is separate and not capped by this
+ *      module, and how much of a body it takes per slow reader is the platform's.
+ *      Measured on Windows loopback with default receive buffers, the kernel buffered
+ *      ~5 MB per slow reader (+1.07 GB nonpaged pool at 200 readers, against +0.33 GB on
+ *      0.4.1's 1 MiB-capped send_2 bodies). Measured on Linux (WSL2, tcp_wmem max 4 MiB),
+ *      it did not: 200 readers at 1 KiB/s held 216-225 MB of send queue against 180-293
+ *      MB on 0.4.1 - both pinned at the kernel's tcp_mem pressure threshold - and 10
+ *      readers held the same 1.7-2.7 MB each on both.
+ *    - A send_file_handle reader is held to a minimum read rate (see that function): about
+ *      510 B/s by the two-window per-chunk timer's arithmetic (64 KiB / 129 s), but on Linux
+ *      the floor does NOT hold under TCP memory pressure: read rate does not decide who
+ *      survives then, so no rate is safe (see that function: every stream can be dropped at
+ *      once). Keep concurrent slow readers x body size well under tcp_mem. Windows loopback
+ *      measured one-window timer figures (0 of 28 dropped at 1.5 KiB/s, all at 800 B/s).
+ *      send_file's floor without pressure is ~205 B/s; under pressure it is unmeasured.
+ *    - Every in-flight send_file_handle stream holds one C-runtime FILE*. On Windows the
+ *      CRT caps a process at 512 simultaneously open FILE* streams unless _setmaxstdio
+ *      raises it (to at most 8192), so that is the ceiling on concurrently streaming
+ *      connections there; the opener's failure past it is an ordinary nullptr to the caller.
  *
  *  Dependencies:
  *    - libwebsockets >= 4.3.5 (system header <libwebsockets.h>). Every libwebsockets
@@ -164,7 +211,7 @@
  *      lws_hdr_custom_length / lws_hdr_custom_copy, lws_http_get_uri_and_method -
  *      exists at 4.3.5, checked against that release's headers.
  *    - CFW: char, file, math, memory, regex, result, thread, container/str,
- *      container/string
+ *      container/string, http/headers (the RFC 9110 token check, implementation only)
  *
  *  Naming tiers:
  *    Numeric suffixes name the string representation a family varies on:
@@ -277,6 +324,8 @@
  *============================================================================*/
 /** Maximum custom request header name size, the trailing ':' and terminator included. */
 #define HTTP_SERVER_CUSTOM_HEADER_NAME_MAX_LENGTH 128
+/** Bytes read and written per write-readiness callback by http_server_response_send_file_handle; also the most one connection holds in the transport's output list. */
+#define HTTP_SERVER_FILE_CHUNK_SIZE (64 * 1024)
 /** Maximum copied client IP buffer size. */
 #define HTTP_SERVER_IP_MAX_LENGTH 48
 /** Maximum copied request or route path size. */
@@ -640,18 +689,24 @@ String const* http_server_response_get_extra_headers(HTTP_Server_Response const 
  * @param key Header name.
  * @param value Header value.
  * @return true when queued; false (with a WARN) when key or value carries CR, LF or a
- *         control byte, or when "key: value\r\n" would exceed
- *         HTTP_SERVER_RESPONSE_HEADER_MAX_LENGTH.
+ *         control byte (HTAB included), when key is not an RFC 9110 token, or when
+ *         "key: value\r\n" would exceed HTTP_SERVER_RESPONSE_HEADER_MAX_LENGTH.
  */
 bool http_server_response_header_add(HTTP_Server_Response *const self, char const *const key, char const *const value);
 
 /**
- * @brief Append a raw headers buffer block to the response context.
+ * @brief Append a raw headers block to the response context.
  * @param self Response context.
- * @param headers Raw CRLF-terminated HTTP headers block.
- * @param headers_size Byte length of the headers block.
+ * @param headers Raw header block: zero or more "Name: value\r\n" lines.
+ * @param headers_size Byte length of the headers block. 0 appends nothing and answers true.
+ * @return true when the block was appended; false (with a WARN that echoes none of the block,
+ *         nothing appended) when any line is malformed - a bare CR or bare LF, a last line
+ *         without its CRLF, a line without ": ", an empty or non-token name (an empty line
+ *         included), or a value carrying a control byte other than HTAB. The block is refused
+ *         WHOLE, never in part: each of those shapes could end the header block early and
+ *         let the rest of it read as a response of its own.
  */
-void http_server_response_header_add_raw(HTTP_Server_Response *const self, char const *const headers, USize const headers_size);
+bool http_server_response_header_add_raw(HTTP_Server_Response *const self, char const *const headers, USize const headers_size);
 
 /**
  * @brief Set the file_served status of a response.
@@ -942,7 +997,8 @@ bool http_server_request_query_copy(HTTP_Server_Request *const self, char *const
  * MARK: - Response API
  *============================================================================*/
 /**
- * @brief Send a null-terminated response.
+ * @brief Send a null-terminated response. Forwards to http_server_response_send_2, so every
+ *        refusal there - the content type's included - is this function's too.
  * @param self Response object.
  * @param data Response data, or null for an empty body.
  * @param content_type HTTP content type.
@@ -956,6 +1012,10 @@ void http_server_response_send_1(HTTP_Server_Response *const self, char const *c
  *        1xx, 204 or 304 status sends neither Content-Length nor a body, whatever
  *        data says - RFC 9110 forbids a length there, and a 304 with a body would
  *        tell a cache the representation is empty.
+ * @note A content_type carrying CR, LF or any other control byte (HTAB excepted) is refused BY
+ *       VALUE, with a WARN that echoes none of it: nothing is written and the response FAILS,
+ *       exactly as a header block too large for 2048 bytes does - the connection closes with no
+ *       reply rather than send a header block the type could have split.
  * @param self Response object.
  * @param data Response data, or null for an empty body.
  * @param data_size Response data size.
@@ -979,12 +1039,15 @@ void http_server_response_send_empty(HTTP_Server_Response *const self, U16 const
  * @param self Response object.
  * @param path On-disk file path.
  * @param content_type HTTP content type (MIME).
- * @param extra_headers Pre-formatted CRLF-terminated header block to emit alongside
- *                      lws' own, or null. Headers queued with
- *                      http_server_response_header_add are appended after it.
+ * @param extra_headers Pre-formatted header block to emit alongside lws' own - zero or more
+ *                      "Name: value\r\n" lines, held to http_server_response_header_add_raw's
+ *                      rules - or null. Headers queued with http_server_response_header_add
+ *                      are appended after it.
  * @param extra_headers_size Byte length of 'extra_headers'.
  * @return true when the file was handed to the transport for streaming; false (with a
- *         WARN) when the file does not exist or the combined header block does not fit.
+ *         WARN) when the file does not exist, the combined header block does not fit,
+ *         content_type carries CR, LF or a control byte other than HTAB, or extra_headers
+ *         has a line header_add_raw would refuse. Neither WARN echoes the refused value.
  * @note Existence is checked here rather than left to libwebsockets, which answers a
  *       missing file with its own 404 and reports the transaction complete - so a
  *       caller could not tell "streamed" from "was not there", and its own 404 body
@@ -994,11 +1057,120 @@ void http_server_response_send_empty(HTTP_Server_Response *const self, U16 const
  * @note The existence check is a documented TOCTOU and is ACCEPTED. A file deleted
  *       between the check and lws_serve_http_file makes lws answer its own 404 - the
  *       exact behaviour that held before the check was added, so the window is never
- *       worse than not checking. Closing it would mean holding an open descriptor
- *       across a call that opens the path by name itself, which lws' file-serving API
- *       does not offer; the check buys the common case at no cost to the rare one.
+ *       worse than not checking. The window is CLOSED by http_server_response_send_file_handle,
+ *       which serves the handle the caller opened and verified; this function keeps the
+ *       path contract for callers that do not need the handle.
  */
 bool http_server_response_send_file(HTTP_Server_Response *const self, char const *const path, char const *const content_type, char const *const extra_headers, USize const extra_headers_size);
+
+/**
+ * @brief Stream a byte window of an OPEN file as the response body, from the handle, in
+ *        fixed-size chunks on the transport's write-readiness callback - no per-response copy
+ *        of the body, at most one chunk held by the transport per connection.
+ *
+ * The streaming twin of send_2 for bodies that live on disk, and the handle-based twin of
+ * send_file: where send_file re-opens its PATH inside libwebsockets (a check-then-open the
+ * caller cannot close), this serves exactly the file the caller opened and verified. It is
+ * what http_service_static uses for every 200 and 206.
+ *
+ * Ownership: on true the response OWNS *file from that moment - the pointer is nulled, the
+ * handle is closed by the server when the last chunk has been handed to the transport, or when
+ * the connection closes first (a client that disconnects mid-stream), or when the next request
+ * on a keep-alive connection begins - whichever comes first. The caller must not touch it
+ * again. On false NOTHING was written and *file is still the caller's to close.
+ *
+ * Headers: status line, Content-Type, Content-Length (= size, also on HEAD), then every header
+ * queued with http_server_response_header_add / _header_add_raw - Content-Range, ETag,
+ * Accept-Ranges, Cache-Control are the caller's to queue before the call. The same 2048-byte
+ * header block and the same refusal as send_2 when it does not fit.
+ *
+ * HEAD: headers only, Content-Length = size, no body, the handle is closed before returning,
+ * and the transaction completes synchronously like a send_2 - the response is NOT marked
+ * file_served. An EMPTY window (size 0) completes the same way on a GET: the headers say
+ * Content-Length: 0 and there is nothing to schedule. Any other GET: the headers are written
+ * here, file_served is set, and the body follows on LWS_CALLBACK_HTTP_WRITEABLE from the
+ * connection's session state.
+ *
+ * A short read mid-stream (the file was truncated under the handle) cannot honour the
+ * Content-Length already on the wire: the connection is CLOSED, which is the only honest
+ * answer and what libwebsockets' own file serving does. A file that grows is served to the
+ * size promised and no further.
+ *
+ * Minimum read rate. Each chunk handed to the transport arms libwebsockets' content timeout for
+ * max(20 s, 2 * chunk bytes / 1024 + 1 s) - two drain windows, 129 s for a full
+ * HTTP_SERVER_FILE_CHUNK_SIZE chunk - and libwebsockets re-arms nothing while it drains a
+ * chunk's unsent tail, so by that arithmetic a reader must average about 510 bytes per second
+ * over a chunk. Two windows because, where the kernel takes a chunk only in part,
+ * libwebsockets keeps the rest and flushes it on the next write-readiness by itself, without
+ * the callback that writes - and re-arms for - the next chunk. Measured on Linux (WSL2, kernel
+ * 6.18, default buffers, 64 MiB body, 240 s per run, 24 readers per rate):
+ *   - Without TCP memory pressure the two-window timer drops nobody: 0 of 96 at 800, 1024,
+ *     1536 and 2048 B/s, and 0 of 120 at 1024 and 1536 B/s with 60 readers each. The re-write
+ *     comes each time ~60 KB is acked, about one window apart, so 800 B/s survives too (the
+ *     one-window timer dropped 2 of 74 at 1 KiB/s and 15 of 168 at 1.5 KiB/s, at ~66 s).
+ *   - Under TCP memory pressure the floor does NOT hold, at any rate. Two of three
+ *     96-reader runs crossed tcp_mem[1] (61430 pages; tcp_wmem max 4 MiB lets each socket
+ *     queue ~2.5 MB): the kernel shrinks sndbuf, no writability event follows, and all 96
+ *     readers, 2048 B/s ones included, were dropped together at the first timeout (~130 s),
+ *     with no EOF seen by the client. Whether a run trips it is close to a coin flip at this
+ *     reader count. Read rate does not separate the outcomes there - 48 of 48 readers at
+ *     2048 B/s were dropped under pressure while 24 of 24 at 800 B/s survived without it -
+ *     so no rate is safe: a reader survives only by draining its kernel backlog (~2.5 MB
+ *     here) within the timeout, roughly 19 KB/s (DERIVED, not measured). A wider timer only
+ *     holds stalled readers longer; capping SO_SNDBUF on these sockets, or re-arming on acked
+ *     progress, is the fix (not yet made). Keep concurrent slow readers x body size well
+ *     under tcp_mem[1].
+ *   - Windows loopback (4 KiB receive buffer, 4 MiB body), measured with the one-window
+ *     timer: no reader at 1.5 KiB/s was dropped (0 of 28); every reader at 800 B/s was.
+ * A reader under its platform's floor is dropped mid-body. This is NOT send_file's
+ * floor: lws's own serving re-arms per 4 KiB fragment, so without pressure its readers
+ * survive down to ~205 bytes per second; it too re-arms only when it writes, so under TCP
+ * memory pressure it is expected to drop sooner (its window is 20 s) - unmeasured. A fully stalled reader therefore keeps its connection, its FILE* and up
+ * to one chunk of buffered output for as long as 129 s before it is dropped - and on Windows
+ * every such reader counts against the C runtime's 512 open-FILE* ceiling (see Performance
+ * Characteristics), which an idle-reading flood reaches sooner than a fast one.
+ *
+ * LIMIT - no client bytes while the body streams. The connection stays in libwebsockets'
+ * transaction state while the chunks go out, and its HTTP/1 reader has no case for bytes
+ * arriving in that state: a pipelined request, or a stray CRLF, CLOSES the connection and
+ * cuts the response short. The stray CRLF includes the extra one some older clients send
+ * after a POST body (RFC 9112 section 2.2) - which is exactly a POST route that answers
+ * through this function. What reaches the peer before the close is whatever had already
+ * been handed to the kernel's send buffer (the unsent tail is discarded), so the amount
+ * depends on the platform's socket buffering - measured on Windows loopback: the headers
+ * and at most one chunk. The handle is released as on any disconnect and the server is
+ * unaffected; the peer sees a truncated body and no second reply. send_file does not share
+ * the limit - lws's own serving parks the wsi in its file-issuing state, which buffers
+ * incoming bytes until the body is done. Accepted and documented rather than worked around, because neither
+ * alternative can carry this function's contract: driving the handle through
+ * lws_serve_http_file with custom file ops hands the status line and Content-Length to
+ * libwebsockets, which writes 200 and the whole file (a 206 needs LWS_WITH_RANGES, and
+ * then lws parses the Range header itself - the caller's window is gone); and the
+ * file-issuing state has no public setter (lwsi_set_state is internal, lws_http_mark_sse
+ * only cancels the timeout), while lws_rx_flow_control was measured to stall the output
+ * after the first transport buffer. Browsers never pipeline and every common client has it
+ * off, and reverse proxies (Caddy, nginx, HAProxy) never pipeline to their upstream, so a
+ * server deployed behind one does not meet the limit at all; a caller that must serve a
+ * pipelining peer directly keeps send_file.
+ *
+ * @param self         Response object.
+ * @param file         In/out: an open, readable, REGULAR file (file_open_nofollow_try_* or any
+ *                     file_open_*). Nulled on take-over. Must not be nullptr, nor point to nullptr.
+ * @param start        First byte of the window.
+ * @param size         Bytes in the window; 0 is a legal empty body (a 0-byte file).
+ * @param content_type Content-Type value (charset included if any). Must not be nullptr.
+ * @param status_code  HTTP_SERVER_STATUS_CODE_OK or _PARTIAL_CONTENT; anything else is a
+ *                     caller error (error_check).
+ * @return true when the headers are on the wire and the body is scheduled (or, on HEAD, done);
+ *         false (with a WARN, nothing written, the response untouched) when the headers are
+ *         already sent, the handle is not a regular file, or start + size overflows or exceeds
+ *         the file's size as the handle reports it, or content_type carries CR, LF or a control
+ *         byte other than HTAB. A false here does NOT fail the response - the caller's own
+ *         fallback reply still goes out, exactly as send_file's refusals. The one exception is
+ *         send_2's own: a header block that does not fit, or a short header write, answers
+ *         false AND fails the response, exactly as send_2 does. *file stays the caller's.
+ */
+bool http_server_response_send_file_handle(HTTP_Server_Response *const self, File **const file, USize const start, USize const size, char const *const content_type, U16 const status_code);
 
 /*==============================================================================
  * MARK: - Router API
