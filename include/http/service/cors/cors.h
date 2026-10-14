@@ -1,6 +1,6 @@
 /*
  * cors.h - HTTP CORS service for the C Libraries Framework
- * @version 0.4.1
+ * @version 0.4.2
  *
  * Builds and validates Cross-Origin Resource Sharing policy data for browser
  * API requests. Application code owns reading request headers and writing the

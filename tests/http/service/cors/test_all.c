@@ -330,7 +330,6 @@ static void _test_origin_shape(Test *const test) {
     test_expect_false(test, "a pipe host is refused", http_service_cors_origin_add(&cors, "http://h|x"));
     test_expect_false(test, "a '<' host is refused", http_service_cors_origin_add(&cors, "http://h<x"));
     test_expect_false(test, "a '>' host is refused", http_service_cors_origin_add(&cors, "http://h>x"));
-    test_expect_false(test, "a spaced host is refused", http_service_cors_origin_add(&cors, "http://h x"));
     test_expect_u(test, "none of the misshapen origins reached the list", 0, al_str_get_size(&cors.origins));
 
     test_expect_true(test, "a plain host is accepted", http_service_cors_origin_add(&cors, "http://h"));

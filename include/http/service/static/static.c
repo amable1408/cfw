@@ -194,23 +194,6 @@ static FpHTTP_Service_Static_Test_Hook _http_service_static_hook_after_open = nu
  * MARK: - Helpers
  *============================================================================*/
 
-/* Case-insensitive byte-span equality for extension matching. */
-static bool _http_service_static_extension_equal(char const *const a, char const *const b, USize const size) {
-    trace_log_push(LOG_METADATA);
-
-    for (USize i = 0; i < size; i += 1) {
-        if (char_to_lower(a[i]) != char_to_lower(b[i])) {
-            trace_log_pop();
-
-            return false;
-        }
-    }
-
-    trace_log_pop();
-
-    return true;
-}
-
 /*
  * Resolve a MIME type from a file name by suffix, case-insensitively. Falls back to
  * lws_get_mimetype, then application/octet-stream. Never returns null. *out_charset is set true
@@ -231,7 +214,7 @@ static char const* _http_service_static_mimetype(char const *const file_name, US
         USize const extension_size = _HTTP_SERVICE_STATIC_MIME_TABLE[i].extension_size;
 
         if (file_name_size >= extension_size &&
-            _http_service_static_extension_equal(file_name + file_name_size - extension_size, _HTTP_SERVICE_STATIC_MIME_TABLE[i].extension, extension_size)) {
+            char_compare_iequal_2(file_name + file_name_size - extension_size, extension_size, _HTTP_SERVICE_STATIC_MIME_TABLE[i].extension, extension_size)) {
             mimetype        = _HTTP_SERVICE_STATIC_MIME_TABLE[i].mimetype;
             *out_charset    = _HTTP_SERVICE_STATIC_MIME_TABLE[i].charset;
 
@@ -761,15 +744,8 @@ static bool _http_service_static_resolve(HTTP_Service_Static const *const self,
      * a directory request appends. Opening one is the hazard ("CONIN$ .txt" blocks this thread),
      * so the refusal precedes the open. */
     {
-        USize base_start = 0;
-
-        for (USize i = file_name_size; i > 0; i -= 1) {
-            if (file_name[i - 1] == '/' || file_name[i - 1] == '\\') {
-                base_start = i;
-
-                break;
-            }
-        }
+        char const *const   base_name   = file_basename_1(file_name);
+        USize const         base_start  = (USize) (base_name - file_name);
 
         if (file_name_reserved_windows(file_name + base_start, file_name_size - base_start)) {
             trace_log_pop();
@@ -883,8 +859,9 @@ static _HTTP_Service_Static_Placement _http_service_static_handle_below_root(HTT
     if (!file_get_final_path(file, final_path, sizeof(final_path))) {
         if (!atomic_exchange_explicit(&_handle_unnamed_warned, true, memory_order_relaxed)) {
             log_message_2(LOG_LEVEL_WARN, LOG_METADATA,
-                "http_service_static: the served file's final path could not be resolved (too long for the buffer, or the platform cannot"
-                " report it - see file_get_final_path), so refuse_symlinks cannot tell where it lives and refuses it (logged once per process)");
+                "http_service_static: a file served below root_dir '%s' had a final path that could not be resolved (too long for the buffer, or the platform"
+                " cannot report it - see file_get_final_path), so refuse_symlinks cannot tell where it lives and refuses it (logged once per process)",
+                self->root_dir);
         }
 
         trace_log_pop();
@@ -1393,6 +1370,21 @@ HTTP_Service_Static http_service_static_init_2(char const *const root_dir, char 
         char_copy_3(self.fallback_file, sizeof(self.fallback_file), default_file, def_len < sizeof(self.fallback_file) ? def_len : sizeof(self.fallback_file) - 1);
 
         self.fallback_file_size = (U8) (def_len < sizeof(self.fallback_file) ? def_len : sizeof(self.fallback_file) - 1);
+
+#ifdef _WIN32
+        /* Config, not request data, so it is echoed. Not a refusal of the service: serving a name
+         * Windows would read as a device or an alias is refused per request (a silent not-served,
+         * never an open), and the operator should learn why here, once. */
+        if (file_name_reserved_windows(self.default_file, self.default_file_size) || file_path_aliased_windows(self.default_file, self.default_file_size)) {
+            log_message_2(LOG_LEVEL_WARN, LOG_METADATA,
+                "http_service_static_init_2: default_file '%s' is a Windows device or alias name and will never be served", self.default_file);
+        }
+
+        if (file_name_reserved_windows(self.fallback_file, self.fallback_file_size) || file_path_aliased_windows(self.fallback_file, self.fallback_file_size)) {
+            log_message_2(LOG_LEVEL_WARN, LOG_METADATA,
+                "http_service_static_init_2: fallback_file '%s' is a Windows device or alias name and will never be served", self.fallback_file);
+        }
+#endif // _WIN32
     }
 
     self.spa_fallback       = spa_fallback;

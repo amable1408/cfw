@@ -407,7 +407,8 @@ char* file_extension_1(char const *const path);
  * caller comparing against a '/'-joined path normalizes its own side, and on Windows compares
  * case-insensitively.
  *
- * For a ROOT asked once at construction, not per request - the per-request question is
+ * For a ROOT asked once at construction, not per request - or by a caller that has deliberately
+ * chosen to FOLLOW a link (static with refuse_symlinks off) - the per-request question is
  * file_get_final_path, asked of the handle that will actually be served. The path must be
  * TRUSTED: it is opened with no device check (on Windows a pipe path connects to its server),
  * unlike file_open_nofollow_try_1's.

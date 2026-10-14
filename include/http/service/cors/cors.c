@@ -64,8 +64,7 @@ static bool _http_service_cors_host_byte_forbidden(char const value) {
                            value == '|'  ||
                            value == '%'  ||
                            value == '<'  ||
-                           value == '>'  ||
-                           value == ' ';
+                           value == '>';
 
     trace_log_pop();
 

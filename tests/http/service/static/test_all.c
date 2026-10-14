@@ -1784,6 +1784,44 @@ static void _test_reserved_windows_name_spellings_refused(Test *const test, U16 
 }
 
 /*
+ * A default_file / fallback_file that file/ reads as a Windows device is config, not request data:
+ * construction logs ONE WARN per field, echoing the value, and still constructs (ruling 2449 - a
+ * bad fallback is a silent not-served, never a refusal of the service). A healthy name logs nothing.
+ */
+static void _test_init_warns_on_device_default_file(Test *const test) {
+    test_case_begin(test, "Windows: init_2 with default_file \"CON\" WARNs once per field naming the value, and still constructs");
+
+    char            log_buffer[2048]    = DEFAULT_INITIALIZATION;
+    LogLevel const  previous_level      = log_get_level();
+
+    log_set_level(LOG_LEVEL_WARN);
+    log_set_buffer(log_buffer, sizeof(log_buffer));
+    log_buffer_clear();
+
+    HTTP_Service_Static const device = http_service_static_init_2(_FIXTURE_ROOT, "/device", "CON", true, 0);
+
+    char const *const fallback_warn = strstr(log_buffer, "fallback_file 'CON'");
+    char const *const default_warn  = strstr(log_buffer, "default_file 'CON'");
+
+    test_expect_true(test, "the fallback_file WARN names the value", fallback_warn != nullptr);
+    test_expect_true(test, "and appears once", fallback_warn != nullptr && strstr(fallback_warn + 1, "fallback_file 'CON'") == nullptr);
+    test_expect_true(test, "the default_file WARN names the value, once", default_warn != nullptr && strstr(default_warn + 1, "default_file 'CON'") == nullptr);
+    test_expect_true(test, "the service is still constructed", device.root_dir_size > 0 && device.route_prefix_size > 0);
+
+    log_buffer_clear();
+
+    HTTP_Service_Static const healthy = http_service_static_init_2(_FIXTURE_ROOT, "/healthy", "index.html", true, 0);
+
+    test_expect_u(test, "a healthy default_file logs nothing", 0, log_get_buffer_size());
+    test_expect_true(test, "and constructs", healthy.root_dir_size > 0);
+
+    log_set_buffer(nullptr, 0);
+    log_set_level(previous_level);
+
+    test_case_end(test);
+}
+
+/*
  * The 8.3 short alias of a dotfile. GetShortPathNameA asks the volume for `.env`'s real short
  * name: on a volume with short names enabled (C: by default) it answers something like "ENV~1",
  * which starts with no '.', so refuse_dotfiles alone never saw it and the file was served. The
@@ -1926,6 +1964,7 @@ int main(void) {
     _test_reserved_windows_name_spellings_refused(&test, port);
     _test_short_name_refused(&test, port);
     _test_short_name_under_compare(&test, port);
+    _test_init_warns_on_device_default_file(&test);
 #endif // _WIN32
 
     http_server_delete(&server);

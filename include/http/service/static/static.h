@@ -1,6 +1,6 @@
 /*
  * static.h - HTTP static file service for the C Libraries Framework
- * @version 0.5.0
+ * @version 0.5.1
  *
  * Maps HTTP request paths to static assets on disk, resolving their MIME types,
  * validating path security, and serving the file data over HTTP.
@@ -22,17 +22,10 @@
  *     (serve_2 only - see below) an unmet If-Modified-Since, Range served only when If-Range (if
  *     present) still matches - by the STRONG comparison RFC 9110 S13.1.5 requires there, so a
  *     W/-prefixed If-Range never matches and answers a full 200.
- *   - Path traversal prevention. On Windows, refused unconditionally as well - through file/'s
- *     OS-independent predicates, called here under _WIN32: file_path_aliased_windows on the
- *     request-relative path (an NTFS alternate-data-stream ':' anywhere; any component,
- *     intermediate ones included, ending in '.' or ' '; any component shaped like an NTFS 8.3
- *     short alias - "ENV~1" for ".env", "BACKUP~1.TXT" - which would otherwise be a second
- *     spelling past refuse_dotfiles, refuse_symlinks and the device list, while a name that can
- *     never be an alias, "my-report~2.pdf", is served) and file_name_reserved_windows on the
- *     final component (CON, CONIN$, CONOUT$, CLOCK$, PRN, AUX, NUL, COM1-9, LPT1-9 and the
- *     superscript COM/LPT forms, case-insensitive, with or without an extension, with the
- *     spaces/dots Win32 trims trimmed - "CONIN$ .txt" is refused like "con.txt"). See file.h
- *     for the exact rules.
+ *   - Path traversal prevention. On Windows, also refused unconditionally: device names and
+ *     alias spellings (alternate data streams, trailing dot/space, 8.3 short names), through
+ *     file/'s file_name_reserved_windows and file_path_aliased_windows - see file.h for the
+ *     exact rules.
  *   - Opt-in dotfile refusal (refuse_dotfiles), `.well-known` exempt.
  *   - SPA fallback support, restricted to extension-less paths.
  *   - Arena and heap allocation.
@@ -89,13 +82,23 @@
  *     variant ("DONNÉES" for "données") is refused - the fail-closed direction, and a browser
  *     requests the href's exact casing. Empty and "." path segments are skipped on both sides.
  *   - A root_dir that is ITSELF a link stays legal: its final path is the target, and requests
- *     compare below the target. A root_dir that does not exist (or cannot be resolved) when the
+ *     compare below the target. That target is resolved ONCE, at construction: re-pointing the
+ *     root link afterwards (`ln -sfn releases/N+1 current`) or rewriting root_dir serves nothing -
+ *     every request answers 404 with the per-request "link refused" WARN (one line per request,
+ *     so a flipped root shows up as log volume), or a silent 404 if the new root_dir does not
+ *     exist - until the service is reconstructed (restart, or rebuild the instance, on deploy).
+ *     A root_dir that does not exist (or cannot be resolved) when the
  *     service is constructed refuses every request while refuse_symlinks is on; construction
  *     logs one WARN, and the first such refusal one more naming the root (once per process,
  *     never per request) - create the root first, then construct.
  *   - With refuse_symlinks off, a final-component link is followed by resolving its target and
- *     opening THAT nofollow (the target must itself be a regular file); that second resolution is
- *     the check-then-open an operator accepts by turning the refusal off.
+ *     opening THAT nofollow (the target must itself be a regular file, and not on a network
+ *     share: a UNC target is refused silently, with no log line); that second resolution is the
+ *     check-then-open an operator accepts by turning the refusal off. On Windows the by-path
+ *     resolve opens the link's TARGET before the nofollow open could refuse it, so a link to a
+ *     pipe or device connects first (operator-placed links only).
+ *   - A HARD link is not a symlink: one inside root_dir to a file outside it has a final path
+ *     inside the root and is served; refuse_symlinks does not cover it.
  *   - Where Linux has no /proc mounted (a minimal container, a chroot) the handle's final path
  *     cannot be read, and refuse_symlinks refuses every request there - fail closed, with one
  *     WARN per process naming /proc, not a link; see file_get_final_path.
@@ -143,7 +146,7 @@
  *     clean http_server_request_header_copy API, including If-Modified-Since (an RFC 7231
  *     IMF-fixdate parsed via datetime_from_http_try - RFC 850/asctime forms are refused, not just
  *     ignored).
- *   - serve_1 is DEPRECATED as of 0.3.1 and will be deleted in 0.6.0 - it was scheduled for
+ *   - serve_1 is DEPRECATED as of 0.3.1 and goes in 0.6.0 at the earliest - it was scheduled for
  *     0.5.0, but 0.5.0 was taken by the streaming seam (the handle-based open/verify/serve), and
  *     its deletion precondition below still holds. It takes no request (only a raw path), so it
  *     cannot read If-Modified-Since at all: a client sending only If-Modified-Since - `wget -N`,
@@ -152,10 +155,13 @@
  *     response's underlying transport handle, which is the last raw lws_hdr_copy left in the
  *     service tier. Every production caller in this tree (28 sites across 16 files) migrated to
  *     serve_2 in the 0.3.1 pass, main.c's root route included; no production caller remains.
- *     serve_1 is kept only for the suite's unchecked build, which cannot reach the resolve- and
- *     open-level refusals through serve_2 because HTTP_Server_Request is opaque; it is deleted
- *     (retiring the last raw lws_hdr_copy) once that build runs against a live server or resolve
- *     gains an exported seam. Both entry points resolve, open and verify BEFORE reading any
+ *     serve_1 is kept for two suite uses that need a request-less entry: the unchecked build's
+ *     T1/T2 twins (HTTP_Server_Request is opaque, so serve_2 cannot reach the resolve- and
+ *     open-level refusals) and the checked suite's late-root log-capture pin (the log buffer is
+ *     thread-local, so it must run on the test thread, which a live-server build does not
+ *     remove). It is deleted (retiring the last raw lws_hdr_copy) only when an exported
+ *     test-build seam over resolve+open+verify, under HTTP_SERVICE_STATIC_TEST_HOOKS beside the
+ *     two setters, replaces both. Both entry points resolve, open and verify BEFORE reading any
  *     header, so every refusal returns having touched nothing on the response.
  *   - Prefer serve_2 for any new integration; it is also what the Usage Example above shows.
  *
@@ -235,7 +241,15 @@ typedef struct {
     U32 max_age;
     /** @brief Enable Single Page Application fallback routing. */
     bool spa_fallback;
-    /** @brief Root directory on disk. */
+    /**
+     * @brief Root directory on disk.
+     *
+     * Fixed at construction together with its final path: a root that is itself a link is
+     * resolved ONCE, so re-pointing it afterwards (`ln -sfn releases/N+1 current`) or rewriting
+     * this field serves nothing - every request answers 404 with the per-request "link refused"
+     * WARN, or a silent 404 if the new root_dir does not exist - until the service is
+     * reconstructed.
+     */
     char root_dir[HTTP_SERVER_PATH_MAX_LENGTH];
     /** @brief Size of the root directory string. */
     U16 root_dir_size;
@@ -345,6 +359,10 @@ HTTP_Service_Static http_service_static_init_1(char const *const root_dir, char 
  * @return Initialized service.
  * @note See http_service_static_init_1 for the truncation-logs-WARN note (applies to
  *       default_file here too) and for the root_dir-must-exist note.
+ * @note On Windows, a default_file that file_name_reserved_windows or file_path_aliased_windows
+ *       refuses ("CON") logs one WARN here, echoing the value (it is config), for default_file and
+ *       for the fallback_file copied from it; the service is still constructed and never serves that
+ *       name.
  */
 HTTP_Service_Static http_service_static_init_2(char const *const root_dir, char const *const route_prefix, char const *const default_file, bool const spa_fallback, U32 const max_age);
 
@@ -355,10 +373,11 @@ HTTP_Service_Static http_service_static_init_2(char const *const root_dir, char 
  * @param path Requested URL path.
  * @param path_size Size of the URL path string.
  * @return true if the static file was found and served.
- * @deprecated Since 0.3.1; scheduled for deletion in 0.6.0 (0.5.0 was taken by the streaming
+ * @deprecated Since 0.3.1; deletion in 0.6.0 at the earliest, once the test-build seam exists (0.5.0 was taken by the streaming
  *             seam). Use http_service_static_serve_2, which takes the request every caller already
- *             holds. No production caller remains; kept only until the unchecked suite can reach
- *             resolve- and open-level refusals another way.
+ *             holds. No production caller remains; kept only for the suite's two request-less uses
+ *             (the unchecked T1/T2 twins and the late-root log-capture pin) until an exported
+ *             test-build seam over resolve+open+verify replaces them.
  * @note No HTTP_Server_Request is available here, so If-Modified-Since is never evaluated (see
  *       static.h's "serve_1 vs serve_2" note). If-None-Match, Range, and If-Range are still fully
  *       supported. Prefer serve_2 when a request is available.
