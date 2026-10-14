@@ -1,5 +1,6 @@
 /*
  * net.h - Cross-platform BSD-socket abstraction for the C Libraries Framework
+ * @version 0.4.0
  *
  * Features:
  *   - Cross-platform (Windows and POSIX) socket abstraction: one Net_Socket
@@ -7,7 +8,7 @@
  *   - Full client + server surface: init/bind/listen/accept/connect,
  *     send/recv for both TCP and UDP, shutdown/close
  *   - Setters for the platform-specific option seams: timeout, SO_REUSEADDR,
- *     blocking mode, TCP_NODELAY
+ *     SO_SNDBUF, blocking mode, TCP_NODELAY
  *   - Address helpers: wildcard/literal construction, DNS resolution,
  *     text formatting, equality, and getters - all IPv4/IPv6-agnostic
  *   - net_socket_address_key_1/_2: an address literal reduced to one key per
@@ -414,6 +415,18 @@ Result net_socket_set_nodelay(Net_Socket const self, bool const enabled);
  * @return RESULT_SUCCESS, or a Result classifying setsockopt()'s failure.
  */
 Result net_socket_set_reuse_address(Net_Socket const self, bool const enabled);
+
+/**
+ * @brief Set SO_SNDBUF, the kernel's send-buffer size for this socket.
+ * @param self       Socket.
+ * @param byte_count Requested size. Linux stores DOUBLE this (bookkeeping overhead), locks
+ *                   the socket out of send-buffer autotuning and out of the under-pressure
+ *                   shrink (SOCK_SNDBUF_LOCK) - sticky for the socket's life; Windows takes it
+ *                   literally. The OS clamps to its own min/max (Linux: net.core.wmem_max, stock
+ *                   212992); 0 is passed through and means the OS minimum.
+ * @return RESULT_SUCCESS, or a Result classifying setsockopt()'s failure.
+ */
+Result net_socket_set_send_buffer_size(Net_Socket const self, U32 const byte_count);
 
 /**
  * @brief Set both the receive and send timeout (SO_RCVTIMEO and SO_SNDTIMEO)

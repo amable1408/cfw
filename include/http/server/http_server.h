@@ -4,7 +4,7 @@
  *  @file    http_server.h
  *  @brief   HTTP/1.1 server over libwebsockets: routing, request accessors and
  *           response helpers.
- *  @version 0.5.0
+ *  @version 0.5.1
  *
  *  Features:
  *    - Exact and regex route registration on one server handle.
@@ -13,8 +13,9 @@
  *    - Response helpers: sized/NUL-terminated bodies, empty bodies, native file streaming.
  *    - http_server_response_send_file_handle streams a byte window of an OPEN File* in
  *      HTTP_SERVER_FILE_CHUNK_SIZE chunks on the transport's write-readiness callback: the
- *      response takes the handle over, at most one chunk is held per connection, and the
- *      handle is released on completion, on a mid-stream disconnect, or on transaction reset.
+ *      response takes the handle over, at most one chunk is held per connection, the
+ *      connection's kernel send buffer is capped, and the handle is released on completion,
+ *      on a mid-stream disconnect, or on transaction reset.
  *    - Bodies are accumulated for any method that sends one, keyed on Content-Length
  *      rather than on the method, so PUT/PATCH/DELETE bodies reach the handler.
  *    - Extra libwebsockets subprotocols may be registered before the server starts.
@@ -78,9 +79,11 @@
  *    - Every path a caller's bytes take into the header block is checked BY VALUE, because
  *      libwebsockets copies them verbatim: a content type given to any sender, a
  *      header_add_raw block, and send_file's extra_headers. A content type carrying CR, LF or
- *      a control byte other than HTAB is refused; a raw block must be whole "Name: value\r\n"
- *      lines with a token name - a bare CR or LF, a missing final CRLF, a missing ": ", or an
- *      empty or non-token name refuses the block whole. The WARN echoes none of the refused
+ *      a control byte other than HTAB is refused; a raw block must be whole RFC 9110 field
+ *      lines ("Name: value\r\n" or "Name:value\r\n", the value possibly empty) with a token
+ *      name - a bare CR or LF, a missing final CRLF, a missing colon, or an empty or non-token
+ *      name (whitespace before the colon, an obs-fold line) refuses the block whole. header_add
+ *      refuses a non-token name itself. The WARN echoes none of the refused
  *      bytes. send_1/send_2 fail the response on a refused type (nothing is written, the
  *      connection closes); header_add_raw, send_file and send_file_handle answer false with
  *      nothing appended or written and leave the response to the caller's fallback.
@@ -183,22 +186,35 @@
  *      ~160 read + write pairs instead of libwebsockets' ~2560 at its 4 KiB serving
  *      buffer, and a slow reader holds at most ONE chunk in the transport's output list
  *      (the choked check waits instead of appending), so 200 stalled connections bound
- *      at ~12.8 MiB IN-PROCESS rather than a buffered body each. That bound is the
- *      process's only: the kernel's send buffer is separate and not capped by this
- *      module, and how much of a body it takes per slow reader is the platform's.
- *      Measured on Windows loopback with default receive buffers, the kernel buffered
- *      ~5 MB per slow reader (+1.07 GB nonpaged pool at 200 readers, against +0.33 GB on
- *      0.4.1's 1 MiB-capped send_2 bodies). Measured on Linux (WSL2, tcp_wmem max 4 MiB),
- *      it did not: 200 readers at 1 KiB/s held 216-225 MB of send queue against 180-293
- *      MB on 0.4.1 - both pinned at the kernel's tcp_mem pressure threshold - and 10
- *      readers held the same 1.7-2.7 MB each on both.
+ *      at ~12.8 MiB IN-PROCESS rather than a buffered body each.
+ *    - The kernel's share is bounded per stream too: at take-over the connection's
+ *      SO_SNDBUF is capped at 256 KiB requested (Linux stores 512 KiB - less where
+ *      net.core.wmem_max is lower, a stock 212992 gives 425984 - Windows 256 KiB),
+ *      where uncapped the platform autotuned it. Before the cap, with readers at 1 KiB/s:
+ *      Windows loopback buffered ~5 MB per slow reader (an earlier run's system-wide counter,
+ *      noisy - 50 capped readers later measured +0.8-1.2 MB each; +1.07 GB nonpaged pool at 200
+ *      readers, against +0.33 GB on 0.4.1's 1 MiB-capped send_2 bodies), and Linux (WSL2,
+ *      tcp_wmem max 4 MiB) held 216-225 MB of send queue at 200 readers - pinned at the
+ *      kernel's tcp_mem pressure threshold - and 1.7-2.7 MB each at 10. Those figures are
+ *      to be re-measured with the cap.
+ *    - The cap's price: throughput per streamed connection is at most cap / RTT
+ *      (~22 Mbit/s measured at 100 ms RTT - 50 ms netem each way - with 512 KiB
+ *      stored; ~18 Mbit/s where a stock wmem_max stores 425984; no limit in practice on LAN or
+ *      loopback), the socket's send-buffer autotuning is off, and both hold for the
+ *      CONNECTION's life - a keep-alive connection that streamed once stays capped for its
+ *      later responses. A cap the OS refuses is logged once per process (WARN) and that
+ *      stream runs uncapped.
  *    - A send_file_handle reader is held to a minimum read rate (see that function): about
- *      510 B/s by the two-window per-chunk timer's arithmetic (64 KiB / 129 s), but on Linux
- *      the floor does NOT hold under TCP memory pressure: read rate does not decide who
- *      survives then, so no rate is safe (see that function: every stream can be dropped at
- *      once). Keep concurrent slow readers x body size well under tcp_mem. Windows loopback
- *      measured one-window timer figures (0 of 28 dropped at 1.5 KiB/s, all at 800 B/s).
- *      send_file's floor without pressure is ~205 B/s; under pressure it is unmeasured.
+ *      510 B/s by the two-window per-chunk timer's arithmetic (64 KiB / 129 s). Under Linux
+ *      tcp_mem pressure the kernel moderates an UNCAPPED socket's send buffer to half its
+ *      queue and signals writable only once the queue drains to 2/3 of that, so with ~2.5 MB
+ *      queued a slow reader's stream never re-arms (it would need ~13 KB/s, DERIVED); the cap
+ *      exempts the streamed socket from that moderation and fits ~5x more concurrent slow
+ *      readers under tcp_mem[1]. Budget concurrent slow readers x per-socket send queue
+ *      (<= 512 KiB capped, ~2.5 MB uncapped) - not x body size - well under tcp_mem[1].
+ *    - send_file (lws's own serving) re-arms its 20 s timeout only when it writes a fragment,
+ *      so on Linux loopback it drops EVERY reader below roughly 4-16 KiB/s at ~20 s, pressure
+ *      or not: send_file_handle is the more robust path for slow readers.
  *    - Every in-flight send_file_handle stream holds one C-runtime FILE*. On Windows the
  *      CRT caps a process at 512 simultaneously open FILE* streams unless _setmaxstdio
  *      raises it (to at most 8192), so that is the ceiling on concurrently streaming
@@ -211,7 +227,8 @@
  *      lws_hdr_custom_length / lws_hdr_custom_copy, lws_http_get_uri_and_method -
  *      exists at 4.3.5, checked against that release's headers.
  *    - CFW: char, file, math, memory, regex, result, thread, container/str,
- *      container/string, http/headers (the RFC 9110 token check, implementation only)
+ *      container/string, http/headers (the RFC 9110 token check, implementation only),
+ *      net (the streamed socket's SO_SNDBUF cap, implementation only)
  *
  *  Naming tiers:
  *    Numeric suffixes name the string representation a family varies on:
@@ -697,14 +714,17 @@ bool http_server_response_header_add(HTTP_Server_Response *const self, char cons
 /**
  * @brief Append a raw headers block to the response context.
  * @param self Response context.
- * @param headers Raw header block: zero or more "Name: value\r\n" lines.
+ * @param headers Raw header block: zero or more RFC 9110 field lines, "Name: value\r\n" OR
+ *                "Name:value\r\n" - optional SP/HTAB around the value, which may be empty
+ *                ("Name:\r\n"). The value goes out with that whitespace stripped, after ": ".
  * @param headers_size Byte length of the headers block. 0 appends nothing and answers true.
  * @return true when the block was appended; false (with a WARN that echoes none of the block,
  *         nothing appended) when any line is malformed - a bare CR or bare LF, a last line
- *         without its CRLF, a line without ": ", an empty or non-token name (an empty line
- *         included), or a value carrying a control byte other than HTAB. The block is refused
- *         WHOLE, never in part: each of those shapes could end the header block early and
- *         let the rest of it read as a response of its own.
+ *         without its CRLF, a line without a colon, an empty or non-token name (an empty line,
+ *         whitespace before the colon "Name :", and an obs-fold continuation line that starts
+ *         with SP/HTAB included), or a value carrying a control byte other than HTAB (obs-text,
+ *         0x80-0xFF, is legal). The block is refused WHOLE, never in part: each of those shapes
+ *         could end the header block early and let the rest of it read as a response of its own.
  */
 bool http_server_response_header_add_raw(HTTP_Server_Response *const self, char const *const headers, USize const headers_size);
 
@@ -1040,8 +1060,10 @@ void http_server_response_send_empty(HTTP_Server_Response *const self, U16 const
  * @param path On-disk file path.
  * @param content_type HTTP content type (MIME).
  * @param extra_headers Pre-formatted header block to emit alongside lws' own - zero or more
- *                      "Name: value\r\n" lines, held to http_server_response_header_add_raw's
- *                      rules - or null. Headers queued with http_server_response_header_add
+ *                      "Name: value\r\n" or "Name:value\r\n" lines (optional SP/HTAB around
+ *                      the value, which may be empty), held to
+ *                      http_server_response_header_add_raw's rules and emitted verbatim - or
+ *                      null. Headers queued with http_server_response_header_add
  *                      are appended after it.
  * @param extra_headers_size Byte length of 'extra_headers'.
  * @return true when the file was handed to the transport for streaming; false (with a
@@ -1102,31 +1124,42 @@ bool http_server_response_send_file(HTTP_Server_Response *const self, char const
  * chunk's unsent tail, so by that arithmetic a reader must average about 510 bytes per second
  * over a chunk. Two windows because, where the kernel takes a chunk only in part,
  * libwebsockets keeps the rest and flushes it on the next write-readiness by itself, without
- * the callback that writes - and re-arms for - the next chunk. Measured on Linux (WSL2, kernel
- * 6.18, default buffers, 64 MiB body, 240 s per run, 24 readers per rate):
- *   - Without TCP memory pressure the two-window timer drops nobody: 0 of 96 at 800, 1024,
- *     1536 and 2048 B/s, and 0 of 120 at 1024 and 1536 B/s with 60 readers each. The re-write
- *     comes each time ~60 KB is acked, about one window apart, so 800 B/s survives too (the
- *     one-window timer dropped 2 of 74 at 1 KiB/s and 15 of 168 at 1.5 KiB/s, at ~66 s).
- *   - Under TCP memory pressure the floor does NOT hold, at any rate. Two of three
- *     96-reader runs crossed tcp_mem[1] (61430 pages; tcp_wmem max 4 MiB lets each socket
- *     queue ~2.5 MB): the kernel shrinks sndbuf, no writability event follows, and all 96
- *     readers, 2048 B/s ones included, were dropped together at the first timeout (~130 s),
- *     with no EOF seen by the client. Whether a run trips it is close to a coin flip at this
- *     reader count. Read rate does not separate the outcomes there - 48 of 48 readers at
- *     2048 B/s were dropped under pressure while 24 of 24 at 800 B/s survived without it -
- *     so no rate is safe: a reader survives only by draining its kernel backlog (~2.5 MB
- *     here) within the timeout, roughly 19 KB/s (DERIVED, not measured). A wider timer only
- *     holds stalled readers longer; capping SO_SNDBUF on these sockets, or re-arming on acked
- *     progress, is the fix (not yet made). Keep concurrent slow readers x body size well
- *     under tcp_mem[1].
- *   - Windows loopback (4 KiB receive buffer, 4 MiB body), measured with the one-window
- *     timer: no reader at 1.5 KiB/s was dropped (0 of 28); every reader at 800 B/s was.
- * A reader under its platform's floor is dropped mid-body. This is NOT send_file's
- * floor: lws's own serving re-arms per 4 KiB fragment, so without pressure its readers
- * survive down to ~205 bytes per second; it too re-arms only when it writes, so under TCP
- * memory pressure it is expected to drop sooner (its window is 20 s) - unmeasured. A fully stalled reader therefore keeps its connection, its FILE* and up
- * to one chunk of buffered output for as long as 129 s before it is dropped - and on Windows
+ * the callback that writes - and re-arms for - the next chunk. Measured floors, one sentence
+ * per platform (the run logs are in docs/modules/http/server.html, "Measurements"):
+ *   - Linux (WSL2) without TCP memory pressure: the two-window timer dropped no reader at
+ *     800-2048 B/s, uncapped and capped alike (0 of 24 per rate, two runs); at 512 B/s the
+ *     capped run dropped 11 of 24 at the 129 s timer, so the floor sits between 512 and
+ *     800 B/s.
+ *   - Linux under TCP memory pressure: the kernel moderates an UNCAPPED socket's send buffer
+ *     to half its queue and signals writable only once the queue drains to 2/3 of that, so
+ *     with ~2.5 MB queued a slow reader's stream never re-arms (it would need ~13 KB/s,
+ *     DERIVED) and, before the cap below, every reader of a pressured run was dropped
+ *     together at ~130 s whatever its rate.
+ *   - Windows loopback, with the one-window timer: no reader dropped at 1.5 KiB/s, every
+ *     reader at 800 B/s.
+ *
+ * Send-buffer cap. At take-over the connection's socket gets SO_SNDBUF =
+ * _HTTP_SERVER_FILE_STREAM_SEND_BUFFER_SIZE (256 KiB requested; Linux stores up to 512 KiB -
+ * 425984 on a stock net.core.wmem_max of 212992, as every deployed VPS has; Windows 256 KiB).
+ * On Linux an explicit SO_SNDBUF locks the buffer, which exempts the socket from the
+ * under-pressure moderation above and bounds the kernel's take per stream, so ~5x more
+ * concurrent slow readers fit under tcp_mem[1]; on Windows it bounds AFD's buffer, not the
+ * nonpaged pool (+0.8-1.2 MB per capped reader measured, noisy counter). Budget concurrent slow
+ * readers x per-socket send queue (<= 512 KiB capped, ~2.5 MB uncapped), not x body size.
+ * The price: throughput per streamed connection is at most cap / RTT (~22 Mbit/s
+ * measured at 100 ms RTT with 512 KiB stored, ~18 at the stock 425984), the socket's send-buffer autotuning is off, and both are sticky for
+ * the CONNECTION's life - a keep-alive connection that streamed once stays capped for its
+ * later responses; the cap is never restored, since the Linux lock cannot be undone. A cap
+ * the OS refuses is logged once per process (WARN) and that stream runs uncapped - it never
+ * refuses the stream, whose headers are already on the wire.
+ *
+ * A reader under its platform's floor is dropped mid-body. send_file is NOT the more
+ * forgiving path: lws's own serving re-arms its 20 s timeout only when it writes a fragment
+ * inside that window, so on Linux loopback it drops EVERY reader below roughly 4-16 KiB/s at
+ * ~20 s, pressure or not (the earlier "~205 B/s" figure for it is withdrawn) - send_file_handle
+ * is the more robust path for slow readers. A fully stalled reader keeps its connection, its
+ * FILE*, up to one chunk of buffered output and up to the capped send buffer in the kernel
+ * for as long as 129 s before it is dropped - and on Windows
  * every such reader counts against the C runtime's 512 open-FILE* ceiling (see Performance
  * Characteristics), which an idle-reading flood reaches sooner than a fast one.
  *
@@ -1151,7 +1184,8 @@ bool http_server_response_send_file(HTTP_Server_Response *const self, char const
  * after the first transport buffer. Browsers never pipeline and every common client has it
  * off, and reverse proxies (Caddy, nginx, HAProxy) never pipeline to their upstream, so a
  * server deployed behind one does not meet the limit at all; a caller that must serve a
- * pipelining peer directly keeps send_file.
+ * pipelining peer directly keeps send_file - a pipelining escape, not a robustness one, since
+ * send_file drops slow readers far sooner (see Minimum read rate).
  *
  * @param self         Response object.
  * @param file         In/out: an open, readable, REGULAR file (file_open_nofollow_try_* or any

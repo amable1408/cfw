@@ -1,6 +1,12 @@
 #include <http/server/http_server.h>
 
+// stdatomic.h is owed directly: the once-per-process "cap failed" flag in
+// http_server_response_send_file_handle is an atomic_bool, and log.h reaches it only under
+// LOG_THREAD_IMPLEMENTATION.
+#include <stdatomic.h>
+
 #include <http/headers/headers.h>
+#include <net/net.h>
 
 /*==============================================================================
  * MARK: - Private Constants
@@ -15,12 +21,25 @@
  * pressure, 0 of 96 and 0 of 120 were; the observed re-arm gap there is nearer one window
  * (a re-write each time ~60 KB is acked), so two is margin, not an exact fit. */
 #define _HTTP_SERVER_FILE_STREAM_DRAIN_WINDOWS 2
-/* The slowest average rate, in bytes per second, a send_file_handle reader may take a chunk
- * at: the per-chunk content timeout grows with the bytes just written, scaled by
- * _HTTP_SERVER_FILE_STREAM_DRAIN_WINDOWS above, so a reader at this rate still drains them
- * in time - 129 s for a full 64 KiB chunk. A slower one is dropped. That is the timer's
- * arithmetic; the floor the docs state in http_server.h is the measured one. */
+/* The rate, in bytes per second, ONE drain window is scaled by: the per-chunk content timeout
+ * is DRAIN_WINDOWS x the bytes just written / this rate, plus 1 s - 129 s for a full 64 KiB
+ * chunk. Across the two windows that admits a reader averaging about 512 B/s (64 KiB / 129 s),
+ * not 1024; a slower one is dropped. That is the timer's arithmetic; the floor the docs state
+ * in http_server.h is the measured one. */
 #define _HTTP_SERVER_FILE_STREAM_MIN_RATE      1024
+/* SO_SNDBUF requested on a streamed socket at take-over (net_socket_set_send_buffer_size).
+ * Under Linux tcp_mem pressure the kernel moderates an UNLOCKED socket's send buffer to half
+ * its queue and signals writable only once the queue drains to 2/3 of that, so a slow
+ * reader's stream with ~2.5 MB queued never re-arms its timer: measured 2026-10-14 on WSL,
+ * 96 of 96 readers dropped together at ~130 s. An explicit SO_SNDBUF sets SOCK_SNDBUF_LOCK,
+ * which exempts the socket from that moderation, and bounds the kernel's take per stream at
+ * 512 KiB effective on Linux (it stores double the request) instead of ~2.5 MB autotuned.
+ * The price - throughput <= this / RTT per streamed connection, sticky for its life - is
+ * stated in http_server.h. 256 KiB, not 128: measured 2026-10-14 at 100 ms RTT, a 128 KiB cap
+ * held a stream to ~11 Mbit/s (Linux keeps only about half the stored buffer in flight), too
+ * tight for a client 100-200 ms away; 256 doubles that while keeping ~5x the uncapped
+ * headroom under tcp_mem. */
+#define _HTTP_SERVER_FILE_STREAM_SEND_BUFFER_SIZE (256 * 1024)
 /* The context's timeout_secs (both context builders assign it, so libwebsockets' own
  * waits and this module's never drift apart) and the FLOOR of a streamed chunk's
  * PENDING_TIMEOUT_HTTP_CONTENT. lws's own file serving re-arms that timeout per 4 KiB
@@ -119,6 +138,10 @@ typedef struct {
      * response is the dispatcher's stack object), so it lives here, with the connection:
      * served on LWS_CALLBACK_HTTP_WRITEABLE, released by _http_server_stream_reset. */
     _HTTP_Server_File_Stream    stream;
+    /* Set by the first send_file_handle take-over on this connection, whether the SO_SNDBUF cap
+     * took or not: the cap is applied once per connection and never restored (on Linux the
+     * lock is sticky). Zeroed with the rest of the session when libwebsockets allocates it. */
+    bool                        send_buffer_capped;
 } HTTP_Session;
 
 /*==============================================================================
@@ -193,14 +216,18 @@ static bool _http_server_header_value_valid(char const *const value, USize const
 }
 
 /**
- * @brief Answer whether a raw header block is a sequence of well-formed "Name: value\r\n" lines.
+ * @brief Answer whether a raw header block is a sequence of well-formed RFC 9110 field lines.
  *
- * Every line needs an RFC 9110 token name, the ": " separator, a value that passes
- * _http_server_header_value_valid, and its own CRLF. Each refusal below is a separate shape:
- * a bare LF or a bare CR (a line break the client honours and this check would not see as
- * one), a block whose last line has no CRLF (the next block appended would continue it), a
- * missing ": ", an empty or non-token name (an empty line ENDS the header block), and a
- * control byte in a value. An empty block holds no line and is answered true.
+ * Every line is `token ":" OWS value OWS CRLF`: an RFC 9110 token name, the colon, a value that
+ * passes _http_server_header_value_valid (OWS - zero or more SP/HTAB - is part of what it
+ * admits, so "Name: value", "Name:value" and "Name:\tvalue" all pass, and an EMPTY value is
+ * legal), and its own CRLF. Each refusal below is a separate shape: a bare LF or a bare CR (a
+ * line break the client honours and this check would not see as one), a block whose last line
+ * has no CRLF (the next block appended would continue it), a line with no colon, an empty or
+ * non-token name - an empty line (it ENDS the header block), whitespace before the colon
+ * ("Name :"), and an obs-fold continuation line (it starts with SP/HTAB) all land here - and a
+ * control byte other than HTAB in a value. obs-text (0x80-0xFF) in a value is legal and passes.
+ * An empty block holds no line and is answered true.
  */
 static bool _http_server_header_lines_valid(char const *const headers, USize const size) {
     USize line_start = 0;
@@ -230,15 +257,15 @@ static bool _http_server_header_lines_valid(char const *const headers, USize con
             colon += 1;
         }
 
+        if (colon == line_end) {
+            return false;
+        }
+
         if (!http_headers_token_valid_2(headers + line_start, colon - line_start)) {
             return false;
         }
 
-        if (colon + 1 >= line_end || headers[colon + 1] != ' ') {
-            return false;
-        }
-
-        if (!_http_server_header_value_valid(headers + colon + 2, line_end - colon - 2, true)) {
+        if (!_http_server_header_value_valid(headers + colon + 1, line_end - colon - 1, true)) {
             return false;
         }
 
@@ -1342,16 +1369,25 @@ static bool _http_server_response_add_extra_headers(HTTP_Server_Response *const 
             char const *const colon = char_find_slice_5(start + offset, line_len, 0, ":", 1);
 
             if (colon != nullptr) {
-                USize   const   name_size   = (colon - (start + offset)) + 1;
+                USize   const   name_size   = (USize) (colon - (start + offset));
                 char    const   *value      = colon + 1;
-                USize           value_size  = line_len - name_size;
+                USize           value_size  = line_len - name_size - 1;
 
-                while (value_size > 0 && *value == ' ') {
+                /* OWS is SP or HTAB, at either edge of the value (RFC 9110 section 5.5); the line
+                 * validator admits both, so both are stripped and the wire form is canonical. */
+                while (value_size > 0 && (*value == ' ' || *value == '\t')) {
                     value       += 1;
                     value_size  -= 1;
                 }
 
-                char *const name_term = (char*) (colon + 1);
+                while (value_size > 0 && (value[value_size - 1] == ' ' || value[value_size - 1] == '\t')) {
+                    value_size -= 1;
+                }
+
+                /* The name ends AT its colon, never after it: with no OWS ("Name:value") the byte
+                 * after the colon is the value's first, and terminating there would send a NUL in
+                 * its place. libwebsockets writes the ": " itself for a name that carries no colon. */
+                char *const name_term = (char*) colon;
                 char const original_char = *name_term;
 
                 *name_term = '\0';
@@ -2082,6 +2118,17 @@ bool http_server_response_header_add(HTTP_Server_Response *const self, char cons
         return false;
     }
 
+    /* The name is checked as a token HERE, not left to the raw path: that path splits a line at
+     * its FIRST colon and admits a value with no space after it, so a key "X:Y" would go out as
+     * the header "X" with the value "Y: ...". The WARN names nothing, as above. */
+    if (!http_headers_token_valid_2(key, char_length(key))) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_server_response_header_add: refusing a header whose name is not an RFC 9110 token");
+
+        trace_log_pop();
+
+        return false;
+    }
+
     char buffer[HTTP_SERVER_RESPONSE_HEADER_MAX_LENGTH] = DEFAULT_INITIALIZATION;
 
     I32 const written = snprintf(buffer, sizeof(buffer), "%s: %s\r\n", key, value);
@@ -2097,8 +2144,8 @@ bool http_server_response_header_add(HTTP_Server_Response *const self, char cons
         return false;
     }
 
-    /* The raw path re-checks the line it is handed; a key that passed the control-byte check
-     * above but is not a token ("X Bad", "X:Y") is refused there, and that answer is this one. */
+    /* The raw path re-checks the whole line it is handed, value included, and its answer is
+     * this one. */
     bool const added = http_server_response_header_add_raw(self, buffer, (USize) written);
 
     trace_log_pop();
@@ -2118,7 +2165,8 @@ bool http_server_response_header_add_raw(HTTP_Server_Response *const self, char 
      * and the WARN echoes none of it - the block is the payload. */
     if (!_http_server_header_lines_valid(headers, headers_size)) {
         log_message_2(LOG_LEVEL_WARN, LOG_METADATA,
-                      "http_server_response_header_add_raw: refusing a %llu-byte block - every line must be \"Name: value\" with a token name, its own CRLF and no other control byte",
+                      "http_server_response_header_add_raw: refusing a %llu-byte block - every line must be \"Name: value\" or \"Name:value\""
+                      " with a token name, its own CRLF and no other control byte",
                       (unsigned long long) headers_size);
 
         trace_log_pop();
@@ -3121,7 +3169,8 @@ bool http_server_response_send_file(HTTP_Server_Response *const self, char const
 
         if (!_http_server_header_lines_valid(extra_headers, extra_headers_size)) {
             log_message_2(LOG_LEVEL_WARN, LOG_METADATA,
-                          "http_server_response_send_file: refusing '%s' - the caller's header block is not \"Name: value\" lines with token names, CRLFs and no other control byte",
+                          "http_server_response_send_file: refusing '%s' - the caller's header block is not \"Name: value\" or \"Name:value\" lines"
+                          " with token names, CRLFs and no other control byte",
                           path);
 
             trace_log_pop();
@@ -3214,6 +3263,10 @@ bool http_server_response_send_file_handle(HTTP_Server_Response *const self, Fil
     error_check_null(LOG_METADATA, "content_type", (void*) content_type);
     error_check_wrong_value(LOG_METADATA, "status_code", status_code != HTTP_SERVER_STATUS_CODE_OK && status_code != HTTP_SERVER_STATUS_CODE_PARTIAL_CONTENT);
 
+    /* Once per process, not per call: swapped with atomic_exchange so of two servers' racing
+     * first failures exactly one logs. */
+    static atomic_bool _send_buffer_cap_warned = false;
+
     /* The same guard send_2 and send_file carry: the header block goes out exactly once. */
     if (self->headers_sent) {
         log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_server_response_send_file_handle: refusing - the response headers are already sent");
@@ -3300,6 +3353,20 @@ bool http_server_response_send_file_handle(HTTP_Server_Response *const self, Fil
      * and the previous transaction's stream ended before this one was dispatched - but the
      * release is idempotent, and a take-over must never leak a handle on any path. */
     _http_server_stream_reset(&session->stream);
+
+    /* Capped once per connection, never restored: on Linux the lock is sticky and getsockopt
+     * reports double the request, so a "restore" would only re-lock at a different size. A
+     * failure is not a refusal - the headers are already on the wire - so the stream runs
+     * uncapped and the process says so once. */
+    if (!session->send_buffer_capped) {
+        Result const capped = net_socket_set_send_buffer_size((Net_Socket) lws_get_socket_fd(self->wsi), _HTTP_SERVER_FILE_STREAM_SEND_BUFFER_SIZE);
+
+        session->send_buffer_capped = true;
+
+        if (result_is_error(capped) && !atomic_exchange_explicit(&_send_buffer_cap_warned, true, memory_order_relaxed)) {
+            log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_server: SO_SNDBUF could not be capped on a streamed socket - streams on it run uncapped (logged once per process)");
+        }
+    }
 
     session->stream.file        = *file;
     session->stream.remaining   = size;

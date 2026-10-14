@@ -17,6 +17,8 @@
  * never collides with a port already in use and never accepts traffic from
  * another host. */
 
+#define _TEST_LINUX_SEND_BUFFER_FACTOR 2
+#define _TEST_SEND_BUFFER_SIZE (128 * 1024)
 #define _TEST_TIMEOUT_MS 2000
 
 static U16 _test_bound_port(Net_Socket const self) {
@@ -564,6 +566,44 @@ static void _test_timeout_setter(Test *const test) {
     test_case_end(test);
 }
 
+static void _test_send_buffer_size_setter(Test *const test) {
+    test_case_begin(test, "net_socket_set_send_buffer_size reaches SO_SNDBUF");
+
+    Net_Socket server = NET_SOCKET_INVALID;
+    Net_Socket_Address bind_address = DEFAULT_INITIALIZATION;
+
+    if (!test_expect_true(test, "server init succeeds", result_is_success(net_socket_init(&server, NET_FAMILY_IPV4, NET_TYPE_TCP)))) {
+        test_case_end(test);
+
+        return;
+    }
+
+    net_socket_address_init_2(NET_FAMILY_IPV4, 0, "127.0.0.1", &bind_address);
+    net_socket_bind(server, &bind_address);
+    net_socket_listen(server, 1);
+
+    test_expect_true(test, "send-buffer setter succeeds", result_is_success(net_socket_set_send_buffer_size(server, _TEST_SEND_BUFFER_SIZE)));
+
+    I32 stored = 0;
+    Net_Socket_Len length = (Net_Socket_Len) sizeof(stored);
+
+    test_expect_true(test, "SO_SNDBUF reads back", getsockopt(server, SOL_SOCKET, SO_SNDBUF, (char*) &stored, &length) == 0);
+
+    /* Windows stores the request literally; Linux stores double it (its bookkeeping overhead); any other
+     * POSIX kernel is only held to "at least what was asked". */
+#if defined(OS_WINDOWS)
+    test_expect_true(test, "Windows stores the requested size", stored == _TEST_SEND_BUFFER_SIZE);
+#elif defined(OS_LINUX)
+    test_expect_true(test, "Linux stores double the requested size", stored == _TEST_LINUX_SEND_BUFFER_FACTOR * _TEST_SEND_BUFFER_SIZE);
+#else
+    test_expect_true(test, "the kernel stores at least the requested size", stored >= _TEST_SEND_BUFFER_SIZE);
+#endif // OS_WINDOWS
+
+    net_socket_close(server);
+
+    test_case_end(test);
+}
+
 static void _test_resolve_localhost(Test *const test) {
     test_case_begin(test, "net_socket_address_resolve answers a usable address for \"localhost\"");
 
@@ -909,6 +949,7 @@ int main(void) {
     _test_connect_refused(&test);
     _test_nonblocking_would_block(&test);
     _test_timeout_setter(&test);
+    _test_send_buffer_size_setter(&test);
     _test_resolve_localhost(&test);
     _test_resolve_failure(&test);
     _test_ipv6_loopback_traffic(&test);

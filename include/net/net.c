@@ -495,6 +495,19 @@ Result net_socket_set_reuse_address(Net_Socket const self, bool const enabled) {
     return result == 0 ? RESULT_SUCCESS : result_from_os();
 }
 
+Result net_socket_set_send_buffer_size(Net_Socket const self, U32 const byte_count) {
+    trace_log_push(LOG_METADATA);
+
+    /* setsockopt takes a signed int: a count above I32_MAX is clamped here rather than wrapped negative,
+     * and the OS then clamps to its own maximum exactly as it would for any other oversized request. */
+    I32 const value  = byte_count > (U32) I32_MAX ? I32_MAX : (I32) byte_count;
+    I32 const result = setsockopt(self, SOL_SOCKET, SO_SNDBUF, (char const*) &value, sizeof(value));
+
+    trace_log_pop();
+
+    return result == 0 ? RESULT_SUCCESS : result_from_os();
+}
+
 Result net_socket_set_timeout(Net_Socket const self, U32 const timeout_ms) {
     trace_log_push(LOG_METADATA);
 
