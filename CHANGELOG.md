@@ -51,6 +51,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - `http/service/oauth`
 - sync: http/service/csrf
 - sync: http/service/oauth
+- http/service/oauth 0.4.1 (behaviour patch): a request header that `http_client_header_add` refuses now fails the call closed with `invalid_request` (false from revoke) before anything reaches the wire, instead of going out without the header; `state_issue_2` / `state_verify_2` check their pointer arguments before the empty-binding refusal, so a contract violation aborts instead of answering false; `Token.status` documents that `HTTP_CLIENT_STATUS_ERROR` with `response_code` 0 is a refusal that never reached the wire; the header's usage example compiles on its own again (it includes `crypto/random` and `oauth.h`).
 - http/service/oauth 0.3.0 changes the signed state token's format (provider and binding are now length-prefixed, and the _2 tiers bind the state to a caller cookie). A 0.2.x process and a 0.3.0 process sharing a key do not verify each other's states: restart a multi-process deployment all at once, or expect one TTL (600 s) of bad_state redirects during a rolling restart.
 - sync: http/service/compression
 - sync: http/service/email

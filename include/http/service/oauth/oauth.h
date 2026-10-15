@@ -1,6 +1,6 @@
 /*
  * oauth.h - HTTP OAuth 2.0 client service for the C Libraries Framework
- * @version 0.4.0
+ * @version 0.4.1
  *
  * Provides provider configuration, signed state tokens bound to a provider, a
  * TTL and the user agent that started the login, PKCE (RFC 7636)
@@ -46,6 +46,9 @@
  *
  * Usage Examples:
  *   @code
+ *   #include <crypto/random/random.h>
+ *   #include <http/service/oauth/oauth.h>
+ *
  *   HTTP_Service_OAuth oauth = DEFAULT_INITIALIZATION;
  *
  *   if (!http_service_oauth_init_1(&oauth)) { return; }
@@ -134,7 +137,9 @@
  *     sent or returned: one field over http/query's encode ceiling, or an
  *     allocator refusal, fails the whole call with error "invalid_request" (or
  *     an empty URL) rather than reaching the provider missing its code, its
- *     client_id or its state.
+ *     client_id or its state. A request header the client could not install
+ *     (Accept, Content-Type, Authorization: Bearer) fails the same way, with
+ *     "invalid_request" or false from revoke, before anything reaches the wire.
  *   - A CR or LF is refused before it can end a header line, never sanitized
  *     out of one: in an access token before "Authorization: Bearer ..." is
  *     built, and in get_authorize_url_2's verbatim `extra_params` before a URL
@@ -418,7 +423,9 @@ typedef struct {
     USize response_code;
     /** @brief Granted scope string when provided. */
     String scope;
-    /** @brief Transport outcome; the field to branch on before response_code. */
+    /** @brief Transport outcome; the field to branch on before response_code.
+     *         HTTP_CLIENT_STATUS_ERROR with response_code 0 is also what a
+     *         refusal that never reached the wire reports. */
     HTTP_Client_Status status;
     /** @brief Provider token type, usually Bearer. */
     String token_type;

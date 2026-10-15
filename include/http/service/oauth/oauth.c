@@ -4,7 +4,9 @@
 
 #include <http/service/oauth/oauth.h>
 
+#include <allocator/allocator.h>
 #include <char/char.h>
+#include <container/str/str.h>
 #include <crypto/hash/hash.h>
 #include <crypto/hmac/hmac.h>
 #include <crypto/random/random.h>
@@ -13,6 +15,7 @@
 #include <http/query/query.h>
 #include <json/json.h>
 #include <log/log.h>
+#include <memory/memory.h>
 
 /*==============================================================================
  * MARK: - Constants
@@ -784,8 +787,23 @@ static HTTP_Service_OAuth_Token _http_service_oauth_send_token_request(HTTP_Serv
     /* GitHub's token endpoint answers application/x-www-form-urlencoded unless this header is
      * present, which json_from_4 cannot parse - so the exchange "succeeded" with an empty
      * access token and no error anywhere. Google ignores it. */
-    http_client_header_add(client, "Accept: application/json");
-    http_client_header_add(client, "Content-Type: application/x-www-form-urlencoded");
+    bool const sent = http_client_header_add(client, "Accept: application/json") && http_client_header_add(client, "Content-Type: application/x-www-form-urlencoded");
+
+    /* A dropped Accept is the GitHub shape above: a form-encoded answer nobody can parse, reported
+     * as an empty token with no error. Refused before the wire in the module's own refusal shape. */
+    if (!sent) {
+        log_message_1(LOG_LEVEL_ERROR, "oauth: token request to %s headers incomplete - not sent\n", url);
+
+        _http_service_oauth_string_add(&token.error, "invalid_request");
+
+        string_uninit(&response);
+        http_client_header_clear(client);
+        http_client_delete(&client);
+
+        trace_log_pop();
+
+        return token;
+    }
 
     HTTP_Client_Result result = http_client_post_4(client, url, payload, &response);
 
@@ -1631,8 +1649,25 @@ HTTP_Service_OAuth_Profile http_service_oauth_get_profile_2(HTTP_Service_OAuth *
     _http_service_oauth_string_add(&header, "Authorization: Bearer ");
     _http_service_oauth_string_add(&header, access_token);
 
-    http_client_header_add(client, string_get_data(&header));
-    http_client_header_add(client, "Accept: application/json");
+    bool const sent = http_client_header_add(client, string_get_data(&header)) && http_client_header_add(client, "Accept: application/json");
+
+    // A dropped Authorization header would send the GET unauthenticated and read as "bad token".
+    if (!sent) {
+        log_message_1(LOG_LEVEL_ERROR, "oauth: provider=%s profile request headers incomplete - not sent\n", provider);
+
+        _http_service_oauth_string_add(&profile.error, "invalid_request");
+
+        string_uninit(&response);
+        string_uninit(&header);
+        http_client_header_clear(client);
+        http_client_delete(&client);
+
+        _http_service_oauth_row_uninit(&row);
+
+        trace_log_pop();
+
+        return profile;
+    }
 
     HTTP_Client_Result result = http_client_get(client, _http_service_oauth_str_text(&row.profile_url), &response);
 
@@ -2050,7 +2085,22 @@ bool http_service_oauth_revoke_2(HTTP_Service_OAuth *const self, char const *con
         return false;
     }
 
-    http_client_header_add(client, "Content-Type: application/x-www-form-urlencoded");
+    bool const sent = http_client_header_add(client, "Content-Type: application/x-www-form-urlencoded");
+
+    if (!sent) {
+        log_message_1(LOG_LEVEL_ERROR, "oauth: provider=%s revoke request headers incomplete - not sent\n", provider);
+
+        string_uninit(&response);
+        string_uninit(&payload);
+        http_client_header_clear(client);
+        http_client_delete(&client);
+
+        _http_service_oauth_row_uninit(&row);
+
+        trace_log_pop();
+
+        return false;
+    }
 
     HTTP_Client_Result result = http_client_post_4(client, revoke_url, &payload, &response);
 
@@ -2077,14 +2127,24 @@ bool http_service_oauth_state_issue_1(HTTP_Service_OAuth *const self, char const
 
 bool http_service_oauth_state_issue_2(HTTP_Service_OAuth *const self, char const *const provider, char const *const binding, USize const binding_size, USize const ttl_seconds,
     char *const out) {
-    /* An EMPTY binding is refused here, by value, before anything else: with it this tier would
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+    error_check_null(LOG_METADATA, "provider", (void*) provider);
+    error_check_null(LOG_METADATA, "out", (void*) out);
+
+    /* An EMPTY binding is refused here, by value, before the core: with it this tier would
      * mint exactly what _1 mints, a state any browser's callback can redeem, and a _2 route
      * reaches that only through a bug - a /start that lost its cookie value. The _2 tier is the
      * login-CSRF defence, so it never degrades to the tier that is not; a caller that genuinely
      * has no binding calls _1 and accepts what that means. */
     if (binding_size == 0) {
+        trace_log_pop();
+
         return false;
     }
+
+    trace_log_pop();
 
     return _http_service_oauth_state_issue(self, provider, binding, binding_size, ttl_seconds, out);
 }
@@ -2094,12 +2154,21 @@ bool http_service_oauth_state_verify_1(HTTP_Service_OAuth *const self, char cons
 }
 
 bool http_service_oauth_state_verify_2(HTTP_Service_OAuth *const self, char const *const provider, char const *const binding, USize const binding_size, char const *const state) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+    error_check_null(LOG_METADATA, "provider", (void*) provider);
+
     /* The empty binding is refused by value, as at issue: a callback that lost its cookie is the
      * attack posture (the attacker's planted state, a victim's browser with nothing to bind it
      * to), and must fail by construction rather than fall through to the _1 tier's answer. */
     if (binding_size == 0) {
+        trace_log_pop();
+
         return false;
     }
+
+    trace_log_pop();
 
     return _http_service_oauth_state_verify(self, provider, binding, binding_size, state);
 }

@@ -32,6 +32,8 @@
  *
  * No network beyond loopback; every port is OS-assigned; every wait is timeout-bounded.
  */
+#include <setjmp.h>
+#include <signal.h>
 #include <stdio.h>
 
 #include <chrono/chrono.h>
@@ -39,6 +41,7 @@
 #include <http/query/query.h>
 #include <http/service/oauth/oauth.h>
 #include <test/test.h>
+#include <tracelog/tracelog.h>
 
 #include <fixture.h>
 
@@ -1654,6 +1657,88 @@ static void _test_revoke_paths(Test *const test) {
 }
 
 /*==============================================================================
+ * MARK: - Cases - state _2 gate order
+ *============================================================================*/
+
+/* glibc delivers a signal() handler with SIGABRT blocked and a plain setjmp does not save the
+ * mask, so the second caught abort would end the run; sigsetjmp(..., 1) restores it. MinGW has
+ * no sigsetjmp, and UCRT's one-shot handler runs with nothing blocked, so setjmp suffices. */
+#ifdef _WIN32
+#define _ABORT_PROBE_JUMP_BUFFER      jmp_buf
+#define _ABORT_PROBE_LONGJMP(buffer)  longjmp(buffer, 1)
+#define _ABORT_PROBE_SETJMP(buffer)   setjmp(buffer)
+#else
+#define _ABORT_PROBE_JUMP_BUFFER      sigjmp_buf
+#define _ABORT_PROBE_LONGJMP(buffer)  siglongjmp(buffer, 1)
+#define _ABORT_PROBE_SETJMP(buffer)   sigsetjmp(buffer, 1)
+#endif
+
+static _ABORT_PROBE_JUMP_BUFFER _abort_probe_jump;
+
+static void _abort_probe_handler(int const signal_number) {
+    (void) signal_number;
+
+    _ABORT_PROBE_LONGJMP(_abort_probe_jump);
+}
+
+/* Runs one state _2 call that carries an EMPTY binding (the by-value refusal) together with a
+ * contract violation (a null self, provider or out) and answers whether the process tried to
+ * abort. The contract checks run FIRST, so the violation must win over the refusal: were the
+ * `binding_size == 0` test back in front, the call would quietly answer false. SIGABRT is
+ * caught and jumped out of, which is safe here because error_check_null aborts after the log
+ * call has returned (no lock is held) and before the instance is touched; the only state the
+ * jump skips is the call's own trace frame, which is popped back to the depth recorded here. */
+static bool _state_2_aborts(bool const issue, bool const null_self, bool const null_provider, bool const null_out) {
+    HTTP_Service_OAuth  oauth  = DEFAULT_INITIALIZATION;
+    char                out[HTTP_SERVICE_OAUTH_STATE_MAX_SIZE + 1] = DEFAULT_INITIALIZATION;
+    bool                aborted = false;
+
+    http_service_oauth_init_1(&oauth);
+
+    HTTP_Service_OAuth *const self     = null_self ? nullptr : &oauth;
+    char const *const         provider = null_provider ? nullptr : "google";
+
+    USize const trace_depth = trace_log_depth();
+
+    void (*const previous)(int) = signal(SIGABRT, _abort_probe_handler);
+
+    if (_ABORT_PROBE_SETJMP(_abort_probe_jump) == 0) {
+        if (issue) {
+            http_service_oauth_state_issue_2(self, provider, "", 0, 600, null_out ? nullptr : out);
+        } else {
+            http_service_oauth_state_verify_2(self, provider, "", 0, null_out ? nullptr : out);
+        }
+    } else {
+        aborted = true;
+    }
+
+    signal(SIGABRT, previous);
+
+    while (trace_log_depth() > trace_depth) {
+        trace_log_pop();
+    }
+
+    http_service_oauth_uninit(&oauth);
+
+    return aborted;
+}
+
+static void _test_state_2_contract_checks_precede_the_binding_refusal(Test *const test) {
+    test_case_begin(test, "state _2: the contract checks run BEFORE the empty-binding refusal");
+
+    test_expect_false(test, "control: valid arguments and an empty binding abort nothing (issue)", _state_2_aborts(true, false, false, false));
+    test_expect_false(test, "control: valid arguments and an empty binding abort nothing (verify)", _state_2_aborts(false, false, false, false));
+
+    test_expect_true(test, "a null self with an empty binding aborts at issue", _state_2_aborts(true, true, false, false));
+    test_expect_true(test, "and at verify", _state_2_aborts(false, true, false, false));
+    test_expect_true(test, "a null provider with an empty binding aborts at issue", _state_2_aborts(true, false, true, false));
+    test_expect_true(test, "and at verify", _state_2_aborts(false, false, true, false));
+    test_expect_true(test, "a null out with an empty binding aborts at issue", _state_2_aborts(true, false, false, true));
+
+    test_case_end(test);
+}
+
+/*==============================================================================
  * MARK: - Entry point
  *============================================================================*/
 
@@ -1690,6 +1775,7 @@ int main(void) {
     _test_exchange_closed_port(&test);
     _test_unknown_provider_and_empty_code(&test);
     _test_null_data_parameters_refuse_rather_than_abort(&test);
+    _test_state_2_contract_checks_precede_the_binding_refusal(&test);
     _test_line_breaks_and_oversized_values_fail_the_call(&test);
     _test_stall_does_not_block_other_calls(&test);
     _test_profile_bearer_and_numeric_id(&test);

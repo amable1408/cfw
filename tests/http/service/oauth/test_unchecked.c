@@ -457,6 +457,12 @@ static void _test_state_and_pkce_refuse_rather_than_abort(Test *const test) {
     test_expect_false(test, "and a null one with size 0", http_service_oauth_state_verify_2(&oauth, "google", nullptr, 0, state));
     test_expect_false(test, "and at _2 issue", http_service_oauth_state_issue_2(&oauth, "google", nullptr, 0, 600, bound));
 
+    /* With the contract checks compiled out, the checks-first gate order leaves the by-value
+     * answer unchanged: a null self AND an empty binding is still a refusal, not a crash. (That
+     * the checked build ABORTS instead is pinned in test_all.c, the only place it is observable.) */
+    test_expect_false(test, "a null self with an empty binding is a plain refusal at _2 issue", http_service_oauth_state_issue_2(nullptr, "google", "", 0, 600, bound));
+    test_expect_false(test, "and at _2 verify", http_service_oauth_state_verify_2(nullptr, "google", "", 0, bound));
+
     // The provider is bounded by value on the state paths too, so a route parameter never sizes the MAC scratch.
     char long_provider[HTTP_SERVICE_OAUTH_STATE_BINDING_MAX_SIZE + 2] = DEFAULT_INITIALIZATION;
 
