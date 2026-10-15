@@ -82,21 +82,6 @@ static bool _http_service_traceparent_id_create(char *const out, USize const byt
     return true;
 }
 
-static void _http_service_traceparent_string_add(String *const self, char const *const data) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "self", (void*) self);
-    error_check_null(LOG_METADATA, "data", (void*) data);
-
-    USize const data_size = char_length(data);
-
-    if (data_size > 0) {
-        string_add_last_2(self, (char*) data, data_size);
-    }
-
-    trace_log_pop();
-}
-
 /* Carried verbatim, but never unbounded: a hop that forwards whatever arrives is an
  * amplifier, and a control byte in a forwarded header is a header break. */
 static bool _http_service_traceparent_tracestate_valid(char const *const data, USize const data_size) {
@@ -177,7 +162,8 @@ static void _http_service_traceparent_tracestate_set(HTTP_Service_Traceparent_Co
     }
 
     if (!_http_service_traceparent_tracestate_valid(tracestate, tracestate_size)) {
-        log_message_2(LOG_LEVEL_WARN, LOG_METADATA,
+        /* DEBUG, never WARN: this is network input, and a peer can make the log fill at will. */
+        log_message_2(LOG_LEVEL_DEBUG, LOG_METADATA,
             "http_service_traceparent: inbound tracestate dropped - over %d bytes, over %d members, or carrying a control byte",
             HTTP_SERVICE_TRACEPARENT_TRACESTATE_MAX_SIZE, HTTP_SERVICE_TRACEPARENT_TRACESTATE_MAX_MEMBERS);
 
@@ -408,6 +394,8 @@ String http_service_traceparent_header_create(HTTP_Service_Traceparent const *co
     char value[HTTP_SERVICE_TRACEPARENT_VALUE_CAPACITY] = DEFAULT_INITIALIZATION;
 
     if (!http_service_traceparent_value_write_1(context, value)) {
+        log_message_2(LOG_LEVEL_DEBUG, LOG_METADATA, "http_service_traceparent: the context is invalid - an empty block is emitted instead");
+
         trace_log_pop();
 
         return header;
@@ -421,10 +409,10 @@ String http_service_traceparent_header_create(HTTP_Service_Traceparent const *co
     USize expected = header_name_size + CHAR_STATIC_SIZE(": ") +
         HTTP_SERVICE_TRACEPARENT_VALUE_SIZE + CHAR_STATIC_SIZE("\r\n");
 
-    _http_service_traceparent_string_add(&header, self->header_name);
-    _http_service_traceparent_string_add(&header, ": ");
-    _http_service_traceparent_string_add(&header, value);
-    _http_service_traceparent_string_add(&header, "\r\n");
+    string_add_last_2(&header, self->header_name, header_name_size);
+    string_add_last_2(&header, ": ", CHAR_STATIC_SIZE(": "));
+    string_add_last_2(&header, value, HTTP_SERVICE_TRACEPARENT_VALUE_SIZE);
+    string_add_last_2(&header, "\r\n", CHAR_STATIC_SIZE("\r\n"));
 
     /* The tracestate line always carries the SPEC name: the header_name knob renames the
      * traceparent only, and a peer looking for vendor state looks for "tracestate". */
@@ -442,10 +430,10 @@ String http_service_traceparent_header_create(HTTP_Service_Traceparent const *co
         expected += CHAR_STATIC_SIZE(HTTP_SERVICE_TRACEPARENT_TRACESTATE_HEADER_NAME) + CHAR_STATIC_SIZE(": ") +
             tracestate_size + CHAR_STATIC_SIZE("\r\n");
 
-        _http_service_traceparent_string_add(&header, HTTP_SERVICE_TRACEPARENT_TRACESTATE_HEADER_NAME);
-        _http_service_traceparent_string_add(&header, ": ");
-        _http_service_traceparent_string_add(&header, context->tracestate);
-        _http_service_traceparent_string_add(&header, "\r\n");
+        string_add_last_2(&header, HTTP_SERVICE_TRACEPARENT_TRACESTATE_HEADER_NAME, CHAR_STATIC_SIZE(HTTP_SERVICE_TRACEPARENT_TRACESTATE_HEADER_NAME));
+        string_add_last_2(&header, ": ", CHAR_STATIC_SIZE(": "));
+        string_add_last_2(&header, context->tracestate, tracestate_size);
+        string_add_last_2(&header, "\r\n", CHAR_STATIC_SIZE("\r\n"));
     }
 
     if (string_get_size(&header) != expected) {
@@ -577,6 +565,8 @@ String http_service_traceparent_value_create(HTTP_Service_Traceparent const *con
     char buffer[HTTP_SERVICE_TRACEPARENT_VALUE_CAPACITY] = DEFAULT_INITIALIZATION;
 
     if (!http_service_traceparent_value_write_1(context, buffer)) {
+        log_message_2(LOG_LEVEL_DEBUG, LOG_METADATA, "http_service_traceparent: the context is invalid - an empty String is returned instead");
+
         trace_log_pop();
 
         return value;

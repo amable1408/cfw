@@ -306,7 +306,19 @@ static void _test_security_create_rechecks_public_fields(Test *const test) {
 
     policy.content_security_policy = string_init_3(hostile);
 
+    char        log_buffer[512]   = DEFAULT_INITIALIZATION;
+    LogLevel const previous_level = log_get_level();
+
+    log_set_level(LOG_LEVEL_WARN);
+    log_set_buffer(log_buffer, sizeof(log_buffer));
+
     String block = http_headers_security_create_2(&policy);
+
+    test_expect_true(test, "the WARN names the refused field", char_contains_1(log_buffer, "content_security_policy"));
+    test_expect_false(test, "and never echoes the hostile value", char_contains_1(log_buffer, "X-Evil"));
+
+    log_set_buffer(nullptr, 0);
+    log_set_level(previous_level);
 
     test_expect_true(test, "a directly-written hostile CSP loses its line", string_find_count_1(&block, "Content-Security-Policy") == 0);
     test_expect_true(test, "no injected line leaks", string_find_count_1(&block, "X-Evil") == 0);

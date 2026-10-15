@@ -403,6 +403,68 @@ static void _test_child(Test *const test) {
     test_case_end(test);
 }
 
+static void _test_inbound_tracestate_drop_is_debug(Test *const test) {
+    test_case_begin(test, "log level: a dropped inbound tracestate is DEBUG, an invalid context's empty block is DEBUG");
+
+    HTTP_Service_Traceparent         trace      = DEFAULT_INITIALIZATION;
+    HTTP_Service_Traceparent_Context context   = DEFAULT_INITIALIZATION;
+    char                             crowded[HTTP_SERVICE_TRACEPARENT_TRACESTATE_CAPACITY] = DEFAULT_INITIALIZATION;
+    char                             log_buffer[512] = DEFAULT_INITIALIZATION;
+    LogLevel const                   previous_level  = log_get_level();
+    USize                            used            = 0;
+
+    test_expect_true(test, "init_1 succeeds", http_service_traceparent_init_1(&trace));
+
+    for (USize index = 0; index < HTTP_SERVICE_TRACEPARENT_TRACESTATE_MAX_MEMBERS + 1; index += 1) {
+        used += (USize) snprintf(crowded + used, sizeof(crowded) - used, index == 0 ? "a%u=1" : ",a%u=1", (unsigned) index);
+    }
+
+    log_set_level(LOG_LEVEL_WARN);
+    log_set_buffer(log_buffer, sizeof(log_buffer));
+
+    test_expect_true(test, "a 33-member tracestate still yields a child (the state is dropped, not the trace)", http_service_traceparent_child_create_2(&trace, _GOLDEN, crowded, &context));
+    test_expect_true(test, "and the tracestate is empty", context.tracestate[0] == '\0');
+    test_expect_true(test, "a dropped inbound tracestate never logs at WARN", char_length(log_buffer) == 0);
+
+    log_set_level(LOG_LEVEL_DEBUG);
+    memset(log_buffer, 0, sizeof(log_buffer));
+    log_set_buffer(log_buffer, sizeof(log_buffer));
+
+    test_expect_true(test, "the same input again still yields a child", http_service_traceparent_child_create_2(&trace, _GOLDEN, crowded, &context));
+    test_expect_true(test, "and the drop is visible at DEBUG", char_contains_1(log_buffer, "inbound tracestate dropped"));
+
+    memset(log_buffer, 0, sizeof(log_buffer));
+    log_set_buffer(log_buffer, sizeof(log_buffer));
+
+    test_expect_true(test, "a valid parse builds a context", http_service_traceparent_context_parse_2(&trace, _GOLDEN, nullptr, &context));
+
+    context.trace_id[0] = 'A';
+
+    String header = http_service_traceparent_header_create(&trace, &context);
+
+    test_expect_true(test, "an invalid (uppercase) context yields the empty block", string_get_size(&header) == 0);
+    test_expect_true(test, "and says why at DEBUG", char_contains_1(log_buffer, "the context is invalid"));
+
+    string_uninit(&header);
+
+    memset(log_buffer, 0, sizeof(log_buffer));
+    log_set_buffer(log_buffer, sizeof(log_buffer));
+
+    String value = http_service_traceparent_value_create(&trace, &context);
+
+    test_expect_true(test, "value_create yields the empty String", string_get_size(&value) == 0);
+    test_expect_true(test, "and says why at DEBUG", char_contains_1(log_buffer, "the context is invalid"));
+
+    string_uninit(&value);
+
+    log_set_buffer(nullptr, 0);
+    log_set_level(previous_level);
+
+    http_service_traceparent_uninit(&trace);
+
+    test_case_end(test);
+}
+
 static void _test_tracestate_hand_filled(Test *const test) {
     test_case_begin(test, "tracestate: a hand-filled context is re-checked at header_create");
 
@@ -822,6 +884,7 @@ I32 main(void) {
     _test_forward_compatibility(&test);
     _test_child(&test);
     _test_tracestate(&test);
+    _test_inbound_tracestate_drop_is_debug(&test);
     _test_tracestate_hand_filled(&test);
     _test_flags_round_trip(&test);
     _test_header_name(&test);

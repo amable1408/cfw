@@ -94,6 +94,9 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - sync: http/query, http/service/body_parser
 - http/query 0.4.1: documentation - the `http_query_next` '?'-skip recipe adjusts the size too; no char*-key twin of `http_query_find` is planned (spell a literal key with `CHAR_STATIC_SIZE`); the zero-allocation tier's `(nullptr, 0)` empty versus the alloc tier's null refusal stated once; the Error Handling text names `alloc_decode_2` / `alloc_form_decode_2`.
 - http/service/body_parser 0.3.1 (first version marker): an urlencoded pair with an empty key is skipped before any allocation; dependencies listed in full.
+- sync: http/headers, http/service/traceparent
+- http/service/traceparent 0.3.2: an inbound `tracestate` dropped for its size, member count or a control byte is logged at DEBUG, not WARN (it is network input; a hand-filled context's bad tracestate or header_name still WARNs); an invalid context now leaves a DEBUG line beside its empty block / empty String; the header block is assembled from the sizes already measured (the private re-measuring helper is gone); docs state the omission-grain rule once and that `context_valid` measures inside the arrays.
+- http/headers 0.4.2: documentation - family section labels, the layout note names `string.h`, Error Handling cross-references the grain rule; the `create_2` control-byte WARN is pinned to name the field and never echo the value.
 
 ## 0.2.0 - release
 

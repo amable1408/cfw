@@ -1,6 +1,6 @@
 /*
  * headers.h - HTTP header helpers for the C Libraries Framework
- * @version 0.4.1
+ * @version 0.4.2
  *
  * Builds common response headers: Cache-Control, Content-*, and browser
  * security policy headers.
@@ -40,16 +40,21 @@
  *     EMPTY.
  *   - http_headers_token_valid_1/_2 answer a bool about DATA and never abort on the value: an
  *     empty value is a legal value, answered false. Only a null pointer is a programming error.
+ *   - The grain rule, stated here for the family (traceparent.h cites it): the failure channel
+ *     decides the grain of a REFUSAL - a caller-side fault; inbound data follows each module's
+ *     own data bullets. A function that answers bool refuses WHOLE; a String builder omits the
+ *     SMALLEST unit whose absence still leaves a well-formed, spec-meaningful block; a by-value
+ *     init substitutes EMPTY per field.
  *
  * Thread Safety:
  *   - Stateless builders are thread-safe.
  *   - Shared configuration structs require caller synchronization.
  *
- * Memory:
+ * Memory Management:
  *   - Returned String values must be uninitialized by caller.
  *   - Arena variants return String storage owned by the provided arena.
  *
- * Performance:
+ * Performance Characteristics:
  *   - Builders append into mutable String values.
  *
  * Dependencies:
@@ -89,7 +94,7 @@
  *
  * @note allocator is unconditional: the Arena type is always declared and this member is
  *       never gated. Layout is uniform across the build only because ARENA_IMPLEMENTATION is a
- *       whole-build flag: the embedded String type keeps ITS allocator member behind that flag,
+ *       whole-build flag: the embedded String type (string.h) keeps ITS allocator member behind that flag,
  *       so one TU compiled without it would not agree with the rest.
  */
 typedef struct {

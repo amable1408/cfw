@@ -1,6 +1,6 @@
 /*
  * traceparent.h - HTTP traceparent service for the C Libraries Framework
- * @version 0.3.1
+ * @version 0.3.2
  *
  * Creates, validates, and propagates W3C Trace Context traceparent (and tracestate)
  * values. The service stays transport-focused and does not depend on logging,
@@ -72,6 +72,15 @@
  *     an untraced request is a fact the caller has to be able to see.
  *   - Invalid incoming values are answered false with a ZEROED context, never an abort -
  *     these bytes come off the network.
+ *   - The grain of a REFUSAL (a caller-side fault - inbound data follows the bullet above) is
+ *     the family rule headers.h Error Handling states: here a bad header_name costs the whole
+ *     block and a bad tracestate only its one line - the smallest unit whose absence still
+ *     leaves a spec-meaningful block.
+ *   - Log levels follow the source of the fault: an inbound tracestate dropped for size,
+ *     member count or a control byte is logged at DEBUG (it is network input), while a
+ *     hand-filled context's bad tracestate or a bad header_name logs WARN (programmer error).
+ *     An invalid context yields the empty block or String with a DEBUG line - its usual
+ *     cause, a refused CSPRNG, already logged its WARN at creation.
  *
  * Thread Safety:
  *   - The service is read-only after init, so concurrent use of one const instance is
@@ -274,7 +283,8 @@ bool http_service_traceparent_context_sampled(HTTP_Service_Traceparent_Context c
 /**
  * @brief Check whether a context has valid trace and parent ids.
  * @param self Traceparent context.
- * @return true when valid.
+ * @return true when valid. Measures INSIDE the arrays, so a hand-filled context whose
+ *         trace_id or parent_id is unterminated answers false and is never over-read.
  */
 bool http_service_traceparent_context_valid(HTTP_Service_Traceparent_Context const *const self);
 
