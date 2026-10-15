@@ -37,6 +37,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - sync: http/cookie, http/query
 - `http/service/permission`
 - sync: http/client
+- http/client 0.6.0: `http_client_response_body_clear` empties the handle-owned response body, for a caller that refuses a send of its own (an empty or unwritable message) and would otherwise leave the PREVIOUS reply readable through `http_client_response_body` as if it were this one; the last-response status and headers, and any caller-owned `response`, are untouched.
 - `http/service/captcha`
 - `http/service/traceparent`
 - `http/service/auth`

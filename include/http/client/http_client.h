@@ -3,7 +3,7 @@
  *  --------------------------------------------------------------------------
  *  @file    http_client.h
  *  @brief   Blocking HTTP client wrapper over libcurl, behind an opaque, reusable handle.
- *  @version 0.5.1
+ *  @version 0.6.0
  *  @license MIT (see LICENSE file)
  *
  *  General-purpose (no project coupling). Wraps one libcurl easy handle per
@@ -107,8 +107,10 @@
  *       bytes); the request clears the view first, scrubbing the old payload. When it does
  *       not, string_try_reserve PROMOTES the view into the arena: read the body via
  *       string_get_data, never from the viewed buffer, which the request leaves untouched
- *       and which never holds the body. A request refused before any I/O clears nothing, so
- *       a refusal never scrubs a caller's buffer. A heap view (string_init_4) skips the
+ *       and which never holds the body. A request refused before any I/O resets the
+ *       last-response status and headers but clears NO body (the handle's own one included -
+ *       http_client_response_body_clear is the caller's tool for that), so a refusal never
+ *       scrubs a caller's buffer. A heap view (string_init_4) skips the
  *       arena path and grows through the heap, which keeps the tree's abort-on-OOM contract.
  *     - The Result's error text is copied into the same arena when it fits, and falls
  *       back to the HEAP when it does not (a full or refused arena) - its
@@ -516,11 +518,26 @@ HTTP_Client_Result http_client_request_delete(HTTP_Client *const self, char cons
  *
  * Populated only by a request called with `response` nullptr; otherwise reflects
  * whatever the last such call left behind (empty for a fresh handle). Valid
- * until the next request on this handle or until the handle is deleted.
+ * until the next request on this handle, until http_client_response_body_clear, or
+ * until the handle is deleted.
  * @param self HTTP client handle.
  * @return The handle's own body buffer.
  */
 String const* http_client_response_body(HTTP_Client const *const self);
+
+/**
+ * @brief Empty this handle's own response body - the body only.
+ *
+ * A request refused before any I/O clears no body, so a caller that refuses a
+ * send of its own (an empty or unwritable message) would otherwise leave the
+ * PREVIOUS reply readable through http_client_response_body as if it were this
+ * one. Empties only the handle-owned body: the last-response status and headers
+ * stay what the last exchange made them (true facts, and the body is the only
+ * channel a refusing caller re-exposes as "this turn's answer"), and any
+ * caller-owned `response` is untouched. A no-op on an empty body.
+ * @param self HTTP client handle.
+ */
+void http_client_response_body_clear(HTTP_Client *const self);
 
 /**
  * @brief Find a header of the most recent response on this handle.

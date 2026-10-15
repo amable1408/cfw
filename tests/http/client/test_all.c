@@ -2410,6 +2410,46 @@ static void _test_user_agent_over_libcurl_limit_restores_default(Test *const tes
     test_case_end(test);
 }
 
+/* 0.6.0: a caller that refuses a send of its own must be able to empty the handle-owned
+ * body, or the PREVIOUS reply stays readable as if it were this one. */
+static void _test_response_body_clear_empties_the_handle_body(Test *const test) {
+    test_case_begin(test, "response_body_clear: the handle-owned body is emptied; status and headers stay");
+
+    Fixture_Server server = DEFAULT_INITIALIZATION;
+    server.script = FIXTURE_SCRIPT_OK;
+
+    if (!_start(test, &server)) {
+        test_case_end(test);
+
+        return;
+    }
+
+    char url[64] = DEFAULT_INITIALIZATION;
+    _url_for(fixture_server_port(&server), "/", url, sizeof(url));
+
+    HTTP_Client *client = http_client_new();
+    HTTP_Client_Result result = http_client_get(client, url, nullptr);
+
+    test_expect_string(test, "the handle's own body holds the reply", "ok-body-content", string_get_data(http_client_response_body(client)));
+
+    http_client_response_body_clear(client);
+
+    test_expect_u(test, "response_body_clear empties the handle's own body", 0, string_get_size(http_client_response_body(client)));
+    test_expect_u(test, "the last-response status is untouched", 200, http_client_response_status(client));
+    test_expect_true(test, "the last-response headers are untouched", http_client_response_header_find(client, "X-DUP") != nullptr);
+
+    http_client_response_body_clear(client);
+
+    test_expect_u(test, "a second clear on an empty body is a no-op", 0, string_get_size(http_client_response_body(client)));
+
+    http_client_result_uninit(&result);
+    http_client_delete(&client);
+    fixture_server_join(&server);
+    string_uninit(&server.request_body);
+
+    test_case_end(test);
+}
+
 /* ── entry point ──────────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -2469,6 +2509,7 @@ int main(void) {
     _test_arena_result_error_full_arena_falls_back_to_heap(&test);
     _test_header_injection_refused_and_header_add_2(&test);
     _test_user_agent_over_libcurl_limit_restores_default(&test);
+    _test_response_body_clear_empties_the_handle_body(&test);
 
     test_suite_end(&test);
 

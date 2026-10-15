@@ -1101,6 +1101,16 @@ String const* http_client_response_body(HTTP_Client const *const self) {
     return &self->response_body;
 }
 
+void http_client_response_body_clear(HTTP_Client *const self) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+
+    string_clear(&self->response_body);
+
+    trace_log_pop();
+}
+
 char const* http_client_response_header_find(HTTP_Client const *const self, char const *const name) {
     trace_log_push(LOG_METADATA);
 
