@@ -48,6 +48,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - `http/service/cors`
 - `http/service/csrf`
 - sync: process
+- process (tests only): the stdout-flood timeout pin gives the paced child a 1 s deadline instead of 100 ms, so a cold sanitizer-instrumented child on a shared CI runner can start and write once before the parent kills it; the 64 MiB limit stays unreachable inside the window by the flooder's own pacing (at most 4 MiB a second).
 - `http/service/email`
 - `http/service/oauth`
 - sync: http/service/csrf

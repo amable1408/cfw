@@ -907,13 +907,15 @@ static void _test_timeout_under_output_pressure(Test *const test) {
 
     /* The child is the PACED flooder, and that is what GUARANTEES the ordering: it writes one
      * 4 KiB chunk per 1 ms sleep, and a sleep is a floor no scheduler returns from early, so no
-     * machine can push more than ~4 MiB a second into this pipe. A 100 ms deadline therefore
-     * admits a few hundred kilobytes at most - the 64 MiB limit is unreachable inside the window
-     * on any hardware, by construction, rather than by a bet on how fast a pipe happens to be.
-     * The limit still ends a run that IGNORES the deadline, because the flood never stops, so
-     * this case keeps every bit of its grip on the defect it was written for. */
+     * machine can push more than ~4 MiB a second into this pipe. A 1 s deadline therefore
+     * admits 4 MiB at most - the 64 MiB limit is unreachable inside the window on any hardware,
+     * by construction, rather than by a bet on how fast a pipe happens to be. The limit still
+     * ends a run that IGNORES the deadline, because the flood never stops, so this case keeps
+     * every bit of its grip on the defect it was written for. The deadline also has a LOWER
+     * bound: it must leave a cold, sanitizer-instrumented child time to start and write once,
+     * or the last assertion reads an empty capture - 100 ms did not on a shared CI runner. */
     char const *const argv[] = { _program, "--child-flood-paced", nullptr };
-    ProcessSpec const spec = { .argv = argv, .output_limit = 64U * 1024U * 1024U, .timeout_milliseconds = 100 };
+    ProcessSpec const spec = { .argv = argv, .output_limit = 64U * 1024U * 1024U, .timeout_milliseconds = 1000 };
     ProcessOutcome outcome = DEFAULT_INITIALIZATION;
     U64 const started = _test_now_milliseconds();
     Result const result = process_run(spec, &outcome);
@@ -921,7 +923,7 @@ static void _test_timeout_under_output_pressure(Test *const test) {
 
     test_expect_true(test, "process_run succeeds (the deadline is the caller's ask)", result_is_success(result));
     test_expect_i(test, "ended == TIMED_OUT, not KILLED at the output limit", (I32) PROCESS_ENDED_TIMED_OUT, (I32) outcome.ended);
-    test_expect_true(test, "and promptly - not after 64 MiB of flood", elapsed < 1000);
+    test_expect_true(test, "and promptly - not after 64 MiB of flood (16 s at the pace)", elapsed < 4000);
     test_expect_true(test, "the capture holds what arrived before the deadline", outcome.output_size > 0);
 
     process_outcome_uninit(&outcome);
