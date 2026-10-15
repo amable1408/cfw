@@ -3,7 +3,7 @@
  *  --------------------------------------------------------------------------
  *  @file    query.h
  *  @brief   Pure parsers and builders for URL query strings and percent-encoded values.
- *  @version 0.4.0
+ *  @version 0.4.1
  *  @license MIT (see LICENSE file)
  *
  *  General-purpose (no project coupling). Extracts a raw value for a key from a
@@ -93,13 +93,15 @@
  *
  *  Error Handling:
  *    - Contract violations - a null Str or String key handle to _3/_4, or a
- *      null out_size to decode_2/form_decode_2 - go through error_check_null,
- *      which LOGS AND ABORTS the process.
+ *      null out_size to alloc_decode_2/alloc_form_decode_2 - go through
+ *      error_check_null, which LOGS AND ABORTS the process.
  *    - The zero-allocation tier (0.4.0) aborts through error_check_null on its
  *      CONTRACT pointers only: a null cursor/out_name/out_value, and a null
  *      query, key, dest or encoded while its paired size says bytes live there.
  *      Every size is a value: a zero-size query, key, dest or encoded may be
- *      null. Its refusals are values too - http_query_next answers false once
+ *      null - `(nullptr, 0)` is a legal empty here, unlike the allocating
+ *      tier, where http_query_alloc_decode_2 / http_query_alloc_form_decode_2
+ *      refuse a null encoded pointer whatever its size says. Its refusals are values too - http_query_next answers false once
  *      no pair is left, http_query_find false for an absent key, and
  *      http_query_decode USIZE_MAX (with dest[0] = '\0' when dest_size > 0)
  *      for a dest that cannot hold the whole decoded value plus terminator.
@@ -128,7 +130,8 @@
  *      an empty value against a missing key. A key_size larger than the key's
  *      own NUL-terminated length is bounded by the key's real extent, never
  *      read past it. http_query_alloc_decode(_2)/form_decode(_2) refuse the
- *      same way on a null encoded pointer ONLY: an empty encoded ("", or a
+ *      same way on a null encoded pointer ONLY (the cross-tier contrast with
+ *      the zero-allocation tier's `(nullptr, 0)` is stated above): an empty encoded ("", or a
  *      zero encoded_size) is a legal VALUE and answers an empty,
  *      arena-allocated "" (never nullptr), the sized twins included; a malformed "%" escape (not two
  *      hex digits, or fewer than two bytes left) passes through as literal,
@@ -359,7 +362,8 @@ bool http_query_encode_2(String *const out, char const *const value, USize const
 /**
  * @brief Find a key's raw (not decoded) value in a sized query string without allocating,
  *        answering it as a VIEW slice. Same match as http_query_alloc_get_5, but a
- *        present-but-empty "key=" is told apart from an absent key.
+ *        present-but-empty "key=" is told apart from an absent key. No char*-key twin
+ *        is planned: a literal key is spelled with CHAR_STATIC_SIZE("kind").
  * @param query      Query bytes, not necessarily NUL-terminated. Read up to query_size or
  *                   its first NUL, whichever comes first (the alloc_get rule), and one
  *                   leading '?' is skipped - unlike http_query_next and http_query_decode,
@@ -426,7 +430,9 @@ bool http_query_form_add_2(String *const body, char const *const name, USize con
  *
  * The walk is byte-transparent, unlike find/alloc_get: every one of the query_size bytes
  * is data - a raw NUL does not end the query, and a leading '?' is NOT skipped (it stays part
- * of the first name; pass query + 1 to skip it). Pairs are split on '&'; empty segments ("&&",
+ * of the first name; pass query + 1 AND query_size - 1 to skip it - over a sized body the
+ * unadjusted size is a one-byte over-read; the buffer http_server_request_query_copy fills
+ * carries no '?' at all). Pairs are split on '&'; empty segments ("&&",
  * a leading or trailing '&') are skipped, never answered. Within a pair the name runs to the
  * FIRST '=' and the value is everything after it, further '=' included ("a==b" is name "a",
  * value "=b").

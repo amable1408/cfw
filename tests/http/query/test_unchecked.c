@@ -9,7 +9,7 @@
  * Behavioral tests for include/http/query/query.c built WITHOUT ERROR_CHECK_ENABLED.
  *
  * error_check_null in this module guards only two NULL-POINTER contracts - a null Str or
- * String key handle to get_3/get_4, and a null out_size to decode_2/form_decode_2 - both
+ * String key handle to get_3/get_4, and a null out_size to alloc_decode_2/alloc_form_decode_2 - both
  * undefined behavior with the checks compiled out, and this file never exercises them. Every
  * OTHER refusal (null/empty query or key, a missing key, an empty value, an oversized
  * key_size, a malformed "%" escape, a sized-query bound) is coded as an ordinary runtime

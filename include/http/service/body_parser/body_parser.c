@@ -99,6 +99,12 @@ static bool _http_service_body_parser_parse_form(HTTP_Service_Body_Parser *const
             break;
         }
 
+        /* An empty key is never a meaningful field name, and its size is known from next
+         * already: skip the pair before borrowing (and releasing) two blocks for it. */
+        if (key_encoded_size == 0) {
+            continue;
+        }
+
         /* try_borrow: both sizes come straight from the request body. */
 #ifdef ARENA_IMPLEMENTATION
         char *const key = (char*) allocator_try_borrow(key_encoded_size + CHAR_END_CHARACTER, self->allocator);
@@ -108,13 +114,12 @@ static bool _http_service_body_parser_parse_form(HTTP_Service_Body_Parser *const
         char *const val = (char*) allocator_try_borrow(val_encoded_size + CHAR_END_CHARACTER);
 #endif // ARENA_IMPLEMENTATION
 
-        /* Skip the pair on an empty key (never a meaningful field name) or when
-         * the allocator is drained. Both blocks are released here, val-before-key
-         * (a LIFO stack arena pops in order); allocator_release ignores a null
-         * pointer, but the guard still only releases the half that DID succeed,
+        /* Skip the pair when the allocator is drained. Both blocks are released here,
+         * val-before-key (a LIFO stack arena pops in order); allocator_release ignores
+         * a null pointer, but the guard still only releases the half that DID succeed,
          * so a decline on one side is never mistaken for one on the other. An
          * empty VALUE is legal past this point: decode(size 0) stores "". */
-        if (memory_empty(key) || memory_empty(val) || key_encoded_size == 0) {
+        if (memory_empty(key) || memory_empty(val)) {
 #ifdef ARENA_IMPLEMENTATION
             if (!memory_empty(val)) {
                 allocator_release((void*) val, self->allocator);

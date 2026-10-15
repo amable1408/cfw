@@ -90,6 +90,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - sync: container/string, http/client
 - http/client 0.5.1: documentation of the pre-I/O refusal (`HTTP_CLIENT_STATUS_ERROR` with `code == CURLE_OK`; no separate REFUSED status will be added) and of the two outcomes for a view-backed `response` (written in place below the cap, promoted into the arena above it); a refused request no longer clears a caller's String first. `error` is now log-safe: every byte below 0x20 and the byte 0x7F in libcurl's message is replaced by `?` before it is stored, so a logger may print it verbatim.
 - container/string 0.5.1: `string_try_reserve` is the twin to reach for whenever the allocator may be exhausted, not only for sizes that came from outside the program; the heap failure branch is pinned.
+- sync: http/query, http/service/body_parser
 
 ## 0.2.0 - release
 

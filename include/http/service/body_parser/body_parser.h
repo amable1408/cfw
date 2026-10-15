@@ -1,5 +1,6 @@
 /*
  * body_parser.h - HTTP request body parser service for the C Libraries Framework
+ * @version 0.3.1
  *
  * Parses HTTP request bodies by Content-Type. Supports
  * application/x-www-form-urlencoded and application/json payloads.
@@ -8,8 +9,16 @@
  *   - Parses URL-encoded form data into a Map_Char_Char key-value store.
  *   - Detects application/json payloads and exposes raw data for Json parsing.
  *   - Arena allocator support.
+ *   - max_pairs bounds the number of URL-encoded pairs kept; init() sets it to
+ *     HTTP_SERVICE_BODY_PARSER_MAX_PAIRS_DEFAULT (1024) rather than leaving an unbounded
+ *     service as the default. Setting it to 0 EXPLICITLY switches it to unbounded - a
+ *     caller opts into that, it is not what a freshly-init'd service does on its own.
+ *     Parsing refuses (returns false) once accepting another pair would exceed the bound;
+ *     pairs already parsed remain in form_data. The caller is expected to bound total
+ *     payload size upstream (e.g. an HTTP server's payload_max_size) - this bounds shape,
+ *     not size.
  *
- * Usage Example:
+ * Usage Examples:
  *   @code
  *   HTTP_Service_Body_Parser parser = http_service_body_parser_init();
  *
@@ -31,13 +40,14 @@
  *     while an empty payload (payload_size == 0) is a value refusal (returns false) that
  *     holds in every build.
  *   - parse() returns false for: an empty payload, an unrecognized Content-Type, and past
- *     max_pairs (see Limits below). It returns true for a recognized, in-budget body even
- *     when individual malformed pairs inside it were skipped.
+ *     max_pairs (see the max_pairs bullet under Features). It returns true for a
+ *     recognized, in-budget body even when individual malformed pairs inside it were
+ *     skipped.
  *
  * Thread Safety:
  *   - Not thread-safe. Synchronization is required for shared instances.
  *
- * Memory:
+ * Memory Management:
  *   - Form keys and values are copied and owned by the service (heap constructor: malloc'd
  *     blocks freed by uninit; alloc_init constructor: arena-owned, released per the arena's
  *     own tier - a linear/pool arena's per-string release is then a no-op until the arena
@@ -45,25 +55,18 @@
  *   - JSON payload pointer references the original payload buffer, never copied.
  *     The payload buffer must outlive the parser.
  *
- * Limits:
- *   - max_pairs bounds the number of URL-encoded pairs kept; init() sets it to
- *     HTTP_SERVICE_BODY_PARSER_MAX_PAIRS_DEFAULT (1024) rather than leaving an unbounded
- *     service as the default. Setting it to 0 EXPLICITLY switches it to unbounded - a
- *     caller opts into that, it is not what a freshly-init'd service does on its own.
- *     Parsing refuses (returns false) once accepting another pair would exceed the bound;
- *     pairs already parsed remain in form_data. The caller is expected to bound total
- *     payload size upstream (e.g. an HTTP server's payload_max_size) - this bounds shape,
- *     not size.
- *
- * Performance:
+ * Performance Characteristics:
  *   - URL-encoded parsing is a single linear pass.
  *   - Form field lookup is a linear scan over the map.
  *
  * Dependencies:
- *   - char, map_char_char, memory; http/query (http_query_next walks the form body's pairs
- *     and http_query_decode decodes each name and value - '+' -> space, "%XX" -> byte, a
- *     malformed escape kept literal - so the form decoding rules are http/query's own, not
- *     a second copy). Included by body_parser.c only: nothing in this header's API names it.
+ *   - allocator (allocator_try_borrow / allocator_release, in body_parser.c); char;
+ *     container/str (str_get_data / str_get_size on the VIEWs http_query_next answers, in
+ *     body_parser.c); map_char_char; memory; http/query (http_query_next walks the form
+ *     body's pairs and http_query_decode decodes each name and value - '+' -> space, "%XX"
+ *     -> byte, a malformed escape kept literal - so the form decoding rules are
+ *     http/query's own, not a second copy). http/query is included by body_parser.c only:
+ *     nothing in this header's API names it.
  *
  * See body_parser.c for implementation details.
  */
@@ -95,7 +98,7 @@
  */
 #define HTTP_SERVICE_BODY_PARSER_CONTENT_TYPE_MULTIPART "multipart/form-data"
 
-/** Default value of max_pairs set by init(); see the Limits section above the struct. */
+/** Default value of max_pairs set by init(); see the max_pairs bullet under Features in the file header. */
 #define HTTP_SERVICE_BODY_PARSER_MAX_PAIRS_DEFAULT 1024
 
 /*==============================================================================
