@@ -1,6 +1,6 @@
 /*
  * string.h - Canonical String Object for the C Libraries Framework
- * @version 0.5.0
+ * @version 0.5.1
  *
  * Provides a high-level, mutable string object with dynamic or arena-backed memory management.
  *
@@ -164,7 +164,8 @@ typedef struct {
  *   - and an APPEND, once ANY call has lowered `size` while leaving capacity alone (clear,
  *     erase, remove, repeat at count 0, a lowering string_set_size). On a view AS CONSTRUCTED
  *     an append always outgrows capacity and PROMOTES to an owner; that stops being true after
- *     the first call that frees bytes.
+ *     the first call that frees bytes. string_clear followed by appends is the shape a
+ *     caller takes when it reuses a VIEW as a receive buffer, so that caller reads this rule.
  *
  * The writers that bound on SIZE - string_clear, string_fill, string_lower, string_upper,
  * string_reverse, string_erase - stay inside the payload and merely destroy it, SO LONG AS
@@ -1319,7 +1320,9 @@ void string_replace_4(String *const self, String const *const data, USize const 
  * @note Never shrinks. A refused arena is a no-op leaving self intact. Growing a VIEW copies
  *       its bytes into a fresh buffer and PROMOTES it to an OWNER. An exhausted arena or a
  *       failed heap allocation ENDS the process; string_try_reserve is the non-aborting twin
- *       for capacities that arrive from outside the program.
+ *       for capacities that arrive from outside the program, or whenever the allocator may be
+ *       exhausted (both in-tree callers reserve program-chosen sizes; the hazard is the
+ *       allocator's fill level).
  * @note To make a following string_add_* of n bytes allocate nothing, reserve
  *       string_get_size(self) + n + CHAR_END_CHARACTER - the append needs the terminator's
  *       byte too, and reserving only size + n leaves it growing at max(required,
@@ -1513,7 +1516,9 @@ void string_trim(String *const self);
 
 /**
  * @brief Grow a String's capacity to at least the requested value WITHOUT aborting - the
- *        non-aborting twin of string_reserve, for capacities derived from external input.
+ *        non-aborting twin of string_reserve, for capacities derived from external input
+ *        or whenever the allocator may be exhausted (both in-tree callers reserve
+ *        program-chosen sizes; the hazard is the allocator's fill level).
  * @param self Pointer to the String object.
  * @param capacity Desired buffer capacity. A VALUE, not a programming error: 0 (and any
  *        capacity self already holds) answers true as a no-op, with no allocation.

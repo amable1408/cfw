@@ -3,7 +3,7 @@
  *  --------------------------------------------------------------------------
  *  @file    http_client.h
  *  @brief   Blocking HTTP client wrapper over libcurl, behind an opaque, reusable handle.
- *  @version 0.5.0
+ *  @version 0.5.1
  *  @license MIT (see LICENSE file)
  *
  *  General-purpose (no project coupling). Wraps one libcurl easy handle per
@@ -100,6 +100,16 @@
  *       that cannot hold the reservation - EXHAUSTED or REFUSED - answers
  *       HTTP_CLIENT_STATUS_ERROR with "response arena cannot hold max_response_size + 1
  *       bytes; lower it with http_client_set_max_response_size" (0.4.x aborted here).
+ *     - A VIEW `response` (string_init_4 / string_alloc_init_4 over a caller buffer of
+ *       data_size bytes) has exactly two outcomes. When cap + 1 fits the viewed buffer
+ *       (cap + 1 <= data_size + 1) the body is written IN PLACE, with the terminator at an
+ *       index <= data_size (the view contract: the buffer must hold data_size + 1 writable
+ *       bytes); the request clears the view first, scrubbing the old payload. When it does
+ *       not, string_try_reserve PROMOTES the view into the arena: read the body via
+ *       string_get_data, never from the viewed buffer, which the request leaves untouched
+ *       and which never holds the body. A request refused before any I/O clears nothing, so
+ *       a refusal never scrubs a caller's buffer. A heap view (string_init_4) skips the
+ *       arena path and grows through the heap, which keeps the tree's abort-on-OOM contract.
  *     - The Result's error text is copied into the same arena when it fits, and falls
  *       back to the HEAP when it does not (a full or refused arena) - its
  *       `error.allocator` is then nullptr; http_client_result_uninit releases either.
@@ -163,8 +173,10 @@
  *     consumer's override never leaks into a later request on the same handle.
  *
  * Dependencies:
- *   - <curl/curl.h>, <pthread.h>, <container/string/string.h>,
- *     <http/query/query.h>
+ *   - header: <curl/curl.h>
+ *   - header: <container/string/string.h>
+ *   - implementation (http_client.c only): <pthread.h>
+ *   - implementation (http_client.c only): <http/query/query.h>
  *   - <http/query/query.h>: the escape family's percent-encoder
  *     (http_query_encode_2), included by http_client.c only - no declaration in
  *     this header names a query symbol. It pulls only arena/str/string, so no
@@ -212,7 +224,11 @@ typedef struct HTTP_Client HTTP_Client;
  */
 typedef enum {
     /** @brief Any other failure (malformed URL, response/header cap exceeded,
-     *         protocol error). */
+     *         protocol error), or a refusal before any I/O (an arena-backed response
+     *         that cannot hold max_response_size + 1, or one with no cap): then `code`
+     *         stays CURLE_OK and `error` names the setter to use. No separate REFUSED
+     *         status will be added: in this alphabetical enum its slot would renumber
+     *         enumerators, and no retry policy branches differently on it. */
     HTTP_CLIENT_STATUS_ERROR,
     /** @brief The transport completed (the server may still have answered with
      *         a 4xx/5xx - check response_code / http_client_result_is_ok). */
@@ -246,7 +262,9 @@ typedef struct {
     /** @brief Transport status code from the HTTP backend. For diagnostics and
      *         logs only - branch on `status` or http_client_result_is_ok instead. */
     CURLcode code;
-    /** @brief Transport error text; empty when `success` is true. */
+    /** @brief Transport error text; empty when `success` is true. Control bytes
+     *         (below 0x20 and 0x7F) are replaced by '?' so the text is log-safe;
+     *         bytes >= 0x80 are kept. */
     String error;
     /** @brief HTTP status code returned by the server, or 0 when none was received. */
     USize response_code;
@@ -587,6 +605,9 @@ void http_client_set_follow_redirects(HTTP_Client *const self, bool const follow
  *       hold it answers HTTP_CLIENT_STATUS_ERROR naming this setter - never an abort -
  *       so lower the 16 MiB default before the first request on such a handle. An
  *       arena-backed `response` is REFUSED outright while the cap is 0 or USIZE_MAX.
+ * @note Raising the cap on a reused arena-backed String strands the old buffer: the
+ *       next request reserves the larger cap + 1 into a new arena block, and the arena
+ *       cannot free the previous one.
  */
 void http_client_set_max_response_size(HTTP_Client *const self, USize const max_bytes);
 

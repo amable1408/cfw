@@ -75,7 +75,7 @@
  * MARK: - Anti-Vacuity Counters
  *============================================================================*/
 /** Closed-form number of case functions below; the final case asserts every one ran. */
-#define _EXPECTED_CASE_COUNT 66
+#define _EXPECTED_CASE_COUNT 67
 
 /** Incremented at the top of every case function; a case that silently never runs
  * (or a dispatcher edit that drops one) fails the closed-form check. */
@@ -1316,6 +1316,27 @@ static void _test_try_reserve_zero_capacity(Test *const test) {
     test_case_end(test);
 }
 
+static void _test_try_reserve_heap_failure_untouched(Test *const test) {
+    _case_entered_count += 1;
+
+    test_case_begin(test, "string_try_reserve on the HEAP with a capacity no allocator can provide (USIZE_MAX): answers false and leaves data, size and capacity untouched");
+
+    String value = string_init_static("keep me", 7);
+    char const *const before_data = string_get_data(&value);
+    USize const before_size = string_get_size(&value);
+    USize const before_capacity = string_get_capacity(&value);
+
+    test_expect_false(test, "the impossible heap grow answered false", string_try_reserve(&value, USIZE_MAX));
+    test_expect_true(test, "data pointer unchanged", string_get_data(&value) == before_data);
+    test_expect_u(test, "size unchanged", before_size, string_get_size(&value));
+    test_expect_u(test, "capacity unchanged", before_capacity, string_get_capacity(&value));
+    test_expect_string(test, "the bytes are intact", "keep me", string_get_data(&value));
+
+    string_uninit(&value);
+
+    test_case_end(test);
+}
+
 static void _test_shrink_keeps_bytes(Test *const test) {
     _case_entered_count += 1;
 
@@ -2090,6 +2111,7 @@ int main(void) {
     _test_try_reserve_refused_arena(&test);
     _test_try_reserve_view_to_owner(&test);
     _test_try_reserve_zero_capacity(&test);
+    _test_try_reserve_heap_failure_untouched(&test);
     test_suite_end(&test);
 
     test_suite_begin(&test, "string_remove_replace_refusals");

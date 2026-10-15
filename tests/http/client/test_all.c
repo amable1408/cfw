@@ -59,6 +59,13 @@
 
 #include <fixture.h>
 
+#define _ARENA_SLACK            512   /* Spare arena bytes beyond the reserved cap + 1. */
+#define _LOG_SAFE_CONTROL_LIMIT 0x20  /* Bytes below this are control bytes. */
+#define _LOG_SAFE_DELETE_BYTE   0x7F  /* DEL. */
+#define _RESPONSE_CAP_64K       65536 /* The cap the 64 KiB cases set. */
+#define _VIEW_SENTINEL_BYTE     0xA5  /* Pre-fill for a caller buffer that must survive a request untouched. */
+#define _VIEW_SIZE              8192  /* data_size of the view-response cases' caller buffer. */
+
 /* ── helpers ──────────────────────────────────────────────────────────────── */
 
 static void _url_for(U16 const port, char const *const path, char *const out, USize const out_capacity) {
@@ -591,6 +598,20 @@ static void _test_closed_port_never_connects(Test *const test) {
     test_expect_true(test, "code/status pair is COULDNT_CONNECT/UNREACHABLE or OPERATION_TIMEDOUT/TIMEOUT", refused || timed_out);
     test_expect_u(test, "response_code stays 0 - the peer was never reached to answer with one", 0, result.response_code);
     test_expect_u(test, "http_client_response_status agrees - 0 after a transport failure", 0, http_client_response_status(client));
+
+    /* The sanitiser is a static helper and the suite links http_client.c as its own TU, so it cannot
+     * be called directly; this pins only that the libcurl-text path runs and leaves no control byte. */
+    bool error_is_log_safe = string_get_size(&result.error) > 0;
+
+    for (USize index = 0; index < string_get_size(&result.error); index += 1) {
+        U8 const byte = (U8) string_get_data(&result.error)[index];
+
+        if (byte < _LOG_SAFE_CONTROL_LIMIT || byte == _LOG_SAFE_DELETE_BYTE) {
+            error_is_log_safe = false;
+        }
+    }
+
+    test_expect_true(test, "result.error is non-empty and carries no control byte (log-safe)", error_is_log_safe);
 
     http_client_result_uninit(&result);
     string_uninit(&response);
@@ -1933,6 +1954,186 @@ static void _test_arena_response_reserves_cap_once(Test *const test) {
     test_case_end(test);
 }
 
+static void _test_arena_view_response_in_place_when_cap_fits(Test *const test) {
+    test_case_begin(test, "an arena-backed VIEW response (string_alloc_init_4 over 8192 bytes) under a 4096 cap: cap + 1 fits the viewed buffer, "
+        "so the body is written IN PLACE with the terminator inside the view");
+
+    Fixture_Server server = DEFAULT_INITIALIZATION;
+    server.script = FIXTURE_SCRIPT_OK;
+
+    if (!_start(test, &server)) {
+        test_case_end(test);
+
+        return;
+    }
+
+    char url[64] = DEFAULT_INITIALIZATION;
+    _url_for(fixture_server_port(&server), "/", url, sizeof(url));
+
+    HTTP_Client *client = http_client_new();
+
+    http_client_set_max_response_size(client, 4096);
+
+    char buffer[_VIEW_SIZE + CHAR_END_CHARACTER] = DEFAULT_INITIALIZATION;
+
+    Arena  arena    = arena_init_1(_VIEW_SIZE, ARENA_TYPE_LINEAR);
+    String response = string_alloc_init_4(buffer, _VIEW_SIZE, &arena);
+
+    HTTP_Client_Result result = http_client_get(client, url, &response);
+
+    test_expect_true(test, "the request succeeded", http_client_result_is_ok(&result));
+
+    test_expect_true(test, "the view still points at the caller's buffer", string_get_data(&response) == buffer);
+    test_expect_false(test, "the view was not promoted to an owner", response.owned);
+    test_expect_u(test, "body size", 15, string_get_size(&response));
+    test_expect_string(test, "the body is in the caller's buffer itself", "ok-body-content", buffer);
+    test_expect_true(test, "the terminator sits inside the view's data_size", buffer[15] == '\0');
+    test_expect_true(test, "the arena was never borrowed from", arena_linear_empty((ArenaLinear*) arena.handler));
+    http_client_result_uninit(&result);
+    string_uninit(&response);
+    arena_uninit(&arena, ARENA_TYPE_LINEAR);
+    http_client_delete(&client);
+    fixture_server_join(&server);
+    string_uninit(&server.request_body);
+
+    test_case_end(test);
+}
+
+static void _test_arena_view_response_promoted_when_cap_exceeds_view(Test *const test) {
+    test_case_begin(test, "an arena-backed VIEW response (string_alloc_init_4 over 8192 bytes) under a 65536 cap: cap + 1 does not fit, "
+        "so the view is PROMOTED into the arena - the body is read through string_get_data and the caller buffer never holds it");
+
+    Fixture_Server server = DEFAULT_INITIALIZATION;
+    server.script = FIXTURE_SCRIPT_OK;
+
+    if (!_start(test, &server)) {
+        test_case_end(test);
+
+        return;
+    }
+
+    char url[64] = DEFAULT_INITIALIZATION;
+    _url_for(fixture_server_port(&server), "/", url, sizeof(url));
+
+    HTTP_Client *client = http_client_new();
+
+    http_client_set_max_response_size(client, _RESPONSE_CAP_64K);
+
+    char buffer[_VIEW_SIZE + CHAR_END_CHARACTER] = DEFAULT_INITIALIZATION;
+
+    memset(buffer, _VIEW_SENTINEL_BYTE, _VIEW_SIZE);
+
+    Arena  arena    = arena_init_1(_RESPONSE_CAP_64K + CHAR_END_CHARACTER + _ARENA_SLACK, ARENA_TYPE_LINEAR);
+    String response = string_alloc_init_4(buffer, _VIEW_SIZE, &arena);
+
+    HTTP_Client_Result result = http_client_get(client, url, &response);
+
+    test_expect_true(test, "the request succeeded", http_client_result_is_ok(&result));
+
+    bool buffer_untouched = buffer[_VIEW_SIZE] == '\0';
+
+    for (USize index = 0; index < _VIEW_SIZE; index += 1) {
+        if (buffer[index] != (char) _VIEW_SENTINEL_BYTE) {
+            buffer_untouched = false;
+        }
+    }
+
+    test_expect_true(test, "the view was promoted away from the caller's buffer", string_get_data(&response) != buffer);
+    test_expect_true(test, "the promoted String owns its arena block", response.owned);
+    test_expect_true(test, "every byte of the viewed range still holds the sentinel and the terminator slot is still NUL", buffer_untouched);
+    test_expect_u(test, "body size", 15, string_get_size(&response));
+    test_expect_string(test, "the body is correct through string_get_data", "ok-body-content", string_get_data(&response));
+    http_client_result_uninit(&result);
+    string_uninit(&response);
+    arena_uninit(&arena, ARENA_TYPE_LINEAR);
+    http_client_delete(&client);
+    fixture_server_join(&server);
+    string_uninit(&server.request_body);
+
+    test_case_end(test);
+}
+
+static void _test_heap_view_response_never_refused_for_no_cap(Test *const test) {
+    test_case_begin(test, "a HEAP view response (string_init_4 over 8192 bytes) under NO cap (0 = unbounded) is never refused for having no cap "
+        "- that refusal is for arena-backed responses only - and the body stays in the caller's buffer");
+
+    Fixture_Server server = DEFAULT_INITIALIZATION;
+    server.script = FIXTURE_SCRIPT_OK;
+
+    if (!_start(test, &server)) {
+        test_case_end(test);
+
+        return;
+    }
+
+    char url[64] = DEFAULT_INITIALIZATION;
+    _url_for(fixture_server_port(&server), "/", url, sizeof(url));
+
+    HTTP_Client *client = http_client_new();
+
+    http_client_set_max_response_size(client, 0);
+
+    char buffer[_VIEW_SIZE + CHAR_END_CHARACTER] = DEFAULT_INITIALIZATION;
+
+    String response = string_init_4(buffer, _VIEW_SIZE);
+
+    HTTP_Client_Result result = http_client_get(client, url, &response);
+
+    test_expect_true(test, "the request succeeded (not refused for having no cap)", http_client_result_is_ok(&result));
+
+    test_expect_true(test, "the body landed in the caller's buffer", string_get_data(&response) == buffer);
+    test_expect_false(test, "the view was not promoted to an owner", response.owned);
+    test_expect_string(test, "the body text is in the buffer", "ok-body-content", buffer);
+    test_expect_u(test, "body size", 15, string_get_size(&response));
+    http_client_result_uninit(&result);
+    string_uninit(&response);
+    http_client_delete(&client);
+    fixture_server_join(&server);
+    string_uninit(&server.request_body);
+
+    test_case_end(test);
+}
+
+static void _test_arena_response_body_of_exactly_cap_succeeds(Test *const test) {
+    test_case_begin(test, "an arena-backed response with a body of EXACTLY cap (65536) bytes under a 65536 cap succeeds: "
+        "required = 65537 = cap + 1, the terminator alone - the 65535-byte row's boundary twin");
+
+    Fixture_Server server = DEFAULT_INITIALIZATION;
+    server.script = FIXTURE_SCRIPT_OVERSIZED;
+    server.oversized_body_size = _RESPONSE_CAP_64K;
+
+    if (!_start(test, &server)) {
+        test_case_end(test);
+
+        return;
+    }
+
+    char url[64] = DEFAULT_INITIALIZATION;
+    _url_for(fixture_server_port(&server), "/", url, sizeof(url));
+
+    HTTP_Client *client = http_client_new();
+
+    http_client_set_max_response_size(client, _RESPONSE_CAP_64K);
+
+    Arena  arena    = arena_init_1(_RESPONSE_CAP_64K + CHAR_END_CHARACTER + _ARENA_SLACK, ARENA_TYPE_LINEAR);
+    String response = string_alloc_init_1(&arena);
+
+    HTTP_Client_Result result = http_client_get(client, url, &response);
+
+    test_expect_true(test, "the request succeeded", http_client_result_is_ok(&result));
+
+    test_expect_u(test, "the whole cap arrived", _RESPONSE_CAP_64K, string_get_size(&response));
+    test_expect_true(test, "no truncation: status is not ERROR", result.status != HTTP_CLIENT_STATUS_ERROR);
+    http_client_result_uninit(&result);
+    string_uninit(&response);
+    arena_uninit(&arena, ARENA_TYPE_LINEAR);
+    http_client_delete(&client);
+    fixture_server_join(&server);
+    string_uninit(&server.request_body);
+
+    test_case_end(test);
+}
+
 static void _test_timeout_zero_no_abort_checked_build(Test *const test) {
     test_case_begin(test, "timeout_ms(0) and connect_timeout_ms(0) do not abort with ERROR_CHECK_ENABLED either, and forward to curl's own default");
 
@@ -2259,6 +2460,10 @@ int main(void) {
     _test_arena_response_without_cap_refused(&test);
     _test_refused_arena_post_rests_handle(&test);
     _test_arena_response_reserves_cap_once(&test);
+    _test_arena_response_body_of_exactly_cap_succeeds(&test);
+    _test_arena_view_response_in_place_when_cap_fits(&test);
+    _test_arena_view_response_promoted_when_cap_exceeds_view(&test);
+    _test_heap_view_response_never_refused_for_no_cap(&test);
     _test_timeout_zero_no_abort_checked_build(&test);
     _test_arena_result_error_survives_next_request(&test);
     _test_arena_result_error_full_arena_falls_back_to_heap(&test);

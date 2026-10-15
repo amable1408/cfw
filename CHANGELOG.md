@@ -87,6 +87,9 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - sync: file, http/service/cors, http/service/static
 - http/service/static 0.5.1: a `root_dir` that is itself a link is resolved once at construction - re-pointing it afterwards answers 404 on every request with the per-request `link refused` WARN (a silent 404 if the new root does not exist) until the service is reconstructed (documented); `default_file` / `fallback_file` are checked at init and a Windows-reserved or aliased name logs one WARN; the final-path WARN names the `root_dir` it belongs to; hard links, Windows follow-by-path and UNC targets documented.
 - http/service/cors 0.4.2: no behaviour change; the space byte is refused by the control-range pass alone.
+- sync: container/string, http/client
+- http/client 0.5.1: documentation of the pre-I/O refusal (`HTTP_CLIENT_STATUS_ERROR` with `code == CURLE_OK`; no separate REFUSED status will be added) and of the two outcomes for a view-backed `response` (written in place below the cap, promoted into the arena above it); a refused request no longer clears a caller's String first. `error` is now log-safe: every byte below 0x20 and the byte 0x7F in libcurl's message is replaced by `?` before it is stored, so a logger may print it verbatim.
+- container/string 0.5.1: `string_try_reserve` is the twin to reach for whenever the allocator may be exhausted, not only for sizes that came from outside the program; the heap failure branch is pinned.
 
 ## 0.2.0 - release
 

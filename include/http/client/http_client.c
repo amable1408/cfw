@@ -8,6 +8,9 @@
 #define _HTTP_CLIENT_CONNECT_TIMEOUT_DEFAULT_MS   2000
 #define _HTTP_CLIENT_ERROR_ARENA_UNBOUNDED        "an arena-backed response needs a max_response_size cap; set one with http_client_set_max_response_size or pass a heap-backed response"
 #define _HTTP_CLIENT_ERROR_ARENA_UNDERSIZED       "response arena cannot hold max_response_size + 1 bytes; lower it with http_client_set_max_response_size"
+#define _HTTP_CLIENT_ERROR_TEXT_CONTROL_LIMIT     0x20 /* Bytes below this are control bytes. */
+#define _HTTP_CLIENT_ERROR_TEXT_DELETE_BYTE       0x7F /* DEL, the one control byte above the limit. */
+#define _HTTP_CLIENT_ERROR_TEXT_REPLACEMENT       '?'  /* Stands in for each control byte. */
 #define _HTTP_CLIENT_HEADER_EMPTY_VALUE_SEPARATOR ";"
 #define _HTTP_CLIENT_HEADER_LINE_BREAKS           "\r\n"
 #define _HTTP_CLIENT_HEADER_NAME_SYMBOLS          "!#$%&'*+-.^_`|~"
@@ -89,6 +92,26 @@ static HTTP_Client_Result _http_client_result_init(void) {
     return result;
 }
 
+/* Error text can carry bytes a remote peer influenced (OpenSSL's hostname-mismatch message
+ * quotes a certificate subject), and log_message_1 does not escape control bytes, so a CR or
+ * LF here would forge a log line in every consumer that prints `result.error`. Replaces each
+ * byte below 0x20 and 0x7F with '?'; bytes >= 0x80 (obs-text) are kept. */
+static void _http_client_error_text_sanitise(char *const text, USize const size) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "text", (void*) text);
+
+    for (USize index = 0; index < size; index += 1) {
+        U8 const byte = (U8) text[index];
+
+        if (byte < _HTTP_CLIENT_ERROR_TEXT_CONTROL_LIMIT || byte == _HTTP_CLIENT_ERROR_TEXT_DELETE_BYTE) {
+            text[index] = _HTTP_CLIENT_ERROR_TEXT_REPLACEMENT;
+        }
+    }
+
+    trace_log_pop();
+}
+
 static void _http_client_result_error_set(HTTP_Client_Result *const self, char const *const data) {
     trace_log_push(LOG_METADATA);
 
@@ -118,6 +141,8 @@ static void _http_client_result_error_set(HTTP_Client_Result *const self, char c
         if (string_try_reserve(&owned, size + CHAR_END_CHARACTER)) {
             string_add_last_2(&owned, error, size);
 
+            _http_client_error_text_sanitise(owned.data, size);
+
             self->error = owned;
 
             trace_log_pop();
@@ -127,7 +152,13 @@ static void _http_client_result_error_set(HTTP_Client_Result *const self, char c
     }
 #endif // ARENA_IMPLEMENTATION
 
-    self->error = string_init_static(error, char_length(error));
+    USize const heap_size = char_length(error);
+
+    self->error = string_init_static(error, heap_size);
+
+    if (heap_size > 0) {
+        _http_client_error_text_sanitise(self->error.data, heap_size);
+    }
 
     trace_log_pop();
 }
@@ -536,8 +567,6 @@ static HTTP_Client_Result _http_client_perform(HTTP_Client *const self, char con
     HTTP_Client_Result result = _http_client_result_init();
 #endif // ARENA_IMPLEMENTATION
 
-    string_clear(target);
-
 #ifdef ARENA_IMPLEMENTATION
     /* An arena-backed response is settled BEFORE any I/O, so no remote peer ever chooses how
      * much of the arena it takes. With no cap (0 or USIZE_MAX, both "unbounded") the body
@@ -575,6 +604,12 @@ static HTTP_Client_Result _http_client_perform(HTTP_Client *const self, char con
         return result;
     }
 #endif // ARENA_IMPLEMENTATION
+
+    /* Cleared only now, after a refusal could have returned: a request that never runs
+     * must not scrub a caller's view buffer (or an owned String's previous body). For an
+     * arena-backed target the reserve above has already settled where the body lands, so
+     * this clears the buffer the body will be written into. */
+    string_clear(target);
 
     self->active_response  = target;
     self->response_size    = 0;
