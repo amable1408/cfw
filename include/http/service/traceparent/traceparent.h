@@ -1,6 +1,6 @@
 /*
  * traceparent.h - HTTP traceparent service for the C Libraries Framework
- * @version 0.3.2
+ * @version 0.3.3
  *
  * Creates, validates, and propagates W3C Trace Context traceparent (and tracestate)
  * values. The service stays transport-focused and does not depend on logging,

@@ -465,6 +465,16 @@ static void _test_inbound_tracestate_drop_is_debug(Test *const test) {
     test_case_end(test);
 }
 
+static USize _count_occurrences(char const *const haystack, char const *const needle) {
+    USize count = 0;
+
+    for (char const *found = strstr(haystack, needle); found != nullptr; found = strstr(found + 1, needle)) {
+        count += 1;
+    }
+
+    return count;
+}
+
 static void _test_tracestate_hand_filled(Test *const test) {
     test_case_begin(test, "tracestate: a hand-filled context is re-checked at header_create");
 
@@ -476,7 +486,19 @@ static void _test_tracestate_hand_filled(Test *const test) {
 
     char_copy_3(context.tracestate, HTTP_SERVICE_TRACEPARENT_TRACESTATE_CAPACITY, "a=b\r\nX-Evil: 1", 15);
 
+    char           crlf_log[512]  = DEFAULT_INITIALIZATION;
+    LogLevel const crlf_previous  = log_get_level();
+
+    log_set_level(LOG_LEVEL_WARN);
+    log_set_buffer(crlf_log, sizeof(crlf_log));
+
     String header = http_service_traceparent_header_create(&trace, &context);
+
+    test_expect_u(test, "the CRLF tracestate WARN fires once", 1, _count_occurrences(crlf_log, "the context's tracestate is unterminated or invalid"));
+    test_expect_false(test, "and never echoes the X-Evil text", char_contains_1(crlf_log, "X-Evil"));
+
+    log_set_buffer(nullptr, 0);
+    log_set_level(crlf_previous);
 
     test_expect_string_contains(test, "the traceparent line still ships", _block(&header), "traceparent: " _GOLDEN);
     test_expect_false(test, "a CRLF tracestate loses its line", char_contains_1(_block(&header), "tracestate"));
@@ -486,7 +508,19 @@ static void _test_tracestate_hand_filled(Test *const test) {
 
     memset(context.tracestate, 'a', HTTP_SERVICE_TRACEPARENT_TRACESTATE_CAPACITY);
 
+    char           log_buffer[512] = DEFAULT_INITIALIZATION;
+    LogLevel const previous_level  = log_get_level();
+
+    log_set_level(LOG_LEVEL_WARN);
+    log_set_buffer(log_buffer, sizeof(log_buffer));
+
     header = http_service_traceparent_header_create(&trace, &context);
+
+    test_expect_u(test, "the unterminated tracestate WARN fires once", 1, _count_occurrences(log_buffer, "the context's tracestate is unterminated or invalid"));
+    test_expect_false(test, "and never echoes the 64 'a' bytes", char_contains_1(log_buffer, "aaaaaaaaaaaaaaaa"));
+
+    log_set_buffer(nullptr, 0);
+    log_set_level(previous_level);
 
     test_expect_string_contains(test, "an unterminated tracestate keeps the traceparent line", _block(&header), "traceparent: " _GOLDEN);
     test_expect_false(test, "but loses its own line", char_contains_1(_block(&header), "tracestate"));
@@ -647,7 +681,19 @@ static void _test_unterminated_arrays(Test *const test) {
 
     memset(trace.header_name, 'a', HTTP_SERVICE_TRACEPARENT_HEADER_NAME_CAPACITY);
 
+    char           name_log[512]  = DEFAULT_INITIALIZATION;
+    LogLevel const name_previous  = log_get_level();
+
+    log_set_level(LOG_LEVEL_WARN);
+    log_set_buffer(name_log, sizeof(name_log));
+
     header = http_service_traceparent_header_create(&trace, &context);
+
+    test_expect_u(test, "the header_name WARN fires once", 1, _count_occurrences(name_log, "the service's header_name is unterminated or not an HTTP token"));
+    test_expect_false(test, "and never echoes the 64 'a' bytes", char_contains_1(name_log, "aaaaaaaaaaaaaaaa"));
+
+    log_set_buffer(nullptr, 0);
+    log_set_level(name_previous);
 
     test_expect_u(test, "an unterminated header_name yields the empty block", 0, string_get_size(&header));
 
@@ -744,6 +790,7 @@ static void _test_header_size_accounting(Test *const test) {
     USize const expected    = CHAR_STATIC_SIZE("traceparent: ") + HTTP_SERVICE_TRACEPARENT_VALUE_SIZE + CHAR_STATIC_SIZE("\r\n");
 
     test_expect_u(test, "no tracestate: name + \": \" + 55 + CRLF", expected, string_get_size(&header));
+    test_expect_u(test, "no tracestate: the one reservation held the NUL too, so the appends never regrew it", string_get_size(&header) + CHAR_END_CHARACTER, string_get_capacity(&header));
 
     string_uninit(&header);
 
@@ -757,6 +804,7 @@ static void _test_header_size_accounting(Test *const test) {
     USize const both_expected   = expected + CHAR_STATIC_SIZE("tracestate: vendor=abc\r\n");
 
     test_expect_u(test, "with tracestate: both lines, counted exactly", both_expected, string_get_size(&both));
+    test_expect_u(test, "with tracestate: capacity is size + NUL, no regrowth", string_get_size(&both) + CHAR_END_CHARACTER, string_get_capacity(&both));
 
     string_uninit(&both);
 

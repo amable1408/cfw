@@ -594,7 +594,27 @@ static void _test_send_buffer_size_setter(Test *const test) {
 #if defined(OS_WINDOWS)
     test_expect_true(test, "Windows stores the requested size", stored == _TEST_SEND_BUFFER_SIZE);
 #elif defined(OS_LINUX)
-    test_expect_true(test, "Linux stores double the requested size", stored == _TEST_LINUX_SEND_BUFFER_FACTOR * _TEST_SEND_BUFFER_SIZE);
+    /* Linux clamps the request to net.core.wmem_max before doubling, so the exact-2x claim holds only
+     * where wmem_max >= the request; read the effective ceiling back and assert against it. */
+    I32 wmem_max = 0;
+    FILE *const wmem_file = fopen("/proc/sys/net/core/wmem_max", "r");
+
+    if (wmem_file) {
+        if (fscanf(wmem_file, "%d", &wmem_max) != 1) {
+            wmem_max = 0;
+        }
+
+        fclose(wmem_file);
+    }
+
+    if (wmem_max > 0) {
+        I32 const effective = wmem_max < _TEST_SEND_BUFFER_SIZE ? wmem_max : _TEST_SEND_BUFFER_SIZE;
+
+        test_expect_true(test, "Linux stores double the effective (wmem_max-clamped) size", stored == _TEST_LINUX_SEND_BUFFER_FACTOR * effective);
+    }
+    else {
+        test_expect_true(test, "Linux stores a positive size no larger than double the request", stored > 0 && stored <= _TEST_LINUX_SEND_BUFFER_FACTOR * _TEST_SEND_BUFFER_SIZE);
+    }
 #else
     test_expect_true(test, "the kernel stores at least the requested size", stored >= _TEST_SEND_BUFFER_SIZE);
 #endif // OS_WINDOWS

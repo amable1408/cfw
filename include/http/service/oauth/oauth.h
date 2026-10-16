@@ -1,6 +1,6 @@
 /*
  * oauth.h - HTTP OAuth 2.0 client service for the C Libraries Framework
- * @version 0.4.1
+ * @version 0.4.2
  *
  * Provides provider configuration, signed state tokens bound to a provider, a
  * TTL and the user agent that started the login, PKCE (RFC 7636)
@@ -219,8 +219,9 @@
  *     GitHub both accept post.
  *
  * Dependencies:
- *   - allocator, arena, crypto/hash, crypto/hmac, crypto/random, datetime,
- *     encoding/base64, http/client, http/query, json, log, string, thread.
+ *   - allocator, arena, char, container/str, crypto/hash, crypto/hmac, crypto/random,
+ *     datetime, encoding/base64, http/client, http/query, json, log, memory, string,
+ *     thread.
  *
  * See oauth.c for implementation details.
  */

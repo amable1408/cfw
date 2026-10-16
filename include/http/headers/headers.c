@@ -128,12 +128,14 @@ static String _http_headers_cache_max_age_create(char const *const visibility, U
  * MARK: - Content Helpers
  *============================================================================*/
 
-static bool _http_headers_content_has_control(char const *const data) {
+/* The ONE control-byte predicate (0x00-0x1F or 0x7F), bounded by size rather than a terminator
+ * so a hand-assigned String view need not be NUL-terminated. */
+static bool _http_headers_content_has_control_2(char const *const data, USize const size) {
     trace_log_push(LOG_METADATA);
 
     error_check_null(LOG_METADATA, "data", (void*) data);
 
-    for (USize i = 0; data[i] != '\0'; i += 1) {
+    for (USize i = 0; i < size; i += 1) {
         unsigned char const byte = (unsigned char) data[i];
 
         if (byte < 0x20 || byte == 0x7F) {
@@ -146,6 +148,18 @@ static bool _http_headers_content_has_control(char const *const data) {
     trace_log_pop();
 
     return false;
+}
+
+static bool _http_headers_content_has_control(char const *const data) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "data", (void*) data);
+
+    bool const found = _http_headers_content_has_control_2(data, char_length(data));
+
+    trace_log_pop();
+
+    return found;
 }
 
 /* RFC 6266 quoted-string: '"' and '\\' are backslash-escaped; everything else in filename
@@ -186,6 +200,24 @@ static void _http_headers_content_disposition_filename_add(String *const self, c
  * MARK: - Security Helpers
  *============================================================================*/
 
+/* The one place the control-byte WARN is worded; the consequence ("omitting its header" or
+ * "refusing the whole policy") is the caller's, so the log never states the opposite of what
+ * happens next. */
+static void _http_headers_security_control_warn(char const *const caller, char const *const field_name, char const *const consequence) {
+    log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "%s: %s contains a control byte; %s", caller, field_name, consequence);
+}
+
+/* True (after one WARN naming the consequence) when value carries a control byte. */
+static bool _http_headers_security_field_has_control(char const *const caller, char const *const field_name, char const *const consequence, char const *const value) {
+    if (!_http_headers_content_has_control(value)) {
+        return false;
+    }
+
+    _http_headers_security_control_warn(caller, field_name, consequence);
+
+    return true;
+}
+
 static void _http_headers_security_header_add(String *const headers, char const *const name, char const *const field_name, String const *const value) {
     trace_log_push(LOG_METADATA);
 
@@ -205,16 +237,12 @@ static void _http_headers_security_header_add(String *const headers, char const 
     char const *const data = string_get_data(value);
     USize const       size = string_get_size(value);
 
-    for (USize i = 0; i < size; i += 1) {
-        unsigned char const byte = (unsigned char) data[i];
+    if (_http_headers_content_has_control_2(data, size)) {
+        _http_headers_security_control_warn("http_headers_security_create_2", field_name, "omitting its header");
 
-        if (byte < 0x20 || byte == 0x7F) {
-            log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_headers_security_create_2: %s contains a control byte; omitting its header", field_name);
+        trace_log_pop();
 
-            trace_log_pop();
-
-            return;
-        }
+        return;
     }
 
     _http_headers_string_add(headers, name);
@@ -253,50 +281,39 @@ static void _http_headers_security_hsts_add(HTTP_Headers_Security const *const s
 }
 
 /* A control byte in a policy value (e.g. an embedded CRLF) could inject arbitrary header
- * lines, so it is never trusted verbatim. Always logs - the by-value init_2 tier below uses
- * this to omit just the offending field's header (returns "" here), since it cannot refuse
- * outright; the alloc_init_2 tier instead uses the separate _http_headers_security_policy_has_control
- * below to DECIDE whether to refuse the whole policy, since it can refuse and the fold-3
- * severity (a dropped header with no log line) is exactly what the WHOLE-policy refusal
- * exists to avoid. */
+ * lines, so it is never trusted verbatim. Always logs, and the log names the CONSEQUENCE the
+ * caller actually applies: the by-value init_2 tier omits just the offending field's header
+ * (_field_safe returns "" here, since it cannot refuse outright), while the alloc_init_2 tier
+ * refuses the whole policy (_policy_has_control decides, since it can refuse and a dropped
+ * header with no log line is exactly what the WHOLE-policy refusal exists to avoid). */
 static char const *_http_headers_security_field_safe(char const *const caller, char const *const field_name, char const *const value) {
-    if (!_http_headers_content_has_control(value)) {
+    if (!_http_headers_security_field_has_control(caller, field_name, "omitting its header", value)) {
         return value;
     }
-
-    log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "%s: %s contains a control byte; omitting its header", caller, field_name);
 
     return "";
 }
 
-/* Used only by the refuse-whole alloc_init_2 tier: reports (with one WARN per offending field)
- * whether ANY of the four policy values carries a control byte, without computing a substitute
- * "" for any of them - the caller refuses the whole policy rather than using a substitute. */
+/* Used only by the refuse-whole alloc_init_2 tier: reports (with one WARN per offending field,
+ * so every bad field still logs) whether ANY of the four policy values carries a control byte,
+ * without computing a substitute "" for any of them. */
 static bool _http_headers_security_policy_has_control(
     char const *const caller, char const *const content_security_policy, char const *const frame_options, char const *const permissions_policy, char const *const referrer_policy) {
     bool found = false;
 
-    if (_http_headers_content_has_control(content_security_policy)) {
-        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "%s: content_security_policy contains a control byte", caller);
-
+    if (_http_headers_security_field_has_control(caller, "content_security_policy", "refusing the whole policy", content_security_policy)) {
         found = true;
     }
 
-    if (_http_headers_content_has_control(frame_options)) {
-        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "%s: frame_options contains a control byte", caller);
-
+    if (_http_headers_security_field_has_control(caller, "frame_options", "refusing the whole policy", frame_options)) {
         found = true;
     }
 
-    if (_http_headers_content_has_control(permissions_policy)) {
-        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "%s: permissions_policy contains a control byte", caller);
-
+    if (_http_headers_security_field_has_control(caller, "permissions_policy", "refusing the whole policy", permissions_policy)) {
         found = true;
     }
 
-    if (_http_headers_content_has_control(referrer_policy)) {
-        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "%s: referrer_policy contains a control byte", caller);
-
+    if (_http_headers_security_field_has_control(caller, "referrer_policy", "refusing the whole policy", referrer_policy)) {
         found = true;
     }
 

@@ -77,6 +77,10 @@ foreach(src ${TEST_SRC})
     # A suite whose module guards test-only symbols behind a macro: the module's own sources
     # join the executable, compiled with the macro, and resolve ahead of the cfw archive's copy.
     set(suite_defines "")
+    if(suite STREQUAL "http/client")
+        list(APPEND helpers "${CMAKE_SOURCE_DIR}/include/http/client/http_client.c")
+        list(APPEND suite_defines HTTP_CLIENT_TEST_HOOKS)
+    endif()
     if(suite STREQUAL "http/service/static")
         list(APPEND helpers "${CMAKE_SOURCE_DIR}/include/http/service/static/static.c")
         list(APPEND suite_defines HTTP_SERVICE_STATIC_TEST_HOOKS)

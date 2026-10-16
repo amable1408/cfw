@@ -3,7 +3,7 @@
  *  --------------------------------------------------------------------------
  *  @file    http_client.h
  *  @brief   Blocking HTTP client wrapper over libcurl, behind an opaque, reusable handle.
- *  @version 0.6.0
+ *  @version 0.7.0
  *  @license MIT (see LICENSE file)
  *
  *  General-purpose (no project coupling). Wraps one libcurl easy handle per
@@ -558,6 +558,15 @@ char const* http_client_response_header_find(HTTP_Client const *const self, char
 USize http_client_response_status(HTTP_Client const *const self);
 
 /**
+ * @brief The result's error text as a printable C string, never nullptr.
+ * @param self Result to inspect.
+ * @return "" when the result carries no error text (a Result from a request that has not failed,
+ *         or one released by http_client_result_uninit), otherwise the owned, log-safe error text.
+ *         The pointer is valid until the result is released or reused for another request.
+ */
+char const* http_client_result_error_text(HTTP_Client_Result const *const self);
+
+/**
  * @brief Whether a result is both a transport success and a 2xx HTTP status.
  * @param self Result to inspect.
  * @return true when `success` is true and response_code is in [200, 300).
@@ -682,5 +691,15 @@ bool http_client_set_user_agent(HTTP_Client *const self, char const *const user_
  * @param verify_tls true to verify peer and host.
  */
 void http_client_set_verify_tls(HTTP_Client *const self, bool const verify_tls);
+
+#ifdef HTTP_CLIENT_TEST_HOOKS
+/**
+ * @brief Test build only: run the module's error-text sanitiser on `text` in place.
+ * @param text Writable buffer of at least `size` bytes.
+ * @param size Number of bytes to scan; each byte below 0x20 and 0x7F becomes '?', bytes >= 0x80 are kept.
+ * @note Compiled only under HTTP_CLIENT_TEST_HOOKS.
+ */
+void http_client_test_error_text_sanitise(char *const text, USize const size);
+#endif // HTTP_CLIENT_TEST_HOOKS
 
 #endif // HTTP_CLIENT_H

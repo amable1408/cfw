@@ -1314,7 +1314,7 @@ static bool _peer_socket_send_buffer(U16 const port, I32 *const out) {
 
         peer.size = (Net_Socket_Len) sizeof(peer.storage);
 
-        if (getpeername(candidate, (struct sockaddr*) &peer.storage, &peer.size) != 0 || net_socket_address_port(&peer) != port) {
+        if (getpeername(candidate, (struct sockaddr*) &peer.storage, &peer.size) != 0 || peer.storage.ss_family != AF_INET || net_socket_address_port(&peer) != port) {
             continue;
         }
 

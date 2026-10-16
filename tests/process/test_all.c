@@ -316,10 +316,21 @@ static I32 _child_stderr(void) {
 }
 
 /**
- * @brief Abort, so the parent can classify a signal death (or the UCRT's fast-fail status).
+ * @brief Abort, so the parent can classify a signal death (or the UCRT's exit-3 abort).
+ *
+ * On Windows the UCRT's abort() first hands the process to Windows Error Reporting, which on an
+ * interactive machine holds the child past the parent's deadline (observed: 5 s), so the report
+ * step is switched off and abort() ends in _exit(3), which process_outcome_aborted accepts.
+ * Raising the fast-fail directly (__fastfail) was tried and refuted: the kernel still hands a
+ * fast-fail crash to WER, and the grandchild-flood case timed out on it. POSIX keeps abort(), so
+ * the SIGABRT classification is unchanged.
  * @return Never returns; the value satisfies the signature.
  */
 static I32 _child_abort(void) {
+#ifdef OS_WINDOWS
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif // OS_WINDOWS
+
     abort();
 
     return 0;
@@ -1115,13 +1126,15 @@ static void _test_own_death_not_mistaken_for_kill(Test *const test) {
     test_case_begin(test, "own death: a child that dies of its own signal while its grandchild floods stdout is reported as that death, never TIMED_OUT or KILLED");
 
     /* The grandchild is the PACED flooder, and that is what GUARANTEES the ordering: bounded to
-     * one 4 KiB chunk per 1 ms sleep, it can put at most ~2 MiB into the pipe inside the 500 ms
+     * one 4 KiB chunk per 1 ms sleep, it can put at most ~8 MiB into the pipe inside the 2 s
      * this case allows, so the 64 MiB limit cannot be reached before the child dies of its own
      * SIGTERM at ~100 ms - on any hardware, by construction rather than by a bet on pipe speed.
      * An unbounded flooder made the outcome a race the faster machine lost, reporting the
-     * module's own SIGKILL at the limit in place of the death the case exists to pin. */
+     * module's own SIGKILL at the limit in place of the death the case exists to pin. The
+     * deadline's LOWER bound is the child's own start-up plus the grandchild spawn: 500 ms was
+     * not enough on a loaded machine (nine parallel builds), and the deadline fired first. */
     char const *const argv[] = { _program, "--child-crash-flooding", nullptr };
-    ProcessSpec const spec = { .argv = argv, .stderr_mode = PROCESS_STDERR_DISCARD, .output_limit = 64U * 1024U * 1024U, .timeout_milliseconds = 500 };
+    ProcessSpec const spec = { .argv = argv, .stderr_mode = PROCESS_STDERR_DISCARD, .output_limit = 64U * 1024U * 1024U, .timeout_milliseconds = 2000 };
     ProcessOutcome outcome = DEFAULT_INITIALIZATION;
 
     process_run(spec, &outcome);
@@ -1420,9 +1433,9 @@ static void _test_stderr_modes(Test *const test) {
 
 /* 16. A death by signal is SIGNALED with the signal named - the death-test primitive the
  *     foundation suites rely on. Windows has no signals: the UCRT's abort() is an EXITED
- *     status carrying the fast-fail NTSTATUS. */
+ *     status - 3 with WER kept out (the child does that), the fast-fail NTSTATUS otherwise. */
 static void _test_abort_is_classified(Test *const test) {
-    test_case_begin(test, "abort: the child's death is classified exactly (SIGNALED + SIGABRT on POSIX; EXITED + 0xC0000409 on Windows)");
+    test_case_begin(test, "abort: the child's death is classified exactly (SIGNALED + SIGABRT on POSIX; EXITED + 3 on Windows, WER kept out)");
 
     char const *const argv[] = { _program, "--child-abort", nullptr };
     ProcessSpec const spec = { .argv = argv, .stderr_mode = PROCESS_STDERR_DISCARD, .timeout_milliseconds = 5000 };
@@ -1434,7 +1447,7 @@ static void _test_abort_is_classified(Test *const test) {
     test_expect_true(test, "and process_outcome_aborted says so", process_outcome_aborted(&outcome));
 #ifdef OS_WINDOWS
     test_expect_i(test, "ended == EXITED (no signals on Windows)", (I32) PROCESS_ENDED_EXITED, (I32) outcome.ended);
-    test_expect_i(test, "exit_code carries the fast-fail NTSTATUS", (I32) 0xC0000409u, outcome.exit_code);
+    test_expect_i(test, "exit_code is the UCRT's abort() exit with WER kept out", 3, outcome.exit_code);
     test_expect_i(test, "signal stays 0", 0, outcome.signal);
 #else
     test_expect_i(test, "ended == SIGNALED", (I32) PROCESS_ENDED_SIGNALED, (I32) outcome.ended);

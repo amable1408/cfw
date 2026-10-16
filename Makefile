@@ -149,6 +149,7 @@ $(subst .c,$(EXE),tests/file/test_oom.c): private OOM_LIB := libcfw_unchecked.a
 $(subst .c,$(EXE),tests/file/test_oom.c): private CPPFLAGS := $(CPPFLAGS_UNCHECKED)
 $(subst .c,$(EXE),tests/http/service/body_parser/test_oom.c): private OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
 $(subst .c,$(EXE),tests/http/service/multipart/test_oom.c): private OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
+$(subst .c,$(EXE),tests/http/service/oauth/test_oom.c): private OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=curl_easy_perform -Wl,--wrap=curl_slist_append -Wl,--wrap=free
 $(subst .c,$(EXE),tests/http/service/permission/test_oom.c): private OOM_LIB := libcfw_unchecked.a
 $(subst .c,$(EXE),tests/http/service/permission/test_oom.c): private CPPFLAGS := $(CPPFLAGS_UNCHECKED)
 $(subst .c,$(EXE),tests/memory/test_oom.c): private OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=realloc
@@ -182,13 +183,19 @@ tests/http/service/captcha/test_all$(EXE) tests/http/service/captcha/test_unchec
 tests/http/service/captcha/test_all$(EXE) tests/http/service/captcha/test_unchecked$(EXE): tests/http/client/fixture.c tests/http/client/fixture.h
 # tests/http/service/oauth borrows tests/http/client rather than carrying a second copy of it; the per-suite
 # wildcard in the recipes above only ever sees a suite's OWN directory.
-tests/http/service/oauth/test_all$(EXE) tests/http/service/oauth/test_unchecked$(EXE): SUITE_EXTRA_INC := -Itests/http/client
-tests/http/service/oauth/test_all$(EXE) tests/http/service/oauth/test_unchecked$(EXE): SUITE_EXTRA_SRC := tests/http/client/fixture.c
-tests/http/service/oauth/test_all$(EXE) tests/http/service/oauth/test_unchecked$(EXE): tests/http/client/fixture.c tests/http/client/fixture.h
+tests/http/service/oauth/test_all$(EXE) tests/http/service/oauth/test_oom$(EXE) tests/http/service/oauth/test_unchecked$(EXE): SUITE_EXTRA_INC := -Itests/http/client
+tests/http/service/oauth/test_all$(EXE) tests/http/service/oauth/test_oom$(EXE) tests/http/service/oauth/test_unchecked$(EXE): SUITE_EXTRA_SRC := tests/http/client/fixture.c
+tests/http/service/oauth/test_all$(EXE) tests/http/service/oauth/test_oom$(EXE) tests/http/service/oauth/test_unchecked$(EXE): tests/http/client/fixture.c tests/http/client/fixture.h
 
 # A suite whose module guards test-only symbols behind a macro compiles its own copy of that
 # module under the macro, ahead of the archive - set per target here, AFTER the fixture rules
 # above, since these append to the SUITE_EXTRA_SRC those set.
+# tests/http/client compiles its own copy of include/http/client under HTTP_CLIENT_TEST_HOOKS; libcfw.a's copy is
+# built without it and is never pulled, since this copy defines every symbol first.
+tests/http/client/test_all$(EXE) tests/http/client/test_unchecked$(EXE): SUITE_EXTRA_SRC += include/http/client/http_client.c
+tests/http/client/test_all$(EXE) tests/http/client/test_unchecked$(EXE): private CPPFLAGS += -DHTTP_CLIENT_TEST_HOOKS
+tests/http/client/test_all$(EXE) tests/http/client/test_unchecked$(EXE): private CPPFLAGS_UNCHECKED += -DHTTP_CLIENT_TEST_HOOKS
+tests/http/client/test_all$(EXE) tests/http/client/test_unchecked$(EXE): include/http/client/http_client.c
 # tests/http/service/static compiles its own copy of include/http/service/static under HTTP_SERVICE_STATIC_TEST_HOOKS; libcfw.a's copy is
 # built without it and is never pulled, since this copy defines every symbol first.
 tests/http/service/static/test_all$(EXE) tests/http/service/static/test_unchecked$(EXE): SUITE_EXTRA_SRC += include/http/service/static/static.c

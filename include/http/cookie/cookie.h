@@ -1,6 +1,6 @@
 /*
  * cookie.h - HTTP cookie helpers for the C Libraries Framework
- * @version 0.4.0
+ * @version 0.4.1
  *
  * Builds Set-Cookie response headers and reads values from Cookie request
  * headers. The module has no application-specific state.

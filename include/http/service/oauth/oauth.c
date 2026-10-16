@@ -787,7 +787,9 @@ static HTTP_Service_OAuth_Token _http_service_oauth_send_token_request(HTTP_Serv
     /* GitHub's token endpoint answers application/x-www-form-urlencoded unless this header is
      * present, which json_from_4 cannot parse - so the exchange "succeeded" with an empty
      * access token and no error anywhere. Google ignores it. */
-    bool const sent = http_client_header_add(client, "Accept: application/json") && http_client_header_add(client, "Content-Type: application/x-www-form-urlencoded");
+    bool sent = http_client_header_add(client, "Accept: application/json");
+
+    sent = http_client_header_add(client, "Content-Type: application/x-www-form-urlencoded") && sent;
 
     /* A dropped Accept is the GitHub shape above: a form-encoded answer nobody can parse, reported
      * as an empty token with no error. Refused before the wire in the module's own refusal shape. */
@@ -797,7 +799,6 @@ static HTTP_Service_OAuth_Token _http_service_oauth_send_token_request(HTTP_Serv
         _http_service_oauth_string_add(&token.error, "invalid_request");
 
         string_uninit(&response);
-        http_client_header_clear(client);
         http_client_delete(&client);
 
         trace_log_pop();
@@ -1649,7 +1650,9 @@ HTTP_Service_OAuth_Profile http_service_oauth_get_profile_2(HTTP_Service_OAuth *
     _http_service_oauth_string_add(&header, "Authorization: Bearer ");
     _http_service_oauth_string_add(&header, access_token);
 
-    bool const sent = http_client_header_add(client, string_get_data(&header)) && http_client_header_add(client, "Accept: application/json");
+    bool sent = http_client_header_add(client, string_get_data(&header));
+
+    sent = http_client_header_add(client, "Accept: application/json") && sent;
 
     // A dropped Authorization header would send the GET unauthenticated and read as "bad token".
     if (!sent) {
@@ -1659,7 +1662,6 @@ HTTP_Service_OAuth_Profile http_service_oauth_get_profile_2(HTTP_Service_OAuth *
 
         string_uninit(&response);
         string_uninit(&header);
-        http_client_header_clear(client);
         http_client_delete(&client);
 
         _http_service_oauth_row_uninit(&row);
@@ -2071,28 +2073,14 @@ bool http_service_oauth_revoke_2(HTTP_Service_OAuth *const self, char const *con
         encoded = http_query_form_add_1(&payload, "token_type_hint", token_type_hint) && encoded;
     }
 
-    if (!encoded) {
-        log_message_1(LOG_LEVEL_ERROR, "oauth: provider=%s revoke request body incomplete - not sent\n", provider);
-
-        string_uninit(&response);
-        string_uninit(&payload);
-        http_client_delete(&client);
-
-        _http_service_oauth_row_uninit(&row);
-
-        trace_log_pop();
-
-        return false;
-    }
-
     bool const sent = http_client_header_add(client, "Content-Type: application/x-www-form-urlencoded");
 
-    if (!sent) {
-        log_message_1(LOG_LEVEL_ERROR, "oauth: provider=%s revoke request headers incomplete - not sent\n", provider);
+    // The two refusals share one teardown: either way nothing reaches the wire.
+    if (!encoded || !sent) {
+        log_message_1(LOG_LEVEL_ERROR, "oauth: provider=%s revoke request %s incomplete - not sent\n", provider, !encoded ? "body" : "headers");
 
         string_uninit(&response);
         string_uninit(&payload);
-        http_client_header_clear(client);
         http_client_delete(&client);
 
         _http_service_oauth_row_uninit(&row);
@@ -2144,9 +2132,12 @@ bool http_service_oauth_state_issue_2(HTTP_Service_OAuth *const self, char const
         return false;
     }
 
+    // The frame stays open across the core so a trace emitted inside it names this public tier.
+    bool const issued = _http_service_oauth_state_issue(self, provider, binding, binding_size, ttl_seconds, out);
+
     trace_log_pop();
 
-    return _http_service_oauth_state_issue(self, provider, binding, binding_size, ttl_seconds, out);
+    return issued;
 }
 
 bool http_service_oauth_state_verify_1(HTTP_Service_OAuth *const self, char const *const provider, char const *const state) {
@@ -2168,9 +2159,12 @@ bool http_service_oauth_state_verify_2(HTTP_Service_OAuth *const self, char cons
         return false;
     }
 
+    // Frame held open across the core; see state_issue_2.
+    bool const verified = _http_service_oauth_state_verify(self, provider, binding, binding_size, state);
+
     trace_log_pop();
 
-    return _http_service_oauth_state_verify(self, provider, binding, binding_size, state);
+    return verified;
 }
 
 bool http_service_oauth_token_is_ok(HTTP_Service_OAuth_Token const *const self) {

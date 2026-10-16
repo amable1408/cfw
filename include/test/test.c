@@ -1,5 +1,9 @@
 #include <test/test.h>
 
+#ifdef OS_WINDOWS
+#include <platform/windows/windows.h>
+#endif // OS_WINDOWS
+
 /*==============================================================================
  * MARK: - Helpers
  *============================================================================*/
@@ -21,9 +25,11 @@ static USize _test_api_effective_failure_count(Test const *const self) {
 }
 
 static FSize _test_elapsed_ms(USize const started_at) {
-    USize const elapsed = _test_now() - started_at;
+    USize const now = _test_now();
 
-    return ((FSize) elapsed * 1000.0) / (FSize) CLOCKS_PER_SEC;
+    // _test_now already counts milliseconds. A clock that could not be read yields 0 at either
+    // end, so the delta is clamped rather than wrapped; the value is display-only.
+    return (FSize) (now < started_at ? 0 : now - started_at);
 }
 
 static FSize _test_elapsed_s(USize const started_at) {
@@ -35,11 +41,31 @@ static char* _test_label(char const *const name) {
 }
 
 static USize _test_now(void) {
-    clock_t const now = clock();
+    // Monotonic WALL time in milliseconds. clock() measured CPU time on POSIX, so a case that
+    // sleeps or blocks on a child reported ~0 ms there. A clock that cannot be read yields 0;
+    // the value is display-only.
+#ifdef OS_WINDOWS
+    LARGE_INTEGER frequency = DEFAULT_INITIALIZATION;
+    LARGE_INTEGER counter   = DEFAULT_INITIALIZATION;
 
-    // clock() reports failure as (clock_t) -1; feeding that through the USize
-    // cast would make every elapsed display absurd. The value is display-only.
-    return now == (clock_t) -1 ? 0 : (USize) now;
+    if (!QueryPerformanceFrequency(&frequency) || !QueryPerformanceCounter(&counter) || frequency.QuadPart <= 0) {
+        return 0;
+    }
+
+    // Split into seconds and remainder so the multiply by 1000 cannot overflow.
+    U64 const ticks = (U64) counter.QuadPart;
+    U64 const per_second = (U64) frequency.QuadPart;
+
+    return (USize) (((ticks / per_second) * 1000) + (((ticks % per_second) * 1000) / per_second));
+#else
+    struct timespec now = DEFAULT_INITIALIZATION;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return 0;
+    }
+
+    return ((USize) now.tv_sec * 1000) + ((USize) now.tv_nsec / 1000000);
+#endif // OS_WINDOWS
 }
 
 static void _test_print_count_line(char const *const label, USize const passed_count, USize const failure_count, USize const total_count) {

@@ -1148,6 +1148,18 @@ USize http_client_response_status(HTTP_Client const *const self) {
     return self->response_status;
 }
 
+char const* http_client_result_error_text(HTTP_Client_Result const *const self) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+
+    char const *const text = string_empty(&self->error) ? "" : string_get_data(&self->error);
+
+    trace_log_pop();
+
+    return text;
+}
+
 bool http_client_result_is_ok(HTTP_Client_Result const *const self) {
     trace_log_push(LOG_METADATA);
 
@@ -1298,3 +1310,15 @@ void http_client_set_verify_tls(HTTP_Client *const self, bool const verify_tls) 
 
     trace_log_pop();
 }
+
+#ifdef HTTP_CLIENT_TEST_HOOKS
+void http_client_test_error_text_sanitise(char *const text, USize const size) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "text", (void*) text);
+
+    _http_client_error_text_sanitise(text, size);
+
+    trace_log_pop();
+}
+#endif // HTTP_CLIENT_TEST_HOOKS

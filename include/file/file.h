@@ -1,6 +1,6 @@
 /*
  * file.h - Canonical file I/O interface for reading, writing, and managing files
- * @version 0.7.0
+ * @version 0.7.1
  *
  * Features:
  *   - Cross-platform support (Linux, Windows)
@@ -222,6 +222,10 @@ typedef enum {
     FILE_POSITION_CURRENT, /**< Seek from current position. */
     FILE_POSITION_END,     /**< Seek from end of file. */
 } File_Position;
+
+// The values go to the C runtime as its whence argument, and the bound checks assume they run contiguously from 0.
+static_assert(FILE_POSITION_BEGIN == SEEK_SET && FILE_POSITION_CURRENT == SEEK_CUR && FILE_POSITION_END == SEEK_END,
+    "File_Position must equal the C runtime's SEEK_SET, SEEK_CUR and SEEK_END");
 
 /**
  * @brief The code field of a RESULT_CATEGORY_ARGUMENT refusal from the management family.
@@ -798,6 +802,8 @@ File* file_open_wait_3(String const *const file_name, char const *const file_mod
  *     "//./" (as in "//./PhysicalDrive0") IS ".", so exempting dot segments would pass the
  *     device namespace to any caller that uses the path at position zero ("//?/C:/x", the
  *     verbatim prefix, is caught by its ':').
+ *     An absolute POSIX path passes ("/x" answers false) while an absolute Windows path never
+ *     does (its drive colon answers true), so a caller that must accept both checks the shape itself.
  *   - A component shaped like an NTFS 8.3 short alias: its stem (the bytes before its first
  *     '.') is at most 8 bytes and contains '~' followed by an ASCII digit, the extension after
  *     that dot (if any) is at most 3 bytes, and the component has no space. ".env" is reachable

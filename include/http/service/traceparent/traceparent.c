@@ -409,11 +409,6 @@ String http_service_traceparent_header_create(HTTP_Service_Traceparent const *co
     USize expected = header_name_size + CHAR_STATIC_SIZE(": ") +
         HTTP_SERVICE_TRACEPARENT_VALUE_SIZE + CHAR_STATIC_SIZE("\r\n");
 
-    string_add_last_2(&header, self->header_name, header_name_size);
-    string_add_last_2(&header, ": ", CHAR_STATIC_SIZE(": "));
-    string_add_last_2(&header, value, HTTP_SERVICE_TRACEPARENT_VALUE_SIZE);
-    string_add_last_2(&header, "\r\n", CHAR_STATIC_SIZE("\r\n"));
-
     /* The tracestate line always carries the SPEC name: the header_name knob renames the
      * traceparent only, and a peer looking for vendor state looks for "tracestate". */
     USize const tracestate_size = _http_service_traceparent_bounded_size(context->tracestate, sizeof(context->tracestate));
@@ -429,7 +424,25 @@ String http_service_traceparent_header_create(HTTP_Service_Traceparent const *co
     if (tracestate_ok) {
         expected += CHAR_STATIC_SIZE(HTTP_SERVICE_TRACEPARENT_TRACESTATE_HEADER_NAME) + CHAR_STATIC_SIZE(": ") +
             tracestate_size + CHAR_STATIC_SIZE("\r\n");
+    }
 
+    /* One reservation for the whole block, so the appends below never grow it: one
+     * allocation (heap or arena) instead of up to eight, and a refusal here happens before
+     * the first byte is written. */
+    if (!string_try_reserve(&header, expected + CHAR_END_CHARACTER)) {
+        log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_service_traceparent: the allocator refused the header block - an empty block is emitted instead");
+
+        trace_log_pop();
+
+        return header;
+    }
+
+    string_add_last_2(&header, self->header_name, header_name_size);
+    string_add_last_2(&header, ": ", CHAR_STATIC_SIZE(": "));
+    string_add_last_2(&header, value, HTTP_SERVICE_TRACEPARENT_VALUE_SIZE);
+    string_add_last_2(&header, "\r\n", CHAR_STATIC_SIZE("\r\n"));
+
+    if (tracestate_ok) {
         string_add_last_2(&header, HTTP_SERVICE_TRACEPARENT_TRACESTATE_HEADER_NAME, CHAR_STATIC_SIZE(HTTP_SERVICE_TRACEPARENT_TRACESTATE_HEADER_NAME));
         string_add_last_2(&header, ": ", CHAR_STATIC_SIZE(": "));
         string_add_last_2(&header, context->tracestate, tracestate_size);

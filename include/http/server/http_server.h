@@ -4,7 +4,7 @@
  *  @file    http_server.h
  *  @brief   HTTP/1.1 server over libwebsockets: routing, request accessors and
  *           response helpers.
- *  @version 0.5.2
+ *  @version 0.5.3
  *
  *  Features:
  *    - Exact and regex route registration on one server handle.

@@ -39,7 +39,7 @@ static String _http_cookie_string_init(Arena *const allocator) {
     trace_log_push(LOG_METADATA);
 
 #ifdef ARENA_IMPLEMENTATION
-    if (!memory_empty(allocator)) {
+    if (allocator != nullptr) {
         String const string = string_alloc_init_1(allocator);
 
         trace_log_pop();
@@ -64,7 +64,7 @@ static String _http_cookie_char_to_string(char const *const data, Arena *const a
 
     if (data_size == 0) {
 #ifdef ARENA_IMPLEMENTATION
-        if (!memory_empty(allocator)) {
+        if (allocator != nullptr) {
             String const string = string_alloc_init_1(allocator);
 
             trace_log_pop();
@@ -81,7 +81,7 @@ static String _http_cookie_char_to_string(char const *const data, Arena *const a
     }
 
 #ifdef ARENA_IMPLEMENTATION
-    if (!memory_empty(allocator)) {
+    if (allocator != nullptr) {
         String const string = string_alloc_init_static(data, data_size, allocator);
 
         trace_log_pop();
@@ -845,6 +845,10 @@ HTTP_Cookie http_cookie_init_1(char const *const name, char const *const value) 
 
 HTTP_Cookie http_cookie_init_2(char const *const name, char const *const value, char const *const path, HTTP_Cookie_Same_Site const same_site, bool const secure, bool const http_only) {
     trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "name", (void*) name);
+    error_check_null(LOG_METADATA, "value", (void*) value);
+    error_check_null(LOG_METADATA, "path", (void*) path);
 
     HTTP_Cookie const cookie = _http_cookie_init(name, value, path, same_site, secure, http_only, nullptr);
 

@@ -1784,12 +1784,34 @@ static void _test_reserved_windows_name_spellings_refused(Test *const test, U16 
 }
 
 /*
+ * A NUL byte inside the request path would be handed to the open as a C string and truncated
+ * there, so the file that opens is not the file the rest of the path names. The resolver refuses
+ * it before any open. lws drops a %00 request before it reaches any route (the connection closes
+ * with no reply - measured), so the live route cannot carry one; the resolver is driven directly
+ * through the test hook over a sized path. The un-NUL'd twin resolves: the refusal is the NUL.
+ */
+static void _test_nul_in_path_refused(Test *const test) {
+    test_case_begin(test, "a NUL byte inside the path is refused by the resolver before any open");
+
+    static char const truncated[] = "/static/index.html\0.x";
+    static char const device[]    = "/static/CON\0/x";
+    static char const clean[]     = "/static/index.html";
+
+    test_expect_true(test, "control: the NUL-free twin resolves", http_service_static_test_resolve(&_svc_default, clean, sizeof(clean) - 1));
+    test_expect_true(test, "index.html + NUL + .x is refused (the truncated name would open index.html)", !http_service_static_test_resolve(&_svc_default, truncated, sizeof(truncated) - 1));
+    test_expect_true(test, "CON + NUL + /x is refused", !http_service_static_test_resolve(&_svc_default, device, sizeof(device) - 1));
+    test_expect_true(test, "a NUL as the last byte is refused", !http_service_static_test_resolve(&_svc_default, "/static/index.html\0", sizeof("/static/index.html")));
+
+    test_case_end(test);
+}
+
+/*
  * A default_file / fallback_file that file/ reads as a Windows device is config, not request data:
- * construction logs ONE WARN per field, echoing the value, and still constructs (ruling 2449 - a
+ * construction logs ONE WARN (the two fields are one value), echoing it, and still constructs (ruling 2449 - a
  * bad fallback is a silent not-served, never a refusal of the service). A healthy name logs nothing.
  */
 static void _test_init_warns_on_device_default_file(Test *const test) {
-    test_case_begin(test, "Windows: init_2 with default_file \"CON\" WARNs once per field naming the value, and still constructs");
+    test_case_begin(test, "Windows: init_2 with default_file \"CON\" WARNs once naming the value, and still constructs");
 
     char            log_buffer[2048]    = DEFAULT_INITIALIZATION;
     LogLevel const  previous_level      = log_get_level();
@@ -1800,12 +1822,11 @@ static void _test_init_warns_on_device_default_file(Test *const test) {
 
     HTTP_Service_Static const device = http_service_static_init_2(_FIXTURE_ROOT, "/device", "CON", true, 0);
 
-    char const *const fallback_warn = strstr(log_buffer, "fallback_file 'CON'");
-    char const *const default_warn  = strstr(log_buffer, "default_file 'CON'");
+    char const *const default_warn = strstr(log_buffer, "default_file 'CON'");
 
-    test_expect_true(test, "the fallback_file WARN names the value", fallback_warn != nullptr);
-    test_expect_true(test, "and appears once", fallback_warn != nullptr && strstr(fallback_warn + 1, "fallback_file 'CON'") == nullptr);
-    test_expect_true(test, "the default_file WARN names the value, once", default_warn != nullptr && strstr(default_warn + 1, "default_file 'CON'") == nullptr);
+    test_expect_true(test, "the default_file WARN names the value", default_warn != nullptr);
+    test_expect_true(test, "and appears once - fallback_file is the same value, so it gets no WARN of its own",
+                     default_warn != nullptr && strstr(default_warn + 1, "default_file 'CON'") == nullptr && strstr(log_buffer, "fallback_file '") == nullptr);
     test_expect_true(test, "the service is still constructed", device.root_dir_size > 0 && device.route_prefix_size > 0);
 
     log_buffer_clear();
@@ -1964,6 +1985,7 @@ int main(void) {
     _test_reserved_windows_name_spellings_refused(&test, port);
     _test_short_name_refused(&test, port);
     _test_short_name_under_compare(&test, port);
+    _test_nul_in_path_refused(&test);
     _test_init_warns_on_device_default_file(&test);
 #endif // _WIN32
 

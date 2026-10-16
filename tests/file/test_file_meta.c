@@ -171,7 +171,9 @@ static void _test_windows_names(Test *const test) {
         { "empty", "", false },
         { "a/b", "a/b", false },
         { "a/b/ (trailing separator)", "a/b/", false },
-        { "a//b (empty component)", "a//b", false }
+        { "a//b (empty component)", "a//b", false },
+        { "CON/x (an intermediate device name opens nothing; the path rule does not look for devices)", "CON/x", false },
+        { "/x (an absolute POSIX path passes)", "/x", false }
     };
 
     for (USize i = 0; i < sizeof(paths) / sizeof(paths[0]); i += 1) {

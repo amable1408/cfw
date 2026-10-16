@@ -1,6 +1,6 @@
 /*
  * headers.h - HTTP header helpers for the C Libraries Framework
- * @version 0.4.2
+ * @version 0.4.3
  *
  * Builds common response headers: Cache-Control, Content-*, and browser
  * security policy headers.

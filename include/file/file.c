@@ -10,11 +10,6 @@
 
 #include <char/char.h>
 
-/* How many readings _file_path_addressable takes of one path: its UTF-8 reading and its
- * code-page reading, which must agree before the path is trusted to a narrow Win32 call.
- * Defined here, beside its only user, because this helper precedes the private macro block. */
-#define _FILE_PATH_READING_COUNT 2
-
 /*
  * Can the ANSI Win32 / CRT entry points below actually ADDRESS this path?
  *
@@ -87,9 +82,10 @@ static Result _file_path_addressable(char const *const path) {
         return unaddressable;
     }
 
-    // ONE block for both readings (the sizes are equal by now): the code-page half starts where
-    // the UTF-8 half ends, so there is a single allocation to refuse and a single one to free.
-    WCHAR *const as_utf8 = (WCHAR*) memory_try_alloc((USize) _FILE_PATH_READING_COUNT * (USize) utf8_size * sizeof(WCHAR));
+    // ONE block for both readings, the UTF-8 one and the code-page one (the sizes are equal by now):
+    // the code-page half starts where the UTF-8 half ends, so there is a single allocation to
+    // refuse and a single one to free.
+    WCHAR *const as_utf8 = (WCHAR*) memory_try_alloc((USize) 2 * (USize) utf8_size * sizeof(WCHAR));
 
     if (memory_empty(as_utf8)) {
         /* Refused rather than assumed safe - but as MEMORY, not as unaddressable: nothing is
@@ -385,6 +381,8 @@ void file_at(File *const self, USize const index, File_Position const position) 
     trace_log_push(LOG_METADATA);
 
     error_check_null(LOG_METADATA, "self", (void*) self);
+    // The caller's own enum (contract, not data): a value outside it would reach the C runtime as a bad whence.
+    error_check_wrong_value(LOG_METADATA, "position", (U32) position > (U32) FILE_POSITION_END);
 #ifdef ERROR_CHECK_ENABLED
     USize const file_size = file_get_size(self);
 

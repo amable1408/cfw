@@ -358,8 +358,20 @@ static void _test_seek_try_contract(Test *const test) {
 
     test_expect_true(test, "a BEGIN seek to 5 answers true", file_seek_try(file, 5, FILE_POSITION_BEGIN));
     test_expect_u(test, "two bytes are read from 5", 2, file_read_1(file, before, sizeof(char), 2));
+    errno = 0;
+
     test_expect_false(test, "an index of I64_MAX + 1 is refused (it would reach the runtime negative)", file_seek_try(file, (USize) I64_MAX + 1, FILE_POSITION_BEGIN));
+    test_expect_i(test, "the index refusal says EINVAL", EINVAL, errno);
+#ifdef _WIN32
+    SetLastError(ERROR_SUCCESS);
+#endif // _WIN32
+    errno = 0;
+
     test_expect_false(test, "a position outside File_Position is refused, not handed to the runtime", file_seek_try(file, 0, (File_Position) (FILE_POSITION_END + 1)));
+    test_expect_i(test, "the position refusal says EINVAL", EINVAL, errno);
+#ifdef _WIN32
+    test_expect_u(test, "and GetLastError says ERROR_INVALID_PARAMETER", ERROR_INVALID_PARAMETER, GetLastError());
+#endif // _WIN32
     test_expect_u(test, "the read after the refusal still answers", 3, file_read_1(file, after, sizeof(char), 3));
     test_expect_true(test, "and continues at 7: the position is untouched", char_equal_2(after, 3, content + 7, 3));
 

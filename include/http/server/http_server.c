@@ -138,10 +138,10 @@ typedef struct {
      * response is the dispatcher's stack object), so it lives here, with the connection:
      * served on LWS_CALLBACK_HTTP_WRITEABLE, released by _http_server_stream_reset. */
     _HTTP_Server_File_Stream    stream;
-    /* Set by the first send_file_handle take-over on this connection, whether the SO_SNDBUF cap
-     * took or not: the cap is applied once per connection and never restored (on Linux the
+    /* Records an ATTEMPT, not a success: set by the first send_file_handle take-over on this
+     * connection whether the SO_SNDBUF cap took or not: the cap is applied once per connection and never restored (on Linux the
      * lock is sticky). Zeroed with the rest of the session when libwebsockets allocates it. */
-    bool                        send_buffer_capped;
+    bool                        send_buffer_cap_tried;
 } HTTP_Session;
 
 /*==============================================================================
@@ -3366,10 +3366,10 @@ bool http_server_response_send_file_handle(HTTP_Server_Response *const self, Fil
      * reports double the request, so a "restore" would only re-lock at a different size. A
      * failure is not a refusal - the headers are already on the wire - so the stream runs
      * uncapped and the process says so once. */
-    if (!session->send_buffer_capped) {
+    if (!session->send_buffer_cap_tried) {
         Result const capped = net_socket_set_send_buffer_size((Net_Socket) lws_get_socket_fd(self->wsi), _HTTP_SERVER_FILE_STREAM_SEND_BUFFER_SIZE);
 
-        session->send_buffer_capped = true;
+        session->send_buffer_cap_tried = true;
 
         if (result_is_error(capped) && !atomic_exchange_explicit(&_send_buffer_cap_warned, true, memory_order_relaxed)) {
             log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_server: SO_SNDBUF could not be capped on a streamed socket - streams on it run uncapped (logged once per process)");

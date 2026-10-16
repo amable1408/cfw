@@ -368,6 +368,7 @@ static void _test_security_control_byte_refusal(Test *const test) {
     test_expect_true(test, "no injected header line leaked through", string_find_count_1(&block, "X-Injected") == 0);
     test_expect_true(test, "an unaffected field's line still renders", string_find_count_1(&block, "X-Frame-Options: DENY\r\n") == 1);
     test_expect_true(test, "the substitution is WARN-logged (Mid-1: was silent before)", char_length(log_buffer) > 0);
+    test_expect_true(test, "the by-value and create_2 paths say the header is omitted", strstr(log_buffer, "omitting its header") != nullptr);
 
     log_set_buffer(nullptr, 0);
     log_set_level(previous_level);
@@ -470,10 +471,10 @@ static void _test_security_arena(Test *const test) {
 static void _test_security_alloc_control_byte_refuses_whole(Test *const test) {
     test_case_begin(test, "security: alloc_init_2 refuses the WHOLE policy (Mid-1) when a value has a control byte, unlike the heap tier");
 
-    Arena                   arena           = arena_init_1(4096, ARENA_TYPE_LINEAR);
-    HTTP_Headers_Security   policy          = DEFAULT_INITIALIZATION;
-    char                    log_buffer[512] = DEFAULT_INITIALIZATION;
-    LogLevel const          previous_level  = log_get_level();
+    Arena                   arena            = arena_init_1(4096, ARENA_TYPE_LINEAR);
+    HTTP_Headers_Security   policy           = DEFAULT_INITIALIZATION;
+    char                    log_buffer[2048] = DEFAULT_INITIALIZATION;
+    LogLevel const          previous_level   = log_get_level();
 
     log_set_level(LOG_LEVEL_WARN);
     log_set_buffer(log_buffer, sizeof(log_buffer));
@@ -486,6 +487,8 @@ static void _test_security_alloc_control_byte_refuses_whole(Test *const test) {
     test_expect_null(test, "frame_options carries no data either - the whole policy is gone, not just the offending field", (void*) string_get_data(&policy.frame_options));
     test_expect_null(test, "allocator is cleared", (void*) policy.allocator);
     test_expect_true(test, "the refusal is WARN-logged", char_length(log_buffer) > 0);
+    test_expect_true(test, "the per-field line names the whole-policy refusal", strstr(log_buffer, "content_security_policy contains a control byte; refusing the whole policy") != nullptr);
+    test_expect_true(test, "and never claims a header was merely omitted - none was, the policy is refused", strstr(log_buffer, "omitting its header") == nullptr);
 
     log_set_buffer(nullptr, 0);
     log_set_level(previous_level);

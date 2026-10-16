@@ -1,6 +1,6 @@
 /*
  * static.h - HTTP static file service for the C Libraries Framework
- * @version 0.5.1
+ * @version 0.5.2
  *
  * Maps HTTP request paths to static assets on disk, resolving their MIME types,
  * validating path security, and serving the file data over HTTP.
@@ -26,6 +26,9 @@
  *     alias spellings (alternate data streams, trailing dot/space, 8.3 short names), through
  *     file/'s file_name_reserved_windows and file_path_aliased_windows - see file.h for the
  *     exact rules.
+ *   - A request path carrying a NUL byte is refused before any open - serve_1's caller-supplied
+ *     sized path and serve_2's request path alike (lws 4.5 never delivers one; the refusal
+ *     protects the caller-supplied path).
  *   - Opt-in dotfile refusal (refuse_dotfiles), `.well-known` exempt.
  *   - SPA fallback support, restricted to extension-less paths.
  *   - Arena and heap allocation.
@@ -360,9 +363,9 @@ HTTP_Service_Static http_service_static_init_1(char const *const root_dir, char 
  * @note See http_service_static_init_1 for the truncation-logs-WARN note (applies to
  *       default_file here too) and for the root_dir-must-exist note.
  * @note On Windows, a default_file that file_name_reserved_windows or file_path_aliased_windows
- *       refuses ("CON") logs one WARN here, echoing the value (it is config), for default_file and
- *       for the fallback_file copied from it; the service is still constructed and never serves that
- *       name.
+ *       refuses ("CON") logs one WARN here, echoing the value (it is config); the fallback_file
+ *       is copied from default_file, so it is the same value and gets no WARN of its own; the service is
+ *       still constructed and never serves that name.
  */
 HTTP_Service_Static http_service_static_init_2(char const *const root_dir, char const *const route_prefix, char const *const default_file, bool const spa_fallback, U32 const max_age);
 
@@ -370,7 +373,7 @@ HTTP_Service_Static http_service_static_init_2(char const *const root_dir, char 
  * @brief Attempt to serve a static file from a raw path string.
  * @param self Service instance.
  * @param response HTTP server response context.
- * @param path Requested URL path.
+ * @param path Requested URL path (sized; a NUL byte inside it is refused before any open).
  * @param path_size Size of the URL path string.
  * @return true if the static file was found and served.
  * @deprecated Since 0.3.1; deletion in 0.6.0 at the earliest, once the test-build seam exists (0.5.0 was taken by the streaming
@@ -413,6 +416,16 @@ void http_service_static_test_hook_after_open_set(FpHTTP_Service_Static_Test_Hoo
  * @note As http_service_static_test_hook_after_open_set.
  */
 void http_service_static_test_hook_after_resolve_set(FpHTTP_Service_Static_Test_Hook const hook);
+
+/**
+ * @brief Test build only: run the lexical resolve alone - no open, no response - over a SIZED
+ *        request path, so a suite can feed it bytes the HTTP stack never delivers (a NUL).
+ * @param self Service instance.
+ * @param path Request path, prefix included, not necessarily NUL-terminated.
+ * @param path_size Byte count of path.
+ * @return true when the path resolves to a file name this service would try to open.
+ */
+bool http_service_static_test_resolve(HTTP_Service_Static const *const self, char const *const path, USize const path_size);
 #endif // HTTP_SERVICE_STATIC_TEST_HOOKS
 
 /**

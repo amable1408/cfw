@@ -1688,12 +1688,12 @@ static void _abort_probe_handler(int const signal_number) {
  * caught and jumped out of, which is safe here because error_check_null aborts after the log
  * call has returned (no lock is held) and before the instance is touched; the only state the
  * jump skips is the call's own trace frame, which is popped back to the depth recorded here. */
-static bool _state_2_aborts(bool const issue, bool const null_self, bool const null_provider, bool const null_out) {
+static bool _state_2_aborts(Test *const test, bool const issue, bool const null_self, bool const null_provider, bool const null_out) {
     HTTP_Service_OAuth  oauth  = DEFAULT_INITIALIZATION;
     char                out[HTTP_SERVICE_OAUTH_STATE_MAX_SIZE + 1] = DEFAULT_INITIALIZATION;
     bool                aborted = false;
 
-    http_service_oauth_init_1(&oauth);
+    test_expect_true(test, "probe instance initialised", http_service_oauth_init_1(&oauth));
 
     HTTP_Service_OAuth *const self     = null_self ? nullptr : &oauth;
     char const *const         provider = null_provider ? nullptr : "google";
@@ -1726,14 +1726,14 @@ static bool _state_2_aborts(bool const issue, bool const null_self, bool const n
 static void _test_state_2_contract_checks_precede_the_binding_refusal(Test *const test) {
     test_case_begin(test, "state _2: the contract checks run BEFORE the empty-binding refusal");
 
-    test_expect_false(test, "control: valid arguments and an empty binding abort nothing (issue)", _state_2_aborts(true, false, false, false));
-    test_expect_false(test, "control: valid arguments and an empty binding abort nothing (verify)", _state_2_aborts(false, false, false, false));
+    test_expect_false(test, "control: valid arguments and an empty binding abort nothing (issue)", _state_2_aborts(test, true, false, false, false));
+    test_expect_false(test, "control: valid arguments and an empty binding abort nothing (verify)", _state_2_aborts(test, false, false, false, false));
 
-    test_expect_true(test, "a null self with an empty binding aborts at issue", _state_2_aborts(true, true, false, false));
-    test_expect_true(test, "and at verify", _state_2_aborts(false, true, false, false));
-    test_expect_true(test, "a null provider with an empty binding aborts at issue", _state_2_aborts(true, false, true, false));
-    test_expect_true(test, "and at verify", _state_2_aborts(false, false, true, false));
-    test_expect_true(test, "a null out with an empty binding aborts at issue", _state_2_aborts(true, false, false, true));
+    test_expect_true(test, "a null self with an empty binding aborts at issue", _state_2_aborts(test, true, true, false, false));
+    test_expect_true(test, "and at verify", _state_2_aborts(test, false, true, false, false));
+    test_expect_true(test, "a null provider with an empty binding aborts at issue", _state_2_aborts(test, true, false, true, false));
+    test_expect_true(test, "and at verify", _state_2_aborts(test, false, false, true, false));
+    test_expect_true(test, "a null out with an empty binding aborts at issue", _state_2_aborts(test, true, false, false, true));
 
     test_case_end(test);
 }

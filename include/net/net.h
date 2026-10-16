@@ -423,7 +423,9 @@ Result net_socket_set_reuse_address(Net_Socket const self, bool const enabled);
  *                   the socket out of send-buffer autotuning and out of the under-pressure
  *                   shrink (SOCK_SNDBUF_LOCK) - sticky for the socket's life; Windows takes it
  *                   literally. The OS clamps to its own min/max (Linux: net.core.wmem_max, stock
- *                   212992); 0 is passed through and means the OS minimum.
+ *                   212992); 0 is passed through: Linux raises it to its minimum send buffer, while on Windows
+ *                   0 disables AFD send buffering, so a send completes only once the stack has taken
+ *                   the bytes - not a way to say "default".
  * @return RESULT_SUCCESS, or a Result classifying setsockopt()'s failure.
  */
 Result net_socket_set_send_buffer_size(Net_Socket const self, U32 const byte_count);

@@ -658,6 +658,16 @@ static bool _http_service_static_resolve(HTTP_Service_Static const *const self,
         rel_path_size   -= 1;
     }
 
+    /* A NUL byte inside the sized path (%00): every open below takes a C string and would stop
+     * there, so the file opened is not the file the rest of the path names, and the lexical
+     * refusals that read the sized buffer judge a different name than the open does. A data
+     * value, so a refusal and never an error_check. */
+    if (memchr(rel_path, '\0', rel_path_size) != nullptr) {
+        trace_log_pop();
+
+        return false;
+    }
+
 #ifdef _WIN32
     /* An NTFS alternate data stream (':'), an 8.3 short alias or a trailing-dot/space component
      * anywhere in the path - the second spellings every lexical refusal below would otherwise
@@ -1372,17 +1382,13 @@ HTTP_Service_Static http_service_static_init_2(char const *const root_dir, char 
         self.fallback_file_size = (U8) (def_len < sizeof(self.fallback_file) ? def_len : sizeof(self.fallback_file) - 1);
 
 #ifdef _WIN32
-        /* Config, not request data, so it is echoed. Not a refusal of the service: serving a name
-         * Windows would read as a device or an alias is refused per request (a silent not-served,
-         * never an open), and the operator should learn why here, once. */
+        /* Config, not request data, so it is echoed. fallback_file was copied from default_file a few
+         * lines up - one value, so one check and one WARN. Not a refusal of the service: serving a
+         * name Windows would read as a device or an alias is refused per request (a silent
+         * not-served, never an open), and the operator should learn why here, once. */
         if (file_name_reserved_windows(self.default_file, self.default_file_size) || file_path_aliased_windows(self.default_file, self.default_file_size)) {
             log_message_2(LOG_LEVEL_WARN, LOG_METADATA,
-                "http_service_static_init_2: default_file '%s' is a Windows device or alias name and will never be served", self.default_file);
-        }
-
-        if (file_name_reserved_windows(self.fallback_file, self.fallback_file_size) || file_path_aliased_windows(self.fallback_file, self.fallback_file_size)) {
-            log_message_2(LOG_LEVEL_WARN, LOG_METADATA,
-                "http_service_static_init_2: fallback_file '%s' is a Windows device or alias name and will never be served", self.fallback_file);
+                "http_service_static_init_2: default_file '%s' (also the fallback_file) is a Windows device or alias name and will never be served", self.default_file);
         }
 #endif // _WIN32
     }
@@ -1564,6 +1570,23 @@ void http_service_static_test_hook_after_resolve_set(FpHTTP_Service_Static_Test_
     _http_service_static_hook_after_resolve = hook;
 
     trace_log_pop();
+}
+
+bool http_service_static_test_resolve(HTTP_Service_Static const *const self, char const *const path, USize const path_size) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+    error_check_null(LOG_METADATA, "path", (void*) path);
+
+    char    file_name[_HTTP_SERVICE_STATIC_PATH_BUFFER_MAX]  = DEFAULT_INITIALIZATION;
+    USize   relative_start                                  = 0;
+    bool    fallback_allowed                                = false;
+
+    bool const resolved = _http_service_static_resolve(self, path, path_size, file_name, sizeof(file_name), &relative_start, &fallback_allowed);
+
+    trace_log_pop();
+
+    return resolved;
 }
 #endif // HTTP_SERVICE_STATIC_TEST_HOOKS
 

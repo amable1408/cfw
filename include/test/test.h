@@ -1,11 +1,14 @@
 /*
  * test.h - Small test runner for the C Libraries Framework
  *
+ * @version 0.2.0
+ *
  * Features:
  *   - Jest-like suite, case, section, and summary output
  *   - Boolean, numeric, pointer, and string assertions
  *   - API coverage counters
- *   - Elapsed timing
+ *   - Elapsed timing (wall time from a monotonic clock, not CPU time; so a case
+ *     that sleeps or waits on a child reports the time actually spent)
  *
  * Usage Example:
  *   @code
@@ -45,6 +48,11 @@
  *   - <error/error.h> (chains tracelog -> log -> the standard headers used
  *     here); the assertion family calls error_check_null and traces via
  *     trace_log_push/pop.
+ *   - The case clock: on Windows QueryPerformanceCounter (test.c includes
+ *     <platform/windows/windows.h> itself, so a standalone build needs no
+ *     feature macro); on POSIX clock_gettime(CLOCK_MONOTONIC), which needs
+ *     _GNU_SOURCE or _POSIX_C_SOURCE >= 199309L under -std=c23 - every CFW
+ *     makefile sets it, and a standalone build must too.
  */
 #ifndef TEST_H
 #define TEST_H

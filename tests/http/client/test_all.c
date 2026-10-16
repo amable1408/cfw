@@ -63,6 +63,7 @@
 #define _LOG_SAFE_CONTROL_LIMIT 0x20  /* Bytes below this are control bytes. */
 #define _LOG_SAFE_DELETE_BYTE   0x7F  /* DEL. */
 #define _RESPONSE_CAP_64K       65536 /* The cap the 64 KiB cases set. */
+#define _VIEW_PROMOTE_BODY_SIZE 16384 /* Body size that cannot fit the 8192-byte view. */
 #define _VIEW_SENTINEL_BYTE     0xA5  /* Pre-fill for a caller buffer that must survive a request untouched. */
 #define _VIEW_SIZE              8192  /* data_size of the view-response cases' caller buffer. */
 
@@ -2094,6 +2095,112 @@ static void _test_heap_view_response_never_refused_for_no_cap(Test *const test) 
     test_case_end(test);
 }
 
+static void _test_heap_view_response_promoted_when_body_exceeds_view_under_no_cap(Test *const test) {
+    test_case_begin(test, "a HEAP view response (string_init_4 over 8192 bytes) under NO cap (0) and a 16384-byte body: the body cannot fit the view, "
+        "so the view is PROMOTED to an owner and the body is read through string_get_data");
+
+    Fixture_Server server = DEFAULT_INITIALIZATION;
+    server.script = FIXTURE_SCRIPT_OVERSIZED;
+    server.oversized_body_size = _VIEW_PROMOTE_BODY_SIZE;
+
+    if (!_start(test, &server)) {
+        test_case_end(test);
+
+        return;
+    }
+
+    char url[64] = DEFAULT_INITIALIZATION;
+    _url_for(fixture_server_port(&server), "/", url, sizeof(url));
+
+    HTTP_Client *client = http_client_new();
+
+    http_client_set_max_response_size(client, 0);
+
+    char buffer[_VIEW_SIZE + CHAR_END_CHARACTER] = DEFAULT_INITIALIZATION;
+
+    String response = string_init_4(buffer, _VIEW_SIZE);
+
+    HTTP_Client_Result result = http_client_get(client, url, &response);
+
+    test_expect_true(test, "the request succeeded", http_client_result_is_ok(&result));
+
+    test_expect_true(test, "the body is owned (the view was promoted to an owner)", response.owned);
+    test_expect_true(test, "the data is not the viewed buffer", string_get_data(&response) != buffer);
+    test_expect_u(test, "body size", _VIEW_PROMOTE_BODY_SIZE, string_get_size(&response));
+    http_client_result_uninit(&result);
+    string_uninit(&response);
+    http_client_delete(&client);
+    fixture_server_join(&server);
+    string_uninit(&server.request_body);
+
+    test_case_end(test);
+}
+
+static void _test_result_error_text_never_nullptr(Test *const test) {
+    test_case_begin(test, "http_client_result_error_text answers \"\" for an empty error and the text otherwise, never nullptr");
+
+    HTTP_Client_Result empty_result = DEFAULT_INITIALIZATION;
+
+    test_expect_not_null(test, "an empty error is never nullptr", (void*) http_client_result_error_text(&empty_result));
+    test_expect_string(test, "an empty error answers the empty string", "", http_client_result_error_text(&empty_result));
+
+    Net_Socket probe = NET_SOCKET_INVALID;
+    Net_Socket_Address address = net_socket_address_init_1(NET_FAMILY_IPV4, 0);
+
+    if (!test_expect_true(test, "probe bind succeeds", result_is_success(net_socket_init(&probe, NET_FAMILY_IPV4, NET_TYPE_TCP))
+        && result_is_success(net_socket_bind(probe, &address))
+        && result_is_success(net_socket_address_local(probe, &address)))) {
+        net_socket_close(probe);
+        test_case_end(test);
+
+        return;
+    }
+
+    U16 const closed_port = net_socket_address_port(&address);
+
+    net_socket_close(probe);
+
+    char url[64] = DEFAULT_INITIALIZATION;
+    _url_for(closed_port, "/", url, sizeof(url));
+
+    HTTP_Client *client = http_client_new();
+
+    http_client_set_connect_timeout_ms(client, 1000);
+
+    String response = string_init_1();
+    HTTP_Client_Result result = http_client_get(client, url, &response);
+
+    test_expect_false(test, "the request failed", result.success);
+    test_expect_true(test, "the accessor answers the stored text", http_client_result_error_text(&result) == string_get_data(&result.error));
+    test_expect_true(test, "the text is non-empty", http_client_result_error_text(&result)[0] != '\0');
+
+    http_client_result_uninit(&result);
+
+    test_expect_string(test, "a released result answers the empty string", "", http_client_result_error_text(&result));
+
+    string_uninit(&response);
+    http_client_delete(&client);
+
+    test_case_end(test);
+}
+
+static void _test_error_text_sanitise_replaces_control_bytes(Test *const test) {
+    test_case_begin(test, "the error-text sanitiser turns every byte below 0x20 and 0x7F into '?', keeps printable and >= 0x80 bytes, and leaves the text terminated");
+
+    char text[] = "a\x01" "b\r\n" "c\x7F" "d\xC3\xA9 ok";
+    USize const size = char_length(text);
+
+    http_client_test_error_text_sanitise(text, size);
+
+    test_expect_string(test, "control bytes (0x01, CR, LF, 0x7F) became '?', obs-text kept", "a?b??c?d\xC3\xA9 ok", text);
+    test_expect_u(test, "the length is unchanged and the terminator is intact", size, char_length(text));
+    test_expect_true(test, "0x01 became '?'", text[1] == '?');
+    test_expect_true(test, "0x7F became '?'", text[6] == '?');
+    test_expect_true(test, "the terminator byte is still NUL", text[size] == '\0');
+
+    test_case_end(test);
+}
+
 static void _test_arena_response_body_of_exactly_cap_succeeds(Test *const test) {
     test_case_begin(test, "an arena-backed response with a body of EXACTLY cap (65536) bytes under a 65536 cap succeeds: "
         "required = 65537 = cap + 1, the terminator alone - the 65535-byte row's boundary twin");
@@ -2504,6 +2611,9 @@ int main(void) {
     _test_arena_view_response_in_place_when_cap_fits(&test);
     _test_arena_view_response_promoted_when_cap_exceeds_view(&test);
     _test_heap_view_response_never_refused_for_no_cap(&test);
+    _test_heap_view_response_promoted_when_body_exceeds_view_under_no_cap(&test);
+    _test_result_error_text_never_nullptr(&test);
+    _test_error_text_sanitise_replaces_control_bytes(&test);
     _test_timeout_zero_no_abort_checked_build(&test);
     _test_arena_result_error_survives_next_request(&test);
     _test_arena_result_error_full_arena_falls_back_to_heap(&test);

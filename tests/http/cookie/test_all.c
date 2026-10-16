@@ -676,6 +676,58 @@ static void _test_alloc_init_success(Test *const test) {
     test_case_end(test);
 }
 
+static void _test_alloc_tier_2_twins(Test *const test) {
+    test_case_begin(test, "alloc_get_2 and alloc_clear_header_create_2 match their heap twins byte-for-byte");
+
+    Arena arena = arena_init_1(4096, ARENA_TYPE_LINEAR);
+
+    char const header_text[] = "a=1; b=22; c=3";
+
+    String sized = http_cookie_alloc_get_2(header_text, sizeof(header_text) - 1, "b", &arena);
+
+    test_expect_string(test, "alloc_get_2 finds the value", "22", string_get_data(&sized));
+
+    String clipped = http_cookie_alloc_get_2(header_text, 8, "b", &arena);
+
+    test_expect_string(test, "alloc_get_2 honours the sized header (clipped inside b's value)", "2", string_get_data(&clipped));
+
+    String arena_clear = http_cookie_alloc_clear_header_create_2("sid", "/app", "example.com", &arena);
+    String heap_clear  = http_cookie_clear_header_create_2("sid", "/app", "example.com");
+
+    test_expect_true(test, "alloc_clear_header_create_2 renders a non-empty header", !string_empty(&arena_clear));
+    test_expect_string(test, "alloc_clear_header_create_2 matches the heap tier's bytes", string_get_data(&heap_clear), string_get_data(&arena_clear));
+
+    string_uninit(&heap_clear);
+    arena_uninit(&arena, ARENA_TYPE_LINEAR);
+
+    test_case_end(test);
+}
+
+static void _test_alloc_init_2_explicit_values(Test *const test) {
+    test_case_begin(test, "alloc_init_2 with explicit path, SameSite and flags renders the same bytes as init_2");
+
+    Arena       arena   = arena_init_1(4096, ARENA_TYPE_LINEAR);
+    HTTP_Cookie cookie  = (HTTP_Cookie) DEFAULT_INITIALIZATION;
+    bool const  success = http_cookie_alloc_init_2(&cookie, "sid", "tok", "/app", HTTP_COOKIE_SAME_SITE_STRICT, false, true, &arena);
+
+    test_expect_true(test, "a roomy arena succeeds", success);
+
+    HTTP_Cookie heap_cookie  = http_cookie_init_2("sid", "tok", "/app", HTTP_COOKIE_SAME_SITE_STRICT, false, true);
+    String      arena_header = http_cookie_set_header_create(&cookie);
+    String      heap_header  = http_cookie_set_header_create(&heap_cookie);
+
+    test_expect_string(test, "the arena-backed cookie renders the heap tier's bytes", string_get_data(&heap_header), string_get_data(&arena_header));
+    test_expect_true(test, "the explicit path reached the header", char_contains_1(string_get_data(&arena_header), "Path=/app"));
+
+    string_uninit(&arena_header);
+    string_uninit(&heap_header);
+    http_cookie_uninit(&heap_cookie);
+    http_cookie_uninit(&cookie);
+    arena_uninit(&arena, ARENA_TYPE_LINEAR);
+
+    test_case_end(test);
+}
+
 /*==============================================================================
  * MARK: - Entry Point
  *============================================================================*/
@@ -706,6 +758,8 @@ int main(void) {
     _test_uninit_is_idempotent(&test);
     _test_alloc_tier_get_and_clear(&test);
     _test_alloc_init_success(&test);
+    _test_alloc_tier_2_twins(&test);
+    _test_alloc_init_2_explicit_values(&test);
     test_suite_end(&test);
 
     return test_uninit(&test);
