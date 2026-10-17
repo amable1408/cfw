@@ -29,6 +29,7 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - sync: datetime
 - `http/server`
 - sync: http/server
+- http/server 0.5.5: every block a request body outgrows while it is being received is wiped before release (0.5.4 wiped only the final block, so a body over 4 KiB carrying a password left an unwiped copy); the header now names what the wipe does not reach (libwebsockets' own receive, header and URI buffers, the response copy send_2 keeps until written, and owned copies a route takes through a getter). The suite waits, bounded, for the server thread's wipe instead of racing it (it failed once on a Linux runner).
 - `http/service/static`
 - `http/service/ip_block`
 - `http/service/security`

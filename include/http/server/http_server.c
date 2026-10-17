@@ -1059,6 +1059,8 @@ static I32 _http_server_callback_http(struct lws *wsi, enum lws_callback_reasons
                         /* A refusal is not an error here: the body path keeps doubling. */
                         if (!memory_empty(grown)) {
                             memory_copy_2(grown, presize, session->payload, session->payload_size);
+                            // The outgrown block holds body bytes (a password, a token): wipe before release.
+                            memory_wipe(session->payload, session->payload_capacity);
                             memory_delete((void**) &session->payload);
 
                             session->payload          = grown;
@@ -1087,6 +1089,7 @@ static I32 _http_server_callback_http(struct lws *wsi, enum lws_callback_reasons
 
                     if (memory_empty(session->payload)) {
                         if (!memory_empty(buffer)) {
+                            memory_wipe(buffer, session->payload_capacity);
                             memory_delete((void**) &buffer);
                         }
 
@@ -1100,6 +1103,8 @@ static I32 _http_server_callback_http(struct lws *wsi, enum lws_callback_reasons
 
                     if (buffer != nullptr) {
                         memory_copy_2(session->payload, payload_capacity_new, buffer, session->payload_size);
+                        // payload_capacity is still the OLD block's size here; it is updated below.
+                        memory_wipe(buffer, session->payload_capacity);
                         memory_delete((void**) &buffer);
                     }
 

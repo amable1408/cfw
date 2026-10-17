@@ -50,6 +50,9 @@
 #define _FIXTURE_REMOVE_SLEEP_MS    25
 #define _FORWARDED_DEEP_ENTRIES     33
 #define _FORWARDED_TEST_ENTRIES     40
+#define _GROW_BODY_FIRST_SIZE       3000
+#define _GROW_BODY_SIZE             12000
+#define _GROW_MARKER_SIZE           16
 /* Two handle-count readings this far apart that agree make a baseline. */
 #define _HANDLE_BASELINE_SLEEP_MS   100
 /* Handle-count pins poll this many rounds, this far apart (4 s), for the server to tear its wsi down. */
@@ -117,6 +120,8 @@
 /* Straddles the first chunk boundary (65531 + 10 > 65536). */
 #define _STREAM_WINDOW_SIZE         10
 #define _STREAM_WINDOW_START        65531
+#define _WIPE_WAIT_ROUNDS           200
+#define _WIPE_WAIT_SLEEP_MS         10
 
 /*==============================================================================
  * MARK: - Request builder
@@ -515,6 +520,7 @@ static USize    _body_seen_count                        = 0;
 extern void __real_memory_wipe(void *const dst, USize const dst_size);
 
 static volatile I32 _wiped_body_first  = 0;
+static volatile I32 _wiped_body_grown  = 0;
 static volatile I32 _wiped_body_second = 0;
 
 static bool _wipe_starts_with(void const *const dst, USize const dst_size, char const *const text, USize const text_size) {
@@ -538,6 +544,10 @@ void __wrap_memory_wipe(void *const dst, USize const dst_size) {
 
     if (_wipe_starts_with(dst, dst_size, "BBBBBBBBB", 9)) {
         _wiped_body_second = 1;
+    }
+
+    if (_wipe_starts_with(dst, dst_size, "DDDDDDDDDDDDDDDD", _GROW_MARKER_SIZE)) {
+        _wiped_body_grown += 1;
     }
 
     __real_memory_wipe(dst, dst_size);
@@ -1765,9 +1775,71 @@ static void _test_bodies(Test *const test) {
     }
 
     /* The body can carry a password or token: each one was wiped (its bytes still in the
-     * buffer when memory_wipe ran) before the session released it. */
+     * buffer when memory_wipe ran) before the session released it. The server resets the
+     * payload on its own thread right after the route ran - and the route has already
+     * written the reply - so the client can read the second reply and get here first. The
+     * first body's wipe is ordered by the second request; the second one is waited for,
+     * bounded, so a missing wipe still fails rather than hangs. */
+    for (USize round = 0; round < _WIPE_WAIT_ROUNDS && _wiped_body_second == 0; round += 1) {
+        thread_sleep(_WIPE_WAIT_SLEEP_MS);
+    }
+
     test_expect_true(test, "the first request body is wiped before its buffer is released", _wiped_body_first != 0);
     test_expect_true(test, "the second request body is wiped before its buffer is released", _wiped_body_second != 0);
+
+    http_server_delete(&server);
+
+    test_case_end(test);
+}
+
+/* 0.5.5: a body that outgrows its first block (two writes, so the server has bytes in hand
+ * when the second chunk arrives) is wiped at EVERY release - the outgrown block on the grow
+ * path and the final block on reset. Without the grow-path wipe only the reset is seen. */
+static void _test_body_grow_wiped(Test *const test) {
+    test_case_begin(test, "a body that outgrows its first block is wiped at every release (0.5.5)");
+
+    HTTP_Server *server = http_server_new();
+
+    http_server_route_add(server, "/echo", _route_echo);
+
+    U16 const port = _start(test, server);
+
+    static char body[_GROW_BODY_SIZE] = DEFAULT_INITIALIZATION;
+
+    memory_set(body, sizeof(body), (U8) 'D');
+
+    char head[128] = DEFAULT_INITIALIZATION;
+    I32 const head_size = snprintf(head, sizeof(head), "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", (int) _GROW_BODY_SIZE);
+
+    _wiped_body_grown = 0;
+
+    Net_Socket socket = DEFAULT_INITIALIZATION;
+
+    if (test_expect_true(test, "connection opens", _client_open(port, &socket))) {
+        _Reply reply = DEFAULT_INITIALIZATION;
+
+        bool ok = head_size > 0 && _client_write(socket, head, (USize) head_size);
+
+        ok = ok && _client_write(socket, body, _GROW_BODY_FIRST_SIZE);
+
+        // A pause, so the first chunk is in the server's buffer before the rest arrives.
+        thread_sleep(_WIPE_WAIT_SLEEP_MS * 5);
+
+        ok = ok && _client_write(socket, body + _GROW_BODY_FIRST_SIZE, _GROW_BODY_SIZE - _GROW_BODY_FIRST_SIZE);
+        ok = ok && _client_read(socket, &reply);
+
+        if (test_expect_true(test, "the large POST is answered", ok)) {
+            test_expect_u(test, "with a 200", 200, reply.status);
+        }
+
+        net_socket_close(socket);
+    }
+
+    for (USize round = 0; round < _WIPE_WAIT_ROUNDS && _wiped_body_grown < 2; round += 1) {
+        thread_sleep(_WIPE_WAIT_SLEEP_MS);
+    }
+
+    test_expect_true(test, "the outgrown block AND the final block are both wiped", _wiped_body_grown >= 2);
 
     http_server_delete(&server);
 
@@ -3543,6 +3615,7 @@ I32 main(void) {
     _test_routing(&test);
     _test_uri_too_long(&test);
     _test_bodies(&test);
+    _test_body_grow_wiped(&test);
     _test_content_length_and_zero_body(&test);
     _test_payload_limits(&test);
     _test_request_accessors(&test);

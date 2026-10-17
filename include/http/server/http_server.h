@@ -4,7 +4,7 @@
  *  @file    http_server.h
  *  @brief   HTTP/1.1 server over libwebsockets: routing, request accessors and
  *           response helpers.
- *  @version 0.5.4
+ *  @version 0.5.5
  *
  *  Features:
  *    - Exact and regex route registration on one server handle.
@@ -146,7 +146,11 @@
  *      only the HANDLE to the arena: the route list is the module's own heap
  *      allocation and must not be handed to an arena's deallocate.
  *    - The accumulated request body (it may hold a password or token) is wiped with
- *      memory_wipe when the session releases it (a buffer outgrown mid-body is not wiped).
+ *      memory_wipe when the session releases it, and every block it outgrows mid-body is wiped
+ *      before release too (0.5.5). Outside this guarantee: libwebsockets' own receive, header
+ *      and URI buffers (a Cookie, an Authorization header, a query-string token); the response
+ *      copy send_2 keeps until it is written; and any owned copy a route takes through a getter
+ *      (request_get_payload_*, header_get_*), which is the caller's to wipe.
  *    - Request, response and route objects are stack objects owned by the callback
  *      that received them; a pointer kept past its return dangles.
  *    - Tier _1 (char*) and tier _4 (String) getters answer an OWNED copy - release
