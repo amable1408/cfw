@@ -1688,6 +1688,17 @@ static void _probe_expect_abort(Test *const test, ProbeRow const *const row, USi
  * or not, and exit the way the forked Linux child does - 0 for a healthy control, and
  * _TEST_EXIT_ARMED_DEFECT when an armed probe survived the refused allocation. */
 static int _probe_child(char const *const row_text, char const *const armed_text) {
+    // A row text that is empty or holds a non-digit would read as row 0 and run the wrong probe.
+    if (char_empty(row_text)) {
+        return _TEST_EXIT_BAD_PROBE;
+    }
+
+    for (USize i = 0; row_text[i] != '\0'; i += 1) {
+        if (!char_check_number(row_text[i])) {
+            return _TEST_EXIT_BAD_PROBE;
+        }
+    }
+
     USize const row  = char_to_numbers_uint_1(row_text);
     bool const armed = char_compare_equal_1(armed_text, "1");
 

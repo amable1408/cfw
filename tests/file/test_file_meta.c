@@ -173,7 +173,8 @@ static void _test_windows_names(Test *const test) {
         { "a/b/ (trailing separator)", "a/b/", false },
         { "a//b (empty component)", "a//b", false },
         { "CON/x (an intermediate device name opens nothing; the path rule does not look for devices)", "CON/x", false },
-        { "/x (an absolute POSIX path passes)", "/x", false }
+        { "/x (an absolute POSIX path passes)", "/x", false },
+        { "//server/share/x (a UNC spelling passes like a POSIX one: the opener's two-leading-separator rule refuses it, not this predicate)", "//server/share/x", false }
     };
 
     for (USize i = 0; i < sizeof(paths) / sizeof(paths[0]); i += 1) {

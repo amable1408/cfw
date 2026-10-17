@@ -110,6 +110,12 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - http/cookie: `allocator != nullptr` spelled as headers.c does; `http_cookie_init_2` checks its arguments at the public entry; the suite gains the `_2` arena twins.
 - test 0.2.0 (first version marker): per-case durations are wall time from a monotonic clock (QueryPerformanceCounter / CLOCK_MONOTONIC), not CPU time, so a case that waits on a child reports the time spent; test.c includes windows.h itself, so a standalone build needs no feature macro on Windows (POSIX needs _GNU_SOURCE or _POSIX_C_SOURCE >= 199309L for clock_gettime).
 - process (tests only): the abort child keeps Windows Error Reporting out (`_set_abort_behavior`), so the UCRT exits 3 and the classification pin expects that; the own-death grandchild case gives the child 2 s to start under load.
+- sync: file, http/headers, http/service/static, process, test
+- http/service/static (tests only): the NUL-in-path refusal is pinned on every platform, not only Windows; the lws 4.5.99 measurement that %00 never reaches a route is dated in the suite.
+- http/headers (tests only): create_2's "omitting its header" consequence is pinned directly.
+- file (docs + tests): a UNC spelling (`//server/share/x`) passes file_path_aliased_windows like a POSIX path - the nofollow opener refuses UNC, not this predicate - stated and pinned; GetLastError pinned on the index refusal; the OOM harness refuses a non-digit probe row.
+- process (tests only): exit(3) being classified aborted on Windows is pinned as the documented UCRT ambiguity.
+- test (tests only): a sleeping case reports wall time (a pin that fails on the old clock() timer under POSIX).
 
 ## 0.2.0 - release
 

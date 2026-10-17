@@ -316,6 +316,7 @@ static void _test_security_create_rechecks_public_fields(Test *const test) {
 
     test_expect_true(test, "the WARN names the refused field", char_contains_1(log_buffer, "content_security_policy"));
     test_expect_false(test, "and never echoes the hostile value", char_contains_1(log_buffer, "X-Evil"));
+    test_expect_true(test, "and says create_2 omitted its header", char_contains_1(log_buffer, "omitting its header"));
 
     log_set_buffer(nullptr, 0);
     log_set_level(previous_level);
@@ -368,7 +369,7 @@ static void _test_security_control_byte_refusal(Test *const test) {
     test_expect_true(test, "no injected header line leaked through", string_find_count_1(&block, "X-Injected") == 0);
     test_expect_true(test, "an unaffected field's line still renders", string_find_count_1(&block, "X-Frame-Options: DENY\r\n") == 1);
     test_expect_true(test, "the substitution is WARN-logged (Mid-1: was silent before)", char_length(log_buffer) > 0);
-    test_expect_true(test, "the by-value and create_2 paths say the header is omitted", strstr(log_buffer, "omitting its header") != nullptr);
+    test_expect_true(test, "the init_2 path says the header is omitted", char_contains_1(log_buffer, "omitting its header"));
 
     log_set_buffer(nullptr, 0);
     log_set_level(previous_level);
@@ -487,8 +488,8 @@ static void _test_security_alloc_control_byte_refuses_whole(Test *const test) {
     test_expect_null(test, "frame_options carries no data either - the whole policy is gone, not just the offending field", (void*) string_get_data(&policy.frame_options));
     test_expect_null(test, "allocator is cleared", (void*) policy.allocator);
     test_expect_true(test, "the refusal is WARN-logged", char_length(log_buffer) > 0);
-    test_expect_true(test, "the per-field line names the whole-policy refusal", strstr(log_buffer, "content_security_policy contains a control byte; refusing the whole policy") != nullptr);
-    test_expect_true(test, "and never claims a header was merely omitted - none was, the policy is refused", strstr(log_buffer, "omitting its header") == nullptr);
+    test_expect_true(test, "the per-field line names the whole-policy refusal", char_contains_1(log_buffer, "content_security_policy contains a control byte; refusing the whole policy"));
+    test_expect_true(test, "and never claims a header was merely omitted - none was, the policy is refused", !char_contains_1(log_buffer, "omitting its header"));
 
     log_set_buffer(nullptr, 0);
     log_set_level(previous_level);

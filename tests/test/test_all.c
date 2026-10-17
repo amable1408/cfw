@@ -7,6 +7,7 @@
 #endif
 
 #include <test/test.h>
+#include <thread/thread.h>
 
 /* This suite verifies the test harness module (test.h/test.c) itself, so it cannot
  * grade itself with its own API. Outer verification is a bare hand-rolled counter;
@@ -433,6 +434,31 @@ static void _check_output_format(void) {
     _outer_check("output contains the Assertions summary line", strstr(buffer, "Assertions:") != nullptr);
 }
 
+/*== the harness clock is WALL time: a case that sleeps must advance case_started_at by about
+ * the sleep. Read white-box (the elapsed helpers are static and the printed "ms" figure is
+ * not stable to capture). On Windows clock() was already wall time, so this pin cannot fail
+ * there; it bites on POSIX, where the old clock() counted CPU time and the delta was ~0. ==*/
+static void _check_clock_is_wall_time(void) {
+    Test test = test_init("subject-wall-clock");
+
+    test_case_begin(&test, "first");
+
+    USize const first_started_at = test.case_started_at;
+
+    thread_sleep(50);
+    test_expect_true(&test, "a passing assertion", true);
+    test_case_end(&test);
+    test_case_begin(&test, "second");
+
+    USize const second_started_at = test.case_started_at;
+
+    test_case_end(&test);
+
+    _outer_check("a 50 ms sleep advances the harness clock by at least 40 ms (wall time, not CPU time)", second_started_at - first_started_at >= 40);
+
+    test_uninit(&test);
+}
+
 int main(void) {
     log_init((LogConfig) { .level = LOG_LEVEL_ERROR, .stream = stdout, .timestamp_enabled = true, .autoflush = true });
 
@@ -451,6 +477,7 @@ int main(void) {
     _check_unbalanced_scope_fails();
     _check_silenced_stream();
     _check_output_format();
+    _check_clock_is_wall_time();
 
     printf("\nouter checks: %llu run, %llu failed\n",
         (unsigned long long) _outer_total,

@@ -802,8 +802,10 @@ File* file_open_wait_3(String const *const file_name, char const *const file_mod
  *     "//./" (as in "//./PhysicalDrive0") IS ".", so exempting dot segments would pass the
  *     device namespace to any caller that uses the path at position zero ("//?/C:/x", the
  *     verbatim prefix, is caught by its ':').
- *     An absolute POSIX path passes ("/x" answers false) while an absolute Windows path never
- *     does (its drive colon answers true), so a caller that must accept both checks the shape itself.
+ *     An absolute POSIX path passes ("/x" answers false) while a drive-letter absolute path never
+ *     does (its colon answers true); a UNC spelling ("//server/share/x") passes like a POSIX one -
+ *     the nofollow opener's two-leading-separator rule refuses UNC, not this predicate - so a caller
+ *     that must accept or refuse a shape checks it itself.
  *   - A component shaped like an NTFS 8.3 short alias: its stem (the bytes before its first
  *     '.') is at most 8 bytes and contains '~' followed by an ASCII digit, the extension after
  *     that dot (if any) is at most 3 bytes, and the component has no space. ".env" is reachable

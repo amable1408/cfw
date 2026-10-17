@@ -1784,28 +1784,6 @@ static void _test_reserved_windows_name_spellings_refused(Test *const test, U16 
 }
 
 /*
- * A NUL byte inside the request path would be handed to the open as a C string and truncated
- * there, so the file that opens is not the file the rest of the path names. The resolver refuses
- * it before any open. lws drops a %00 request before it reaches any route (the connection closes
- * with no reply - measured), so the live route cannot carry one; the resolver is driven directly
- * through the test hook over a sized path. The un-NUL'd twin resolves: the refusal is the NUL.
- */
-static void _test_nul_in_path_refused(Test *const test) {
-    test_case_begin(test, "a NUL byte inside the path is refused by the resolver before any open");
-
-    static char const truncated[] = "/static/index.html\0.x";
-    static char const device[]    = "/static/CON\0/x";
-    static char const clean[]     = "/static/index.html";
-
-    test_expect_true(test, "control: the NUL-free twin resolves", http_service_static_test_resolve(&_svc_default, clean, sizeof(clean) - 1));
-    test_expect_true(test, "index.html + NUL + .x is refused (the truncated name would open index.html)", !http_service_static_test_resolve(&_svc_default, truncated, sizeof(truncated) - 1));
-    test_expect_true(test, "CON + NUL + /x is refused", !http_service_static_test_resolve(&_svc_default, device, sizeof(device) - 1));
-    test_expect_true(test, "a NUL as the last byte is refused", !http_service_static_test_resolve(&_svc_default, "/static/index.html\0", sizeof("/static/index.html")));
-
-    test_case_end(test);
-}
-
-/*
  * A default_file / fallback_file that file/ reads as a Windows device is config, not request data:
  * construction logs ONE WARN (the two fields are one value), echoing it, and still constructs (ruling 2449 - a
  * bad fallback is a silent not-served, never a refusal of the service). A healthy name logs nothing.
@@ -1902,6 +1880,29 @@ static void _test_short_name_refused(Test *const test, U16 const port) {
 }
 #endif // _WIN32
 
+/*
+ * A NUL byte inside the request path would be handed to the open as a C string and truncated
+ * there, so the file that opens is not the file the rest of the path names. The resolver refuses
+ * it before any open. lws 4.5.99 (dep/libwebsockets/lws_config.h) drops a %00 request before it reaches any
+ * route (measured: GET /static/index.html%00.x HTTP/1.1 -> connection closed, zero bytes), so the live route cannot carry one; the resolver is driven directly
+ * through the test hook over a sized path. The un-NUL'd twin resolves: the refusal is the NUL.
+ */
+static void _test_nul_in_path_refused(Test *const test) {
+    test_case_begin(test, "a NUL byte inside the path is refused by the resolver before any open");
+
+    static char const truncated[] = "/static/index.html\0.x";
+    static char const device[]    = "/static/CON\0/x";
+    static char const clean[]     = "/static/index.html";
+    static char const trailing[]  = "/static/index.html\0";
+
+    test_expect_true(test, "control: the NUL-free twin resolves", http_service_static_test_resolve(&_svc_default, clean, sizeof(clean) - 1));
+    test_expect_true(test, "index.html + NUL + .x is refused (the truncated name would open index.html)", !http_service_static_test_resolve(&_svc_default, truncated, sizeof(truncated) - 1));
+    test_expect_true(test, "CON + NUL + /x is refused", !http_service_static_test_resolve(&_svc_default, device, sizeof(device) - 1));
+    test_expect_true(test, "a NUL as the last byte is refused", !http_service_static_test_resolve(&_svc_default, trailing, sizeof(trailing) - 1));
+
+    test_case_end(test);
+}
+
 /*==============================================================================
  * MARK: - Entry point
  *============================================================================*/
@@ -1979,13 +1980,13 @@ int main(void) {
     _test_slow_reader(&test, port);
     _test_dotfiles(&test, port);
     _test_tilde_name_served(&test, port);
+    _test_nul_in_path_refused(&test);
 #ifdef _WIN32
     _test_ntfs_spellings_refused(&test, port);
     _test_reserved_windows_name_refused(&test, port);
     _test_reserved_windows_name_spellings_refused(&test, port);
     _test_short_name_refused(&test, port);
     _test_short_name_under_compare(&test, port);
-    _test_nul_in_path_refused(&test);
     _test_init_warns_on_device_default_file(&test);
 #endif // _WIN32
 

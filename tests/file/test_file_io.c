@@ -363,6 +363,7 @@ static void _test_seek_try_contract(Test *const test) {
     test_expect_false(test, "an index of I64_MAX + 1 is refused (it would reach the runtime negative)", file_seek_try(file, (USize) I64_MAX + 1, FILE_POSITION_BEGIN));
     test_expect_i(test, "the index refusal says EINVAL", EINVAL, errno);
 #ifdef _WIN32
+    test_expect_u(test, "and GetLastError says ERROR_INVALID_PARAMETER for the index refusal too", ERROR_INVALID_PARAMETER, GetLastError());
     SetLastError(ERROR_SUCCESS);
 #endif // _WIN32
     errno = 0;

@@ -966,6 +966,18 @@ static void _test_aborted_predicate(Test *const test) {
 
     process_outcome_uninit(&outcome);
 
+#ifdef OS_WINDOWS
+    /* Documented UCRT contract (process.c): the legacy msvcrt abort() is a plain exit(3), so a deliberate exit(3) is indistinguishable. */
+    char const *const argv_three[] = { _program, "--child-exit", "3", nullptr };
+    ProcessSpec const spec_three = { .argv = argv_three, .timeout_milliseconds = 5000 };
+
+    process_run(spec_three, &outcome);
+
+    test_expect_true(test, "an exit(3) IS classified aborted on Windows (accepted ambiguity)", process_outcome_aborted(&outcome));
+
+    process_outcome_uninit(&outcome);
+#endif // OS_WINDOWS
+
     test_expect_false(test, "a released outcome is not aborted", process_outcome_aborted(&outcome));
 
     test_case_end(test);
