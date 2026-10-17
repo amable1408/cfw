@@ -203,6 +203,79 @@ static void _test_crypto_random_uniform_max_bound(Test *const test) {
     test_case_end(test);
 }
 
+/* memory_wipe is interposed at link time (-Wl,--wrap=memory_wipe in the makefile):
+ * every wipe issued by the module under test is logged (size, and whether the
+ * buffer still held a nonzero byte at that moment, i.e. a live secret rather
+ * than an already-zero buffer), then forwarded to the real primitive. */
+#define _TEST_WIPE_LOG_MAX 16
+
+typedef struct {
+    USize count;
+    USize sizes[_TEST_WIPE_LOG_MAX];
+    bool live[_TEST_WIPE_LOG_MAX];
+} TestWipeLog;
+
+static TestWipeLog _test_wipe_log;
+
+void __real_memory_wipe(void *const dst, USize const dst_size);
+
+void __wrap_memory_wipe(void *const dst, USize const dst_size) {
+    if (_test_wipe_log.count < _TEST_WIPE_LOG_MAX) {
+        bool live = false;
+
+        for (USize i = 0; i < dst_size; i += 1) {
+            if (((U8 const*) dst)[i] != 0) {
+                live = true;
+            }
+        }
+
+        _test_wipe_log.sizes[_test_wipe_log.count] = dst_size;
+        _test_wipe_log.live[_test_wipe_log.count]  = live;
+    }
+
+    _test_wipe_log.count += 1;
+
+    __real_memory_wipe(dst, dst_size);
+}
+
+static void _test_wipe_log_reset(void) {
+    _test_wipe_log = (TestWipeLog) { 0 };
+}
+
+static void _test_crypto_random_wipes_transients(Test *const test) {
+    test_case_begin(test, "crypto_random: the raw draw chunk and the uniform draw are wiped");
+
+    char hex_small[CRYPTO_RANDOM_HEX_SIZE(32) + CHAR_END_CHARACTER]  = DEFAULT_INITIALIZATION;
+    char hex_large[CRYPTO_RANDOM_HEX_SIZE(130) + CHAR_END_CHARACTER] = DEFAULT_INITIALIZATION;
+
+    _test_wipe_log_reset();
+
+    test_expect_true(test, "hex(32) succeeds", result_is_success(crypto_random_hex(hex_small, 32)));
+    test_expect_u(test, "hex(32): one chunk, one wipe", 1, _test_wipe_log.count);
+    test_expect_u(test, "hex(32): the wipe covers the whole chunk buffer", 64, _test_wipe_log.sizes[0]);
+    test_expect_true(test, "hex(32): the chunk held token bytes when wiped", _test_wipe_log.live[0]);
+
+    _test_wipe_log_reset();
+
+    test_expect_true(test, "hex(130) succeeds", result_is_success(crypto_random_hex(hex_large, 130)));
+    test_expect_u(test, "hex(130): three chunks, three wipes", 3, _test_wipe_log.count);
+
+    U64 value = 0;
+
+    _test_wipe_log_reset();
+
+    test_expect_true(test, "uniform(1) succeeds", result_is_success(crypto_random_uniform(1, &value)));
+    test_expect_u(test, "uniform(1) draws nothing, so wipes nothing", 0, _test_wipe_log.count);
+
+    _test_wipe_log_reset();
+
+    test_expect_true(test, "uniform(10) succeeds", result_is_success(crypto_random_uniform(10, &value)));
+    test_expect_true(test, "uniform(10): the draw is wiped", _test_wipe_log.count >= 1);
+    test_expect_u(test, "uniform(10): the wipe covers the draw", sizeof(U64), _test_wipe_log.sizes[0]);
+
+    test_case_end(test);
+}
+
 int main(void) {
     log_init((LogConfig){ .level = LOG_LEVEL_ERROR, .stream = stdout, .timestamp_enabled = true, .autoflush = true });
 
@@ -218,6 +291,7 @@ int main(void) {
     _test_crypto_random_uniform_range(&test);
     _test_crypto_random_argument_rejection(&test);
     _test_crypto_random_uniform_max_bound(&test);
+    _test_crypto_random_wipes_transients(&test);
     test_suite_end(&test);
 
     return test_uninit(&test);

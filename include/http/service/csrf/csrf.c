@@ -521,6 +521,7 @@ bool http_service_csrf_mint(HTTP_Service_CSRF const *const self, HTTP_Service_CS
      * mismatch nothing logs. Release both rather than hand back half a pair. */
     if (string_empty(cookie)) {
         http_service_csrf_token_uninit(token);
+        string_wipe(cookie);
         string_uninit(cookie);
 
         trace_log_pop();
@@ -581,6 +582,7 @@ bool http_service_csrf_request_allowed_2(HTTP_Service_CSRF const *const self, ch
     String      cookie_value = http_service_csrf_cookie_read(self, cookie_header);
     bool const  allowed      = http_service_csrf_token_verify_2(self, header_token, string_get_data(&cookie_value));
 
+    string_wipe(&cookie_value);
     string_uninit(&cookie_value);
 
     trace_log_pop();
@@ -614,6 +616,7 @@ bool http_service_csrf_request_allowed_4(HTTP_Service_CSRF const *const self, ch
     bool const  allowed      = _http_service_csrf_token_equal(
         string_get_data(header_token), string_get_size(header_token), string_get_data(&cookie_value), string_get_size(&cookie_value));
 
+    string_wipe(&cookie_value);
     string_uninit(&cookie_value);
 
     trace_log_pop();
@@ -647,6 +650,7 @@ bool http_service_csrf_token_create(HTTP_Service_CSRF const *const self, HTTP_Se
     if (buffer == nullptr || result_is_error(crypto_random_hex(buffer, self->token_byte_count))) {
         log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_service_csrf_token_create: refusing - no buffer, or the CSPRNG did not produce a token");
 
+        string_wipe(&value);
         string_uninit(&value);
 
         trace_log_pop();
@@ -681,6 +685,7 @@ void http_service_csrf_token_uninit(HTTP_Service_CSRF_Token *const self) {
 
     error_check_null(LOG_METADATA, "self", (void*) self);
 
+    string_wipe(&self->value);
     string_uninit(&self->value);
 
     self->expires_at = 0;

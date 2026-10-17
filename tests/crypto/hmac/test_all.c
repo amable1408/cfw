@@ -74,9 +74,11 @@ static void _test_rfc4231_short_keys(Test *const test) {
     test_expect_true(test, "case 1 sha512 computes", result_is_success(crypto_hmac_sha512_hex_1(key, sizeof(key), _TEST_TC1_MESSAGE, char_length(_TEST_TC1_MESSAGE), hex)));
     test_expect_string(test, "case 1 sha512 digest", _TEST_TC1_SHA512, hex);
 
-    test_expect_true(test, "case 2 sha256 computes", result_is_success(crypto_hmac_sha256_hex_1(_TEST_TC2_KEY, char_length(_TEST_TC2_KEY), _TEST_TC2_MESSAGE, char_length(_TEST_TC2_MESSAGE), hex)));
+    test_expect_true(test, "case 2 sha256 computes",
+        result_is_success(crypto_hmac_sha256_hex_1(_TEST_TC2_KEY, char_length(_TEST_TC2_KEY), _TEST_TC2_MESSAGE, char_length(_TEST_TC2_MESSAGE), hex)));
     test_expect_string(test, "case 2 sha256 digest", _TEST_TC2_SHA256, hex);
-    test_expect_true(test, "case 2 sha512 computes", result_is_success(crypto_hmac_sha512_hex_1(_TEST_TC2_KEY, char_length(_TEST_TC2_KEY), _TEST_TC2_MESSAGE, char_length(_TEST_TC2_MESSAGE), hex)));
+    test_expect_true(test, "case 2 sha512 computes",
+        result_is_success(crypto_hmac_sha512_hex_1(_TEST_TC2_KEY, char_length(_TEST_TC2_KEY), _TEST_TC2_MESSAGE, char_length(_TEST_TC2_MESSAGE), hex)));
     test_expect_string(test, "case 2 sha512 digest", _TEST_TC2_SHA512, hex);
 
     _test_fill(key, sizeof(key), _TEST_KEY_BYTE_AA);
@@ -221,7 +223,76 @@ static void _test_verify_rejections(Test *const test) {
     test_expect_false(test, "verify rejects a short expected hex", crypto_hmac_sha256_verify_1(key, key_size, message, message_size, "deadbeef"));
     test_expect_false(test, "verify rejects an empty expected hex", crypto_hmac_sha256_verify_1(key, key_size, message, message_size, ""));
     test_expect_false(test, "sha512 verify rejects a sha256-length expected hex", crypto_hmac_sha512_verify_1(key, key_size, message, message_size, _TEST_MESSAGE_SHA256));
-    test_expect_false(test, "verify rejects the right digest under a different key", crypto_hmac_sha256_verify_1("wrong key", char_length("wrong key"), message, message_size, _TEST_MESSAGE_SHA256));
+    test_expect_false(test, "verify rejects the right digest under a different key",
+        crypto_hmac_sha256_verify_1("wrong key", char_length("wrong key"), message, message_size, _TEST_MESSAGE_SHA256));
+
+    test_case_end(test);
+}
+
+/* memory_wipe is interposed at link time (-Wl,--wrap=memory_wipe in the makefile):
+ * every wipe issued by the module under test is logged (size, and whether the
+ * buffer still held a nonzero byte at that moment, i.e. a live secret rather
+ * than an already-zero buffer), then forwarded to the real primitive. */
+#define _TEST_WIPE_LOG_MAX 16
+
+typedef struct {
+    USize count;
+    USize sizes[_TEST_WIPE_LOG_MAX];
+    bool live[_TEST_WIPE_LOG_MAX];
+} TestWipeLog;
+
+static TestWipeLog _test_wipe_log;
+
+void __real_memory_wipe(void *const dst, USize const dst_size);
+
+void __wrap_memory_wipe(void *const dst, USize const dst_size) {
+    if (_test_wipe_log.count < _TEST_WIPE_LOG_MAX) {
+        bool live = false;
+
+        for (USize i = 0; i < dst_size; i += 1) {
+            if (((U8 const*) dst)[i] != 0) {
+                live = true;
+            }
+        }
+
+        _test_wipe_log.sizes[_test_wipe_log.count] = dst_size;
+        _test_wipe_log.live[_test_wipe_log.count]  = live;
+    }
+
+    _test_wipe_log.count += 1;
+
+    __real_memory_wipe(dst, dst_size);
+}
+
+static void _test_wipe_log_reset(void) {
+    _test_wipe_log = (TestWipeLog) { 0 };
+}
+
+static void _test_crypto_hmac_wipes_transients(Test *const test) {
+    test_case_begin(test, "crypto_hmac: the staged raw MAC and verify's recomputed hex are wiped");
+
+    char output[CRYPTO_HMAC_SHA256_HEX_SIZE + CHAR_END_CHARACTER] = DEFAULT_INITIALIZATION;
+
+    _test_wipe_log_reset();
+
+    test_expect_true(test, "hex succeeds", result_is_success(crypto_hmac_sha256_hex_1(_TEST_TC2_KEY, char_length(_TEST_TC2_KEY), _TEST_TC1_MESSAGE, char_length(_TEST_TC1_MESSAGE), output)));
+    test_expect_u(test, "hex: exactly one wipe", 1, _test_wipe_log.count);
+    test_expect_u(test, "hex: the wipe covers the staging buffer", EVP_MAX_MD_SIZE, _test_wipe_log.sizes[0]);
+    test_expect_true(test, "hex: the staging buffer held the MAC when wiped", _test_wipe_log.live[0]);
+
+    _test_wipe_log_reset();
+
+    test_expect_true(test, "verify accepts its own MAC", crypto_hmac_sha256_verify_1(_TEST_TC2_KEY, char_length(_TEST_TC2_KEY), _TEST_TC1_MESSAGE, char_length(_TEST_TC1_MESSAGE), output));
+    test_expect_u(test, "verify: staging and recomputed hex are both wiped", 2, _test_wipe_log.count);
+    test_expect_u(test, "verify: staging size", EVP_MAX_MD_SIZE, _test_wipe_log.sizes[0]);
+    test_expect_u(test, "verify: recomputed hex size", CRYPTO_HMAC_SHA512_HEX_SIZE + CHAR_END_CHARACTER, _test_wipe_log.sizes[1]);
+    test_expect_true(test, "verify: the recomputed hex held the MAC when wiped", _test_wipe_log.live[1]);
+
+    _test_wipe_log_reset();
+
+    bool const accepted = crypto_hmac_sha256_verify_1(_TEST_TC2_KEY, char_length(_TEST_TC2_KEY), _TEST_TC1_MESSAGE, char_length(_TEST_TC1_MESSAGE), "abc");
+    test_expect_true(test, "verify rejects a wrong-length MAC", !accepted);
+    test_expect_u(test, "a length-rejected verify computes nothing, so wipes nothing", 0, _test_wipe_log.count);
 
     test_case_end(test);
 }
@@ -239,6 +310,7 @@ int main(void) {
     _test_overloads(&test);
     _test_empty_values(&test);
     _test_verify_rejections(&test);
+    _test_crypto_hmac_wipes_transients(&test);
     test_suite_end(&test);
 
     return test_uninit(&test);

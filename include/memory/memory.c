@@ -216,3 +216,40 @@ void* memory_try_alloc(USize const byte_count) {
 
     return (void*) buffer;
 }
+
+/* Loaded through a volatile object on every call, so the compiler can never prove the callee is
+ * memset, never inlines it, and never treats the stores as dead (C23 6.7.4: accesses to volatile
+ * objects may not be elided). Only memory_wipe reads it. */
+static void *(*volatile _memory_memset)(void*, int, size_t) = memset;
+
+void memory_wipe(void *const dst, USize const dst_size) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "dst", (void*) dst);
+
+    if (dst_size == 0) {
+        trace_log_pop();
+
+        return;
+    }
+
+    _memory_memset(dst, 0, dst_size);
+#if defined(__GNUC__) || defined(__clang__)
+    /* Names dst and clobbers memory: every store above must be complete and may be read here, so
+     * none can be sunk or elided even after LTO inlines this whole function. NOT redundant with
+     * the opaque call: under -fprofile-use GCC may speculatively devirtualize the call into
+     * `if (fp == memset) <inlined memset> else call *fp`, and this clobber is what keeps that
+     * inlined branch's stores alive. Do not delete it as belt and braces. */
+    __asm__ __volatile__("" : : "r"(dst) : "memory");
+#else
+    {
+        volatile U8 *const at = (volatile U8*) dst;
+
+        for (USize i = 0; i < dst_size; i += 1) {
+            at[i] = 0;
+        }
+    }
+#endif
+
+    trace_log_pop();
+}

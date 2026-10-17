@@ -4,6 +4,7 @@
  *  @file    kdf.h
  *  @brief   Key derivation functions over OpenSSL — PBKDF2-HMAC-SHA256.
  *  @author  CFW
+ *  @version 0.2.0
  *  @date    2026-08-09
  *  @license MIT (see LICENSE file)
  *
@@ -65,9 +66,11 @@
  *      undefined.
  *    - Nothing here is wiped: the derived key left in output (and any partial
  *      bytes written before a LIBRARY failure) persists until the caller
- *      overwrites it. The module holds no secret locals of its own. CFW has
- *      no memory_wipe primitive yet — a caller holding key material is
- *      responsible for clearing its own buffers when done.
+ *      overwrites it. The module holds no secret locals of its own, so it
+ *      has nothing to wipe. A caller holding key material is responsible
+ *      for clearing its own buffers when done: call memory_wipe(output,
+ *      output_size) from <memory/memory.h> (NOT memory_set, which the
+ *      optimizer may drop) before the buffer is released or reused.
  *
  *  Performance Characteristics:
  *    - Deliberately expensive: linear in iterations (that is the point of a

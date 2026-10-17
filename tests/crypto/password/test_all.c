@@ -184,6 +184,91 @@ static void _test_malformed_records(Test *const test) {
     test_case_end(test);
 }
 
+/* memory_wipe is interposed at link time (-Wl,--wrap=memory_wipe in the makefile):
+ * every wipe issued by the module under test is logged (size, and whether the
+ * buffer still held a nonzero byte at that moment, i.e. a live secret rather
+ * than an already-zero buffer), then forwarded to the real primitive. */
+#define _TEST_WIPE_LOG_MAX 16
+
+typedef struct {
+    USize count;
+    USize sizes[_TEST_WIPE_LOG_MAX];
+    bool live[_TEST_WIPE_LOG_MAX];
+} TestWipeLog;
+
+static TestWipeLog _test_wipe_log;
+
+void __real_memory_wipe(void *const dst, USize const dst_size);
+
+void __wrap_memory_wipe(void *const dst, USize const dst_size) {
+    if (_test_wipe_log.count < _TEST_WIPE_LOG_MAX) {
+        bool live = false;
+
+        for (USize i = 0; i < dst_size; i += 1) {
+            if (((U8 const*) dst)[i] != 0) {
+                live = true;
+            }
+        }
+
+        _test_wipe_log.sizes[_test_wipe_log.count] = dst_size;
+        _test_wipe_log.live[_test_wipe_log.count]  = live;
+    }
+
+    _test_wipe_log.count += 1;
+
+    __real_memory_wipe(dst, dst_size);
+}
+
+static void _test_wipe_log_reset(void) {
+    _test_wipe_log = (TestWipeLog) { 0 };
+}
+
+static void _test_crypto_password_wipes_transients(Test *const test) {
+    test_case_begin(test, "crypto_password: salt, key, hex forms and the verify candidate are wiped on every path");
+
+    _test_wipe_log_reset();
+
+    String stored = crypto_password_hash_1("pw", 1000);
+
+    test_expect_true(test, "hash produced a record", !string_empty(&stored));
+    test_expect_u(test, "hash: four wipes", 4, _test_wipe_log.count);
+    test_expect_u(test, "hash: salt size", CRYPTO_PASSWORD_SALT_BYTE_COUNT, _test_wipe_log.sizes[0]);
+    test_expect_u(test, "hash: key size", CRYPTO_PASSWORD_HASH_BYTE_COUNT, _test_wipe_log.sizes[1]);
+    test_expect_u(test, "hash: salt hex size", ENCODING_HEX_SIZE(CRYPTO_PASSWORD_SALT_BYTE_COUNT) + CHAR_END_CHARACTER, _test_wipe_log.sizes[2]);
+    test_expect_u(test, "hash: key hex size", ENCODING_HEX_SIZE(CRYPTO_PASSWORD_HASH_BYTE_COUNT) + CHAR_END_CHARACTER, _test_wipe_log.sizes[3]);
+    test_expect_true(test, "hash: every buffer was live when wiped", _test_wipe_log.live[0] && _test_wipe_log.live[1] && _test_wipe_log.live[2] && _test_wipe_log.live[3]);
+
+    string_uninit(&stored);
+
+    _test_wipe_log_reset();
+
+    String refused = crypto_password_hash_1("pw", 0);
+
+    test_expect_true(test, "iterations 0 is refused", string_empty(&refused));
+    test_expect_u(test, "a refused hash declares no secret buffers, so wipes nothing", 0, _test_wipe_log.count);
+
+    string_uninit(&refused);
+
+    _test_wipe_log_reset();
+
+    test_expect_true(test, "verify accepts the golden record", crypto_password_verify_1(_TEST_GOLDEN_PASSWORD, _TEST_GOLDEN_STORED));
+    test_expect_u(test, "verify: three wipes", 3, _test_wipe_log.count);
+    test_expect_u(test, "verify: salt size", CRYPTO_PASSWORD_SALT_BYTE_COUNT, _test_wipe_log.sizes[0]);
+    test_expect_u(test, "verify: stored hash size", CRYPTO_PASSWORD_HASH_BYTE_COUNT, _test_wipe_log.sizes[1]);
+    test_expect_u(test, "verify: candidate size", CRYPTO_PASSWORD_HASH_BYTE_COUNT, _test_wipe_log.sizes[2]);
+    test_expect_true(test, "verify: every buffer was live when wiped", _test_wipe_log.live[0] && _test_wipe_log.live[1] && _test_wipe_log.live[2]);
+
+    _test_wipe_log_reset();
+
+    test_expect_true(test, "verify rejects a malformed record", !crypto_password_verify_1("pw", "garbage"));
+    test_expect_u(test, "verify: the parse-failure path wipes all three buffers too", 3, _test_wipe_log.count);
+
+    test_expect_true(test, "verify rejects a wrong password", !crypto_password_verify_1("wrong horse", _TEST_GOLDEN_STORED));
+    test_expect_u(test, "verify: the mismatch path wipes all three buffers too", 6, _test_wipe_log.count);
+
+    test_case_end(test);
+}
+
 int main(void) {
     log_init((LogConfig){ .level = LOG_LEVEL_ERROR, .stream = stdout, .timestamp_enabled = true, .autoflush = true });
 
@@ -197,6 +282,7 @@ int main(void) {
     _test_empty_password_values(&test);
     _test_fail_closed_hashing(&test);
     _test_malformed_records(&test);
+    _test_crypto_password_wipes_transients(&test);
     test_suite_end(&test);
 
     return test_uninit(&test);

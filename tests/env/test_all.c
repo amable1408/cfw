@@ -1,7 +1,99 @@
 #include <stdio.h>
+#include <string.h>
+#include <malloc.h>
 
 #include <env/env.h>
 #include <test/test.h>
+
+/*==============================================================================
+ * MARK: - Free watch
+ *============================================================================*/
+
+/* Linked with -Wl,--wrap=free (see makefile). While armed, every free() reads the block it is
+ * about to release and counts the blocks that still hold a watched secret: a secret RELEASED
+ * WITHOUT being wiped first. Reading a block the program still owns is defined behavior, unlike
+ * reading it after the release. A slot may also name the one block it watches (a pointer), so a
+ * copy another library owns (libcurl's header list) is not mistaken for ours. */
+void __real_free(void *const pointer);
+void __wrap_free(void *const pointer);
+
+#define _FREE_WATCH_SLOTS 4
+
+static char const *_free_watch_needles[_FREE_WATCH_SLOTS];
+static USize       _free_watch_needle_sizes[_FREE_WATCH_SLOTS];
+static void const *_free_watch_pointers[_FREE_WATCH_SLOTS];
+static USize       _free_watch_slot_count = 0;
+static USize       _free_watch_hits       = 0;
+
+static USize _free_watch_block_size(void *const pointer) {
+#if defined(_WIN32)
+    return (USize) _msize(pointer);
+#else
+    return (USize) malloc_usable_size(pointer);
+#endif
+}
+
+void __wrap_free(void *const pointer) {
+    if (pointer != nullptr && _free_watch_slot_count != 0) {
+        USize                    const block_size = _free_watch_block_size(pointer);
+        volatile U8 const *const bytes      = (volatile U8 const*) pointer;
+
+        for (USize slot = 0; slot < _free_watch_slot_count; slot += 1) {
+            if (_free_watch_pointers[slot] != nullptr && _free_watch_pointers[slot] != pointer) {
+                continue;
+            }
+
+            USize const needle_size = _free_watch_needle_sizes[slot];
+            bool        found       = false;
+
+            for (USize start = 0; !found && start + needle_size <= block_size; start += 1) {
+                USize matched = 0;
+
+                while (matched < needle_size && bytes[start + matched] == (U8) _free_watch_needles[slot][matched]) {
+                    matched += 1;
+                }
+
+                found = matched == needle_size;
+            }
+
+            if (found) {
+                _free_watch_hits += 1;
+            }
+        }
+    }
+
+    __real_free(pointer);
+}
+
+static void _free_watch_add(char const *const needle, void const *const pointer) {
+    _free_watch_needles[_free_watch_slot_count]      = needle;
+    _free_watch_needle_sizes[_free_watch_slot_count] = strlen(needle);
+    _free_watch_pointers[_free_watch_slot_count]     = pointer;
+    _free_watch_slot_count                          += 1;
+}
+
+static USize _free_watch_end(void) {
+    USize const hits = _free_watch_hits;
+
+    _free_watch_slot_count = 0;
+    _free_watch_hits       = 0;
+
+    return hits;
+}
+
+/* The control: a block still holding the needle when it is released MUST be counted, so a zero
+ * elsewhere in the suite cannot come from a watch that sees nothing. */
+static USize _free_watch_control(char const *const needle) {
+    USize const needle_size = strlen(needle);
+    char *const block       = (char*) memory_alloc(needle_size + 16);
+
+    memcpy(block, needle, needle_size);
+
+    _free_watch_add(needle, nullptr);
+    memory_free(block);
+
+    return _free_watch_end();
+}
 
 /* Full coverage of the env module: set/get/unset roundtrips, unset/empty
  * collapsing, typed getters (bool + the number_i/_u/_f family), Str/String set
@@ -558,6 +650,42 @@ static void _test_env_from_empty(Test *const test) {
     test_case_end(test);
 }
 
+static void _test_secret_buffers_wiped(Test *const test) {
+    test_case_begin(test, "the loader's working copies are zeroed before release (free watch)");
+
+    char const needle[]  = "env-secret-value-2290-long";
+    char const path[]    = "env_pin_wipe.env";
+    char const name[]    = "ENV_PIN_WIPE";
+
+    test_expect_u(test, "the free watch counts an unwiped block (control)", 1, _free_watch_control(needle));
+
+    Str const value = str_init_3((char*) needle, sizeof(needle) - 1);
+
+    _free_watch_add(needle, nullptr);
+    test_expect_true(test, "env_set_2 succeeds", result_is_success(env_set_2(name, &value)));
+    test_expect_u(test, "env_set_2 released no unwiped copy of the value", 0, _free_watch_end());
+    env_unset(name);
+
+    char text[96] = DEFAULT_INITIALIZATION;
+
+    snprintf(text, sizeof(text), "%s=%s\n", name, needle);
+
+    _free_watch_add(needle, nullptr);
+    test_expect_true(test, "env_from_char_2 succeeds", result_is_success(env_from_char_2(text, strlen(text), true)));
+    test_expect_u(test, "env_from_char_2 released no unwiped copy of the text", 0, _free_watch_end());
+    env_unset(name);
+
+    _env_test_fixture_write(path, text);
+
+    _free_watch_add(needle, nullptr);
+    test_expect_true(test, "env_load_1 succeeds", result_is_success(env_load_1(path)));
+    test_expect_u(test, "env_load_1 released no unwiped copy of the file text", 0, _free_watch_end());
+    env_unset(name);
+    remove(path);
+
+    test_case_end(test);
+}
+
 int main(void) {
     LogConfig const log_config = {
         .level             = LOG_LEVEL_ERROR,
@@ -591,6 +719,7 @@ int main(void) {
     _test_env_load_directory(&test);
     _test_env_load_over_cap(&test);
     _test_env_load_empty(&test);
+    _test_secret_buffers_wiped(&test);
     test_suite_end(&test);
 
     return test_uninit(&test);

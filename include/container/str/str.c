@@ -2627,3 +2627,33 @@ void str_upper(Str *const self) {
 
     trace_log_pop();
 }
+
+bool str_wipe(Str *const self) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+
+    /* EMPTY: nothing to wipe. Checked before `owned`, which is false in that state too. */
+    if (self->data == nullptr) {
+        trace_log_pop();
+
+        return true;
+    }
+
+    /* A VIEW is untouched: it may sit on a literal or on a payload another owner still uses. */
+    if (!self->owned) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    /* Every owner is terminated and holds at least size + 1 bytes, so the live bytes plus the
+     * terminator are the extent Str can prove; it has no capacity to wipe past that. */
+    memory_wipe(self->data, self->size + CHAR_END_CHARACTER);
+
+    self->size = 0;
+
+    trace_log_pop();
+
+    return true;
+}

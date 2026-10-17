@@ -1,6 +1,6 @@
 /*
  * csrf.h - HTTP CSRF service for the C Libraries Framework
- * @version 0.6.1
+ * @version 0.6.2
  *
  * Creates and verifies CSRF tokens for cookie-backed browser sessions, in both of
  * the two patterns that actually ship:
@@ -87,10 +87,12 @@
  *           http_server_response_header_add(response, "Set-Cookie", string_get_data(&cookie));
  *       }
  *
+ *       string_wipe(&cookie);   // the cookie String IS the raw token
  *       string_uninit(&cookie);
  *       http_service_csrf_token_uninit(&token);
  *   }
  *
+ *   string_wipe(&current);   // a cookie_read value is the caller's to wipe
  *   string_uninit(&current);
  *   string_uninit(&cookie_header);
  *
@@ -218,6 +220,14 @@
  *   - Returned String and token values must be uninitialized by the caller
  *     (http_service_csrf_token_uninit for tokens, string_uninit for the rest),
  *     including after a `false` answer.
+ *   - Secret wiping. The module wipes what it owns: token_uninit, its own
+ *     scratch, and the cookie value it consumes inside request_allowed_*. The
+ *     CALLER owns the rest and must string_wipe it before string_uninit: mint's
+ *     cookie String (it IS the raw token) and the values cookie_read/_3/_4
+ *     return. NOT covered: the http/cookie render appends the value and then
+ *     grows through the attributes, so mint's Set-Cookie String leaves
+ *     raw-token copies in the blocks it outgrew; and lws / http_server header
+ *     buffers.
  *   - An output left empty by a `false` answer has data == nullptr; on the arena
  *     tier it also keeps the service's arena, which is the String module's
  *     bulk-release convention (string.c) and not a leak. string_uninit on it is

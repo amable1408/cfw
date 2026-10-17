@@ -36,7 +36,7 @@
  * MARK: - Anti-Vacuity Counters
  *============================================================================*/
 /** Closed-form number of case functions below; the final case asserts every one ran. */
-#define _EXPECTED_CASE_COUNT 37
+#define _EXPECTED_CASE_COUNT 42
 
 /** Incremented at the top of every case function; a case that silently never runs
  * (or a dispatcher edit that drops one) fails the closed-form check. */
@@ -1406,6 +1406,140 @@ static void _test_slice_uninit_round_trip(Test *const test) {
 }
 
 /*==============================================================================
+ * MARK: - Cases: str_wipe (0.2.0)
+ *============================================================================*/
+/** Counts the bytes in [data, data + size) that differ from expected, read through a volatile
+ * pointer so the read-back itself can never be folded away. */
+static USize _count_bytes_not(char const *const data, USize const size, char const expected) {
+    volatile char const *const at = (volatile char const*) data;
+    USize mismatches = 0;
+
+    for (USize i = 0; i < size; i += 1) {
+        if (at[i] != expected) {
+            mismatches += 1;
+        }
+    }
+
+    return mismatches;
+}
+
+static void _test_wipe_owner(Test *const test) {
+    _case_entered_count += 1;
+
+    test_case_begin(test, "str_wipe on an OWNER: every live byte and the terminator are zeroed, size is 0, the block stays owned until uninit");
+
+    Str subject = str_init_static("secret!", 7);
+    char *const block = str_get_data(&subject);
+
+    test_expect_true(test, "precondition: an owner", subject.owned);
+    test_expect_u(test, "precondition: the secret is present in all 7 live bytes", 0, (USize) memcmp(block, "secret!", 7));
+
+    test_expect_true(test, "str_wipe on an owner answers true", str_wipe(&subject));
+    test_expect_u(test, "all 7 live bytes plus the terminator (8) are zero", 0, _count_bytes_not(block, 8, '\0'));
+    test_expect_u(test, "size is 0", 0, str_get_size(&subject));
+    test_expect_true(test, "the Str reports empty", str_empty(&subject));
+    test_expect_true(test, "the block is still allocated (same pointer)", subject.data == block);
+    test_expect_true(test, "still an owner", subject.owned);
+
+    str_uninit(&subject);
+
+    test_expect_null(test, "uninit after the wipe leaves the EMPTY Str (data nullptr)", subject.data);
+
+    test_case_end(test);
+}
+
+static void _test_wipe_view(Test *const test) {
+    _case_entered_count += 1;
+
+    test_case_begin(test, "str_wipe on a VIEW: answers false and touches NOTHING (the caller's buffer, data, size and owned are all unchanged)");
+
+    char backing[16] = "do-not-touch";
+    Str view = str_init_3(backing, 12);
+
+    test_expect_false(test, "precondition: the Str is a view", view.owned);
+
+    test_expect_false(test, "str_wipe on a view answers false", str_wipe(&view));
+    test_expect_string(test, "the caller's bytes are unchanged", "do-not-touch", backing);
+    test_expect_true(test, "the view still points at the caller's buffer", view.data == backing);
+    test_expect_u(test, "the view's size is unchanged", 12, str_get_size(&view));
+    test_expect_false(test, "the view is still not an owner", view.owned);
+
+    str_uninit(&view);
+
+    test_expect_string(test, "uninit of the view left the caller's bytes alone too", "do-not-touch", backing);
+
+    test_case_end(test);
+}
+
+static void _test_wipe_empty(Test *const test) {
+    _case_entered_count += 1;
+
+    test_case_begin(test, "str_wipe on the EMPTY Str: answers true, nothing to do, idempotent");
+
+    Str empty = str_init_1();
+
+    test_expect_true(test, "str_wipe on the EMPTY Str answers true", str_wipe(&empty));
+    test_expect_null(test, "the EMPTY Str still holds no buffer", empty.data);
+    test_expect_u(test, "its size is still 0", 0, str_get_size(&empty));
+    test_expect_true(test, "wiping again is idempotent", str_wipe(&empty));
+
+    Str owner = str_init_static("gone", 4);
+
+    test_expect_true(test, "a wiped owner wipes again without trouble (size 0, one terminator byte)", str_wipe(&owner) && str_wipe(&owner));
+
+    str_uninit(&owner);
+
+    test_case_end(test);
+}
+
+static void _test_wipe_promoted_from_view(Test *const test) {
+    _case_entered_count += 1;
+
+    test_case_begin(test, "str_wipe on an owner PROMOTED from a view (str_add_last_1): wipes the new owned block, never the caller's buffer");
+
+    char backing[32] = "view-";
+    Str subject = str_init_3(backing, 5);
+
+    str_add_last_1(&subject, "secret");
+
+    test_expect_true(test, "precondition: the append promoted the view to an owner", subject.owned);
+    test_expect_true(test, "precondition: the owner's block is not the caller's buffer", subject.data != backing);
+    test_expect_string(test, "precondition: the copy holds the whole secret", "view-secret", str_get_data(&subject));
+
+    char *const block = str_get_data(&subject);
+
+    test_expect_true(test, "str_wipe on the promoted owner answers true", str_wipe(&subject));
+    test_expect_u(test, "the promoted block's 11 live bytes plus terminator are zero", 0, _count_bytes_not(block, 12, '\0'));
+    test_expect_u(test, "size is 0", 0, str_get_size(&subject));
+    test_expect_string(test, "the caller's original buffer was not touched", "view-", backing);
+
+    str_uninit(&subject);
+
+    test_case_end(test);
+}
+
+static void _test_wipe_arena(Test *const test) {
+    _case_entered_count += 1;
+
+    test_case_begin(test, "str_wipe on an arena-backed owner: the slice is zeroed and the Str emptied; arena_uninit releases the block");
+
+    Arena arena = arena_init_1(4096, ARENA_TYPE_LINEAR);
+    Str subject = str_alloc_init_static("arena-secret", 12, &arena);
+    char *const block = str_get_data(&subject);
+
+    test_expect_string(test, "precondition: the arena Str holds the secret", "arena-secret", block);
+
+    test_expect_true(test, "str_wipe on the arena owner answers true", str_wipe(&subject));
+    test_expect_u(test, "the arena slice's 12 live bytes plus terminator are zero", 0, _count_bytes_not(block, 13, '\0'));
+    test_expect_u(test, "size is 0", 0, str_get_size(&subject));
+    test_expect_true(test, "still an owner carrying its arena", subject.owned && subject.allocator == &arena);
+
+    arena_uninit(&arena, ARENA_TYPE_LINEAR);
+
+    test_case_end(test);
+}
+
+/*==============================================================================
  * MARK: - Cases: Anti-Vacuity Closed Form
  *============================================================================*/
 static void _test_anti_vacuity_closed_form(Test *const test) {
@@ -1495,6 +1629,14 @@ int main(int argc, char **argv) {
     _test_coverage_anchors(&test);
     _test_round_2_pins(&test);
     _test_delete_null_handle(&test);
+    test_suite_end(&test);
+
+    test_suite_begin(&test, "str_wipe");
+    _test_wipe_owner(&test);
+    _test_wipe_view(&test);
+    _test_wipe_empty(&test);
+    _test_wipe_promoted_from_view(&test);
+    _test_wipe_arena(&test);
     test_suite_end(&test);
 
     test_suite_begin(&test, "str_anchors");

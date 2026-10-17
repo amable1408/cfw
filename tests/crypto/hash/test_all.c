@@ -189,6 +189,78 @@ static void _test_crypto_hash_abandon(Test *const test) {
     test_case_end(test);
 }
 
+/* memory_wipe is interposed at link time (-Wl,--wrap=memory_wipe in the makefile):
+ * every wipe issued by the module under test is logged (size, and whether the
+ * buffer still held a nonzero byte at that moment, i.e. a live secret rather
+ * than an already-zero buffer), then forwarded to the real primitive. */
+#define _TEST_WIPE_LOG_MAX 16
+
+typedef struct {
+    USize count;
+    USize sizes[_TEST_WIPE_LOG_MAX];
+    bool live[_TEST_WIPE_LOG_MAX];
+} TestWipeLog;
+
+static TestWipeLog _test_wipe_log;
+
+void __real_memory_wipe(void *const dst, USize const dst_size);
+
+void __wrap_memory_wipe(void *const dst, USize const dst_size) {
+    if (_test_wipe_log.count < _TEST_WIPE_LOG_MAX) {
+        bool live = false;
+
+        for (USize i = 0; i < dst_size; i += 1) {
+            if (((U8 const*) dst)[i] != 0) {
+                live = true;
+            }
+        }
+
+        _test_wipe_log.sizes[_test_wipe_log.count] = dst_size;
+        _test_wipe_log.live[_test_wipe_log.count]  = live;
+    }
+
+    _test_wipe_log.count += 1;
+
+    __real_memory_wipe(dst, dst_size);
+}
+
+static void _test_wipe_log_reset(void) {
+    _test_wipe_log = (TestWipeLog) { 0 };
+}
+
+static void _test_crypto_hash_wipes_staging(Test *const test) {
+    test_case_begin(test, "crypto_hash_final: the staged digest is wiped on success, not on an argument rejection");
+
+    U8 const message[] = { 0x61, 0x62, 0x63 };
+    U8 output[CRYPTO_HASH_SHA256_SIZE] = DEFAULT_INITIALIZATION;
+
+    Crypto_Hash stream = DEFAULT_INITIALIZATION;
+
+    test_expect_true(test, "stream init succeeds", result_is_success(crypto_hash_init(&stream, CRYPTO_HASH_ALGORITHM_SHA256)));
+    test_expect_true(test, "stream update succeeds", result_is_success(crypto_hash_update(&stream, message, sizeof(message))));
+
+    _test_wipe_log_reset();
+
+    test_expect_true(test, "final succeeds", result_is_success(crypto_hash_final(&stream, output, sizeof(output))));
+    test_expect_u(test, "exactly one wipe", 1, _test_wipe_log.count);
+    test_expect_u(test, "the wipe covers the whole staging buffer", EVP_MAX_MD_SIZE, _test_wipe_log.sizes[0]);
+    test_expect_true(test, "the staging buffer held the digest when wiped", _test_wipe_log.live[0]);
+
+    Crypto_Hash hash = DEFAULT_INITIALIZATION;
+    U8 small[4]      = DEFAULT_INITIALIZATION;
+
+    test_expect_true(test, "init succeeds", result_is_success(crypto_hash_init(&hash, CRYPTO_HASH_ALGORITHM_SHA256)));
+
+    _test_wipe_log_reset();
+
+    test_expect_true(test, "undersized final is rejected", result_is_error(crypto_hash_final(&hash, small, sizeof(small))));
+    test_expect_u(test, "a rejected final stages nothing, so wipes nothing", 0, _test_wipe_log.count);
+
+    crypto_hash_uninit(&hash);
+
+    test_case_end(test);
+}
+
 int main(void) {
     log_init((LogConfig){ .level = LOG_LEVEL_ERROR, .stream = stdout, .timestamp_enabled = true, .autoflush = true });
 
@@ -203,6 +275,7 @@ int main(void) {
     _test_crypto_hash_stale_handles(&test);
     _test_crypto_hash_final_sizing(&test);
     _test_crypto_hash_abandon(&test);
+    _test_crypto_hash_wipes_staging(&test);
     test_suite_end(&test);
 
     return test_uninit(&test);

@@ -3,6 +3,7 @@
 // char.h is singled out because it declares no TYPES at all: no header's API can ever name one,
 // so every chain that happens to reach it is accidental and a file using char_* owes it directly.
 #include <char/char.h>
+#include <memory/memory.h>
 
 #define _HTTP_SERVICE_SESSION_HASH_BYTE_COUNT CRYPTO_HASH_SHA256_SIZE
 
@@ -117,12 +118,17 @@ static bool _http_service_session_digest_hex(char const *const token, char hex[E
     U8 digest[_HTTP_SERVICE_SESSION_HASH_BYTE_COUNT] = DEFAULT_INITIALIZATION;
 
     if (result_is_error(crypto_hash_sha256((U8 const*) token, char_length(token), digest))) {
+        memory_wipe(digest, sizeof(digest));
+
         trace_log_pop();
 
         return false;
     }
 
     encoding_hex_encode_1(digest, _HTTP_SERVICE_SESSION_HASH_BYTE_COUNT, hex);
+
+    // The digest is a stored verifier: nothing reads it again once rendered.
+    memory_wipe(digest, sizeof(digest));
 
     trace_log_pop();
 
@@ -214,6 +220,7 @@ static bool _http_service_session_hash_value(HTTP_Service_Session const *const s
     *out = (String) DEFAULT_INITIALIZATION;
 
     if (string_empty(value)) {
+        string_wipe(value);
         string_uninit(value);
 
         trace_log_pop();
@@ -223,9 +230,11 @@ static bool _http_service_session_hash_value(HTTP_Service_Session const *const s
 
     String hash = http_service_session_token_hash(self, string_get_data(value));
 
+    string_wipe(value);
     string_uninit(value);
 
     if (string_empty(&hash)) {
+        string_wipe(&hash);
         string_uninit(&hash);
 
         trace_log_pop();
@@ -584,6 +593,7 @@ bool http_service_session_mint(HTTP_Service_Session const *const self, HTTP_Serv
 
     if (string_empty(hash)) {
         http_service_session_token_uninit(token);
+        string_wipe(hash);
         string_uninit(hash);
 
         trace_log_pop();
@@ -595,7 +605,9 @@ bool http_service_session_mint(HTTP_Service_Session const *const self, HTTP_Serv
 
     if (string_empty(cookie)) {
         http_service_session_token_uninit(token);
+        string_wipe(hash);
         string_uninit(hash);
+        string_wipe(cookie);
         string_uninit(cookie);
 
         trace_log_pop();
@@ -634,6 +646,7 @@ bool http_service_session_token_create(HTTP_Service_Session const *const self, H
     if (buffer == nullptr || result_is_error(crypto_random_hex(buffer, self->token_byte_count))) {
         log_message_2(LOG_LEVEL_WARN, LOG_METADATA, "http_service_session_token_create: refusing - no buffer, or the CSPRNG did not produce a token");
 
+        string_wipe(&value);
         string_uninit(&value);
 
         trace_log_pop();
@@ -681,10 +694,17 @@ String http_service_session_token_hash(HTTP_Service_Session const *const self, c
 
     String string = _http_service_session_string_init(self);
 
+    // Reserved whole so the digest is appended into its final block: a growing String would leave
+    // an unwiped copy of it in the block it outgrew. Two terminator bytes: the append's own, and the
+    // one string_terminate appends as a character.
+    string_reserve(&string, ENCODING_HEX_SIZE(_HTTP_SERVICE_SESSION_HASH_BYTE_COUNT) + CHAR_END_CHARACTER + CHAR_END_CHARACTER);
+
     /* The size is a positive compile-time constant, so the append is unconditional; the
      * terminate call below still has a job on a REFUSED arena, which appends nothing. */
     string_add_last_2(&string, hex, ENCODING_HEX_SIZE(_HTTP_SERVICE_SESSION_HASH_BYTE_COUNT));
     _http_service_session_string_terminate(&string);
+
+    memory_wipe(hex, sizeof(hex));
 
     trace_log_pop();
 
@@ -696,6 +716,7 @@ void http_service_session_token_uninit(HTTP_Service_Session_Token *const self) {
 
     error_check_null(LOG_METADATA, "self", (void*) self);
 
+    string_wipe(&self->value);
     string_uninit(&self->value);
 
     self->expires_at = 0;
@@ -728,6 +749,8 @@ bool http_service_session_token_verify_1(HTTP_Service_Session const *const self,
     }
 
     bool const success = _http_service_session_hash_equal(hex, ENCODING_HEX_SIZE(_HTTP_SERVICE_SESSION_HASH_BYTE_COUNT), hash, char_length(hash));
+
+    memory_wipe(hex, sizeof(hex));
 
     trace_log_pop();
 
@@ -763,6 +786,8 @@ bool http_service_session_token_verify_4(HTTP_Service_Session const *const self,
     /* The stored side is read through the String's OWN size, not char_length. */
     bool const success = _http_service_session_hash_equal(
         hex, ENCODING_HEX_SIZE(_HTTP_SERVICE_SESSION_HASH_BYTE_COUNT), string_get_data(hash), string_get_size(hash));
+
+    memory_wipe(hex, sizeof(hex));
 
     trace_log_pop();
 

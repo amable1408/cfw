@@ -69,6 +69,7 @@ TEST_BIN := $(TEST_SRC:.c=$(EXE))
 OOM_SRC  := $(filter %/test_oom.c,$(call rwildcard,tests,*.c))
 OOM_BIN  := $(OOM_SRC:.c=$(EXE))
 OOM_WRAP ?=
+TEST_WRAP ?=
 OOM_LIB  ?= libcfw.a
 # The unchecked suites pin what a module does with ERROR_CHECK_ENABLED compiled OUT - the
 # inert fallbacks a checked build can only abort on. They need the library built the same
@@ -99,7 +100,7 @@ SUITE_EXTRA_INC :=
 SUITE_EXTRA_SRC :=
 
 $(TEST_BIN): %$(EXE): %.c $(HARNESS) libcfw.a
-	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(dir $<) $(SUITE_EXTRA_INC) -o $@ $< $(filter-out $(dir $<)test_%,$(wildcard $(dir $<)*.c)) $(SUITE_EXTRA_SRC) $(HARNESS) libcfw.a $(LDLIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(dir $<) $(SUITE_EXTRA_INC) -o $@ $< $(filter-out $(dir $<)test_%,$(wildcard $(dir $<)*.c)) $(SUITE_EXTRA_SRC) $(HARNESS) libcfw.a $(TEST_WRAP) $(LDLIBS)
 
 # A suite that exits non-zero without printing a failure (a crash after its summary, a
 # timing-dependent exit) would otherwise leave the log with nothing to name: say which
@@ -149,13 +150,21 @@ $(subst .c,$(EXE),tests/file/test_oom.c): private OOM_LIB := libcfw_unchecked.a
 $(subst .c,$(EXE),tests/file/test_oom.c): private CPPFLAGS := $(CPPFLAGS_UNCHECKED)
 $(subst .c,$(EXE),tests/http/service/body_parser/test_oom.c): private OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
 $(subst .c,$(EXE),tests/http/service/multipart/test_oom.c): private OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free
-$(subst .c,$(EXE),tests/http/service/oauth/test_oom.c): private OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=curl_easy_perform -Wl,--wrap=curl_slist_append -Wl,--wrap=free
+$(subst .c,$(EXE),tests/http/service/oauth/test_oom.c): private OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=curl_easy_perform -Wl,--wrap=curl_slist_append -Wl,--wrap=curl_slist_free_all -Wl,--wrap=free
 $(subst .c,$(EXE),tests/http/service/permission/test_oom.c): private OOM_LIB := libcfw_unchecked.a
 $(subst .c,$(EXE),tests/http/service/permission/test_oom.c): private CPPFLAGS := $(CPPFLAGS_UNCHECKED)
 $(subst .c,$(EXE),tests/memory/test_oom.c): private OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=realloc
 $(subst .c,$(EXE),tests/process/test_oom.c): private OOM_WRAP := -Wl,--wrap=calloc -Wl,--wrap=free -Wl,--wrap=malloc
 $(subst .c,$(EXE),tests/process/test_oom.c): private OOM_LIB := libcfw_unchecked.a
 $(subst .c,$(EXE),tests/process/test_oom.c): private CPPFLAGS := $(CPPFLAGS_UNCHECKED)
+# A checked or unchecked suite that defines __wrap_* bodies gets exactly the --wrap= flags they
+# need through its own private TEST_WRAP (same reason as the OOM block above).
+$(subst .c,$(EXE),tests/crypto/hash/test_all.c): private TEST_WRAP := -Wl,--wrap=memory_wipe
+$(subst .c,$(EXE),tests/crypto/hmac/test_all.c): private TEST_WRAP := -Wl,--wrap=memory_wipe
+$(subst .c,$(EXE),tests/crypto/password/test_all.c): private TEST_WRAP := -Wl,--wrap=memory_wipe
+$(subst .c,$(EXE),tests/crypto/random/test_all.c): private TEST_WRAP := -Wl,--wrap=memory_wipe
+$(subst .c,$(EXE),tests/env/test_all.c): private TEST_WRAP := -Wl,--wrap=free
+$(subst .c,$(EXE),tests/http/server/test_all.c): private TEST_WRAP := -Wl,--wrap=memory_wipe
 $(OOM_BIN): %$(EXE): %.c $(HARNESS) libcfw.a libcfw_unchecked.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(HARNESS) $(OOM_LIB) $(OOM_WRAP) $(LDLIBS)
 
@@ -174,7 +183,7 @@ libcfw_unchecked.a: $(LIB_OBJ_UNCHECKED)
 	$(CC) $(CFLAGS) $(CPPFLAGS_UNCHECKED) -c $< -o $@
 
 $(UNCHECKED_BIN): %$(EXE): %.c $(HARNESS) libcfw_unchecked.a
-	$(CC) $(CFLAGS) $(CPPFLAGS_UNCHECKED) -I$(dir $<) $(SUITE_EXTRA_INC) -o $@ $< $(filter-out $(dir $<)test_%,$(wildcard $(dir $<)*.c)) $(SUITE_EXTRA_SRC) $(HARNESS) libcfw_unchecked.a $(LDLIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS_UNCHECKED) -I$(dir $<) $(SUITE_EXTRA_INC) -o $@ $< $(filter-out $(dir $<)test_%,$(wildcard $(dir $<)*.c)) $(SUITE_EXTRA_SRC) $(HARNESS) libcfw_unchecked.a $(TEST_WRAP) $(LDLIBS)
 
 # tests/http/service/captcha borrows tests/http/client rather than carrying a second copy of it; the per-suite
 # wildcard in the recipes above only ever sees a suite's OWN directory.

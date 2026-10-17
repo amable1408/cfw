@@ -1,5 +1,6 @@
 /*
  * env.h - Environment variable management (dotenv-style) for the C Libraries Framework
+ * @version 0.2.0
  *
  * Features:
  *   - Process-environment-backed loading: env_load parses a .env file and applies
@@ -13,6 +14,12 @@
  *     env_get_bool, the env_get_number_i/_u/_f family and env_exists
  *   - Cross-platform write wrappers: env_set_1/_2/_3 and env_unset hide the
  *     _putenv_s (Windows) / setenv-unsetenv (POSIX) divergence
+ *   - Secret hygiene: the loader's working copies (the file text and the
+ *     env_from / env_set_2 / env_set_3 buffers) are zeroed with memory_wipe
+ *     before release. NOT covered: the process environment block itself, which
+ *     keeps every applied value for the process lifetime, is inherited by
+ *     spawned children and (POSIX) readable through /proc/<pid>/environ; call
+ *     env_unset once a consumer has copied a secret out if that matters
  *   - Parser dialect: '#' comments (full-line, and inline after whitespace),
  *     blank lines, optional "export " prefix, double quotes with \n \t \r \" \\
  *     escapes, literal single quotes, whitespace-trimmed unquoted values, LF and

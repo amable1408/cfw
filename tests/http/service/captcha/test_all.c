@@ -1117,6 +1117,106 @@ static void _test_arena_twins(Test *const test) {
 }
 #endif // ARENA_IMPLEMENTATION
 
+#ifdef ARENA_IMPLEMENTATION
+/* A linear arena reclaims nothing, so what an uninit "frees" stays readable at the same address:
+ * the only way to observe, without undefined behavior, whether a secret was wiped BEFORE its
+ * release. This reads that memory back. */
+static bool _test_span_contains(char const *const base, USize const span, char const *const needle, USize const needle_size) {
+    volatile U8 const *const bytes = (volatile U8 const*) base;
+
+    for (USize start = 0; start + needle_size <= span; start += 1) {
+        USize matched = 0;
+
+        while (matched < needle_size && bytes[start + matched] == (U8) needle[matched]) {
+            matched += 1;
+        }
+
+        if (matched == needle_size) {
+            return true;
+        }
+    }
+
+    return false;
+}
+#endif // ARENA_IMPLEMENTATION
+
+#ifdef ARENA_IMPLEMENTATION
+static void _test_payload_wiped_after_verify(Test *const test) {
+    test_case_begin(test, "verify zeroes the per-call form payload that carried the secret (arena readback)");
+
+    /* The whole final payload: a block outgrown while the fields were appended holds only a
+     * prefix of it, and is the documented not-covered case. */
+    char const field[] = "secret=turnstile-secret-5521&response=tok&remoteip=1.2.3.4";
+    Arena            arena = arena_init_1(1 << 20, ARENA_TYPE_LINEAR);
+    char const *const probe = (char const*) allocator_borrow(8, &arena);
+    USize      const  span  = 8192;
+
+    Fixture_Server server = DEFAULT_INITIALIZATION;
+
+    server.script        = FIXTURE_SCRIPT_OK;
+    server.response_body = "{\"success\":true,\"hostname\":\"h\"}";
+
+    if (!test_expect_true(test, "fixture started", fixture_server_start(&server))) {
+        arena_uninit(&arena, ARENA_TYPE_LINEAR);
+
+        test_case_end(test);
+
+        return;
+    }
+
+    HTTP_Service_Captcha captcha = DEFAULT_INITIALIZATION;
+
+    test_expect_true(test, "alloc_init_2 built a Turnstile service", http_service_captcha_alloc_init_2(&captcha, HTTP_SERVICE_CAPTCHA_PROVIDER_TURNSTILE, "turnstile-secret-5521", &arena));
+
+    char url[_URL_SIZE] = DEFAULT_INITIALIZATION;
+
+    _url_for(fixture_server_port(&server), url, sizeof(url));
+
+    http_service_captcha_set_verify_tls(&captcha, false);
+    test_expect_true(test, "endpoint accepted", http_service_captcha_set_url(&captcha, url));
+
+    HTTP_Service_Captcha_Result result = http_service_captcha_verify(&captcha, "tok", "1.2.3.4");
+
+    fixture_server_join(&server);
+
+    test_expect_true(test, "verification succeeded", result.success);
+    test_expect_string(test, "the provider received the secret field", "secret=turnstile-secret-5521&response=tok&remoteip=1.2.3.4", string_get_data(&server.request_body));
+    test_expect_false(test, "no copy of the final secret payload survives in the arena", _test_span_contains(probe, span, field, sizeof(field) - 1));
+
+    http_service_captcha_result_uninit(&result);
+    http_service_captcha_uninit(&captcha);
+    string_uninit(&server.request_body);
+    arena_uninit(&arena, ARENA_TYPE_LINEAR);
+
+    test_case_end(test);
+}
+#endif // ARENA_IMPLEMENTATION
+
+#ifdef ARENA_IMPLEMENTATION
+static void _test_secret_wiped_on_uninit(Test *const test) {
+    test_case_begin(test, "uninit zeroes the siteverify secret before releasing it (arena readback)");
+
+    char const secret[] = "turnstile-secret-5521";
+    Arena            arena = arena_init_1(65536, ARENA_TYPE_LINEAR);
+    char const *const probe = (char const*) allocator_borrow(8, &arena);
+    USize      const  span  = 8192;
+
+    HTTP_Service_Captcha captcha = DEFAULT_INITIALIZATION;
+
+    test_expect_true(test, "alloc_init_2 built a Turnstile service", http_service_captcha_alloc_init_2(&captcha, HTTP_SERVICE_CAPTCHA_PROVIDER_TURNSTILE, secret, &arena));
+    test_expect_true(test, "the live secret is in the arena", _test_span_contains(probe, span, secret, sizeof(secret) - 1));
+
+    http_service_captcha_uninit(&captcha);
+
+    test_expect_true(test, "uninit leaves the secret String empty", string_empty(&captcha.secret));
+    test_expect_false(test, "uninit left no copy of the secret in the arena", _test_span_contains(probe, span, secret, sizeof(secret) - 1));
+
+    arena_uninit(&arena, ARENA_TYPE_LINEAR);
+
+    test_case_end(test);
+}
+#endif // ARENA_IMPLEMENTATION
+
 int main(void) {
     LogConfig const log_config = {
         .level             = LOG_LEVEL_ERROR,
@@ -1161,6 +1261,10 @@ int main(void) {
     _test_arena_twins(&test);
 #endif // ARENA_IMPLEMENTATION
 
+#ifdef ARENA_IMPLEMENTATION
+    _test_secret_wiped_on_uninit(&test);
+    _test_payload_wiped_after_verify(&test);
+#endif // ARENA_IMPLEMENTATION
     test_suite_end(&test);
 
     I32 const failures = test_uninit(&test);

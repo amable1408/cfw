@@ -4,6 +4,7 @@
  *  @file    hmac.h
  *  @brief   Keyed-hash message authentication (HMAC-SHA256/SHA512) over OpenSSL.
  *  @author  CFW
+ *  @version 0.2.0
  *  @date    2026-07-17
  *  @license MIT (see LICENSE file)
  *
@@ -91,9 +92,9 @@
  *      size it writes, so the requirement is visible at the call site.
  *    - output must not overlap key or message. The raw MAC is staged in a
  *      stack buffer before hex-encoding, and verify's internal hex copy is
- *      likewise stack-resident; neither is zeroised on return — CFW has no
- *      memory_wipe primitive yet, so a caller holding secrets in its own
- *      buffers is responsible for scrubbing them.
+ *      likewise stack-resident; both are wiped (memory_wipe) on every exit.
+ *      The caller's own key and output buffers are NOT wiped: a caller
+ *      holding secrets there memory_wipes them when done.
  *
  *  Performance Characteristics:
  *    - O(n) in the message length: one OpenSSL MAC pass plus a fixed-size hex

@@ -1,6 +1,6 @@
 /*
  * session.h - HTTP session service for the C Libraries Framework
- * @version 0.4.2
+ * @version 0.4.3
  *
  * Creates secure session tokens, hashes tokens for server-side storage, verifies
  * stored token hashes, and builds cookie header values.
@@ -65,7 +65,11 @@
  *       http_server_response_header_add(response, "Set-Cookie", string_get_data(&cookie));
  *   }
  *
+ *   // The cookie String IS the raw token and the hash is the stored verifier:
+ *   // wipe both before releasing them.
+ *   string_wipe(&cookie);
  *   string_uninit(&cookie);
+ *   string_wipe(&hash);
  *   string_uninit(&hash);
  *   http_service_session_token_uninit(&token);
  *
@@ -76,6 +80,7 @@
  *       // SELECT ... WHERE token_hash = string_get_data(&lookup)
  *   }
  *
+ *   string_wipe(&lookup);
  *   string_uninit(&lookup);
  *
  *   // Logout route: delete the stored row, then expire the browser's cookie.
@@ -184,6 +189,15 @@
  *   - Returned String and token values must be uninitialized by the caller
  *     (http_service_session_token_uninit for tokens, string_uninit for the rest),
  *     including after a `false` answer.
+ *   - Secret wiping. The module wipes what it owns: token_uninit, its own
+ *     digests and scratch, and the cookie value it consumes inside cookie_hash
+ *     and request_allowed_*. The CALLER owns the rest and must string_wipe it
+ *     before string_uninit: mint's cookie String (it IS the raw token), the
+ *     values cookie_read/_3/_4 return, and the token_hash / cookie_hash results
+ *     (stored verifiers). NOT covered: the http/cookie render appends the value
+ *     and then grows through the attributes, so mint's Set-Cookie String leaves
+ *     raw-token copies in the blocks it outgrew; lws / http_server header
+ *     buffers; and any JSON document that held a login password.
  *
  * Performance Characteristics:
  *   - Per mint: one CSPRNG call writing straight into the token String, one

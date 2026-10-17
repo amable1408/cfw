@@ -762,6 +762,89 @@ static void _test_config_is_copied(Test *const test) {
     test_case_end(test);
 }
 
+/*
+ * A linear arena reclaims nothing, so what string_uninit "frees" stays readable at the same
+ * address: the only way to observe, without undefined behavior, whether a secret was wiped
+ * BEFORE its release. These two helpers read that memory back.
+ */
+static USize _test_nonzero_bytes(char const *const at, USize const byte_count) {
+    volatile U8 const *const bytes = (volatile U8 const*) at;
+
+    USize count = 0;
+
+    for (USize index = 0; index < byte_count; index += 1) {
+        if (bytes[index] != 0) {
+            count += 1;
+        }
+    }
+
+    return count;
+}
+
+static bool _test_span_contains(char const *const base, USize const span, char const *const needle, USize const needle_size) {
+    volatile U8 const *const bytes = (volatile U8 const*) base;
+
+    for (USize start = 0; start + needle_size <= span; start += 1) {
+        USize matched = 0;
+
+        while (matched < needle_size && bytes[start + matched] == (U8) needle[matched]) {
+            matched += 1;
+        }
+
+        if (matched == needle_size) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void _test_wipe_on_release(Test *const test) {
+    test_case_begin(test, "secrets are wiped before release: token_uninit and cookie_hash leave no token bytes behind in an arena");
+
+    Arena arena = arena_init_1(65536, ARENA_TYPE_LINEAR);
+
+    /* Everything the service allocates lands after this probe, so [probe, probe + span) covers it. */
+    char const *const probe = (char const*) allocator_borrow(8, &arena);
+    USize      const  span  = 8192;
+
+    HTTP_Service_Session session = DEFAULT_INITIALIZATION;
+
+    test_expect_true(test, "alloc_init_2 succeeds on a healthy arena", http_service_session_alloc_init_2(&session, 32, 600, "sid", "/", "Strict", true, true, &arena));
+
+    HTTP_Service_Session_Token token = DEFAULT_INITIALIZATION;
+
+    test_expect_true(test, "token_create succeeds", http_service_session_token_create(&session, &token));
+
+    char const *const at = string_get_data(&token.value);
+
+    test_expect_true(test, "the live token holds bytes", _test_nonzero_bytes(at, 64) == 64);
+
+    char header[80] = DEFAULT_INITIALIZATION;
+
+    snprintf(header, sizeof(header), "sid=%s", at);
+
+    char secret[65] = DEFAULT_INITIALIZATION;
+
+    snprintf(secret, sizeof(secret), "%s", at);
+
+    http_service_session_token_uninit(&token);
+
+    test_expect_true(test, "token_uninit leaves the String empty", string_empty(&token.value));
+    test_expect_u(test, "token_uninit zeroed the released token bytes", 0, _test_nonzero_bytes(at, 64));
+
+    String hash = DEFAULT_INITIALIZATION;
+
+    test_expect_true(test, "cookie_hash finds the cookie", http_service_session_cookie_hash(&session, header, &hash));
+    test_expect_false(test, "cookie_hash left no copy of the cookie value in the arena", _test_span_contains(probe, span, secret, 64));
+
+    string_uninit(&hash);
+    http_service_session_uninit(&session);
+    arena_uninit(&arena, ARENA_TYPE_LINEAR);
+
+    test_case_end(test);
+}
+
 static void _test_arena_tier(Test *const test) {
     test_case_begin(test, "the arena tier mirrors the heap tier, and a refused arena refuses the whole service");
 
@@ -1102,6 +1185,7 @@ I32 main(void) {
     _test_config_refusals(&test);
     _test_config_is_copied(&test);
     _test_arena_tier(&test);
+    _test_wipe_on_release(&test);
     _test_verify_allocates_nothing(&test);
 
     test_suite_end(&test);

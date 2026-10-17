@@ -1,6 +1,6 @@
 /*
  * captcha.h - HTTP CAPTCHA verification service for the C Libraries Framework
- * @version 0.3.1
+ * @version 0.3.2
  *
  * Verifies client CAPTCHA tokens against provider siteverify APIs while keeping
  * route policy, request parsing, and account storage outside the service.
@@ -100,12 +100,13 @@
  *   - A false return from any init/alloc_init leaves *self ZEROED, not
  *     initialized: treat it as "this instance does not exist" and fail startup.
  *     Do not call any other function on it, uninit included.
- *   - The secret is freed but NOT wiped on uninit; a memory-wipe primitive is
- *     still an open framework item. It is also COPIED, percent-escaped, into the
+ *   - The secret is zeroed (string_wipe) before it is released on uninit. It is
+ *     also COPIED, percent-escaped, into the
  *     verification payload on every call: that copy lives on the heap (or in the
- *     arena) for the duration of the request and is released, unwiped, when the
- *     call returns. An arena-backed service therefore retains one payload copy
- *     of the secret per verification until the arena itself is reset.
+ *     arena) for the duration of the request and is zeroed (string_wipe) before
+ *     it is released, on every exit. Not covered: a payload block outgrown while
+ *     the fields were appended was released unwiped, and libcurl's own copy of
+ *     the request body while the call is in flight.
  *   - result.response keeps the provider's RAW body. It can name configuration
  *     state ("invalid-input-secret" says the deployment's secret is wrong), so a
  *     consumer that logs it verbatim leaks that to its log reader. Log

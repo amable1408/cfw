@@ -116,6 +116,14 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - file (docs + tests): a UNC spelling (`//server/share/x`) passes file_path_aliased_windows like a POSIX path - the nofollow opener refuses UNC, not this predicate - stated and pinned; GetLastError pinned on the index refusal; the OOM harness refuses a non-digit probe row.
 - process (tests only): exit(3) being classified aborted on Windows is pinned as the documented UCRT ambiguity.
 - test (tests only): a sleeping case reports wall time (a pin that fails on the old clock() timer under POSIX).
+- sync: container/str, container/string, crypto/hash, crypto/hmac, crypto/kdf, crypto/password, crypto/random, env, http/server, http/service/auth, http/service/captcha, http/service/csrf, http/service/email, http/service/oauth, http/service/session, memory
+- memory 0.2.0 (first version marker): `memory_wipe(dst, size)` zeroes a secret through a volatile function pointer plus an asm memory barrier, so the stores survive -O3 and LTO; a non-elision proof (tests/memory/wipe_proof.ps1 / .sh: two controls show a plain memset is removed, two pins show memory_wipe keeps an indirect, non-import call) passes on gcc 16 ucrt64 and gcc 14 glibc 2.41. The header states what it does NOT guarantee (registers, compiler copies, swap, earlier realloc blocks). `memset_explicit` stays deferred (glibc 2.43 is the first to ship it).
+- container/string 0.6.0: `string_wipe` zeroes an owner's recorded capacity and sizes it to 0; a VIEW answers false and is never written. `string_clear` is documented as NOT a secret wipe.
+- container/str 0.2.0 (first version marker): `str_wipe` zeroes an owner's live bytes plus terminator (Str records no capacity; the bytes a `str_set_size` shrink or an adoption leave behind are documented as not reached); a VIEW answers false.
+- crypto/hash, crypto/hmac, crypto/kdf, crypto/password, crypto/random 0.2.0 (first version markers): every transient digest, MAC, derived key and random buffer is wiped before release; password and hmac moved to a single exit so every return path wipes.
+- http/server 0.5.4: the request body is wiped in the payload reset.
+- http/service/session 0.4.3, csrf 0.6.2, auth 0.2.0 (first version marker): tokens, their stored verifier digests and auth's password buffers are wiped before release; each header states what the module wipes, what the CALLER must `string_wipe` (the minted cookie, read values, hash results) and what is not covered (Set-Cookie rendering, server header buffers).
+- http/service/oauth 0.4.3, captcha 0.3.2, email 0.4.1, env 0.2.0 (first version marker): client secrets, tokens, the secret-bearing request payloads and a replaced SMTP password are wiped before release on every exit.
 
 ## 0.2.0 - release
 

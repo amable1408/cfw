@@ -1,6 +1,8 @@
 /*
  * auth.h - HTTP authentication service for the C Libraries Framework
  *
+ * @version 0.2.0
+ *
  * Handles authentication primitives without owning account storage, sessions,
  * database writes, or mail delivery. Applications persist returned hashes and
  * tokens in their own storage layer.
@@ -23,6 +25,7 @@
  *       String hash = http_service_auth_hash_password(&auth, password);
  *
  *       // persist string_get_data(&hash)
+ *       string_wipe(&hash);   // the stored verifier is the caller's to wipe
  *       string_uninit(&hash);
  *   }
  *
@@ -35,6 +38,7 @@
  *           String fresh = http_service_auth_hash_password(&auth, password);
  *
  *           // UPDATE users SET password_hash = fresh WHERE password_hash = stored
+ *           string_wipe(&fresh);
  *           string_uninit(&fresh);
  *       }
  *   }
@@ -48,6 +52,7 @@
  *       String token_hash = http_service_auth_token_hash(&auth, string_get_data(&token.value));
  *
  *       // persist token_hash + token.expires_at; mail string_get_data(&token.value)
+ *       string_wipe(&token_hash);
  *       string_uninit(&token_hash);
  *   }
  *
@@ -82,6 +87,13 @@
  * Memory Management:
  *   - Returned String and token values must be uninitialized by caller.
  *   - Call http_service_auth_token_uninit() for token values.
+ *   - Secret wiping. The module wipes what it owns: token_uninit, the
+ *     candidate digests and scratch it builds in verify, and the hash
+ *     intermediates in token_hash. The CALLER owns the rest and must
+ *     string_wipe it before string_uninit: the hash_password result and the
+ *     token_hash result (stored verifiers). The plaintext password the route
+ *     parsed is the route's. NOT covered: lws / http_server header and body
+ *     buffers, and the JSON document that held the password.
  *   - The service OWNS its decoy hash: http_service_auth_uninit() releases it.
  *     An arena-backed instance must not outlive the arena it was built from.
  *   - Every accessor commits to a single tier: values arrive as null-terminated

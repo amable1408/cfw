@@ -80,6 +80,7 @@ static bool _http_service_captcha_string_set(String *const self, char const *con
 
     USize const data_size = char_length(data);
 
+    string_wipe(self);
     string_uninit(self);
 
 #ifdef ARENA_IMPLEMENTATION
@@ -857,6 +858,7 @@ void http_service_captcha_uninit(HTTP_Service_Captcha *const self) {
         http_client_delete(&self->client);
     }
 
+    string_wipe(&self->secret);
     string_uninit(&self->expected_action);
     string_uninit(&self->expected_hostname);
     string_uninit(&self->secret);
@@ -990,6 +992,7 @@ HTTP_Service_Captcha_Result http_service_captcha_verify(HTTP_Service_Captcha *co
 #else
         _http_service_captcha_result_error_set(&result, "captcha payload encoding failed");
 #endif // ARENA_IMPLEMENTATION
+        string_wipe(&payload);
         string_uninit(&payload);
 
         trace_log_pop();
@@ -1066,6 +1069,7 @@ HTTP_Service_Captcha_Result http_service_captcha_verify(HTTP_Service_Captcha *co
     }
 
     http_client_result_uninit(&client_result);
+    string_wipe(&payload);
     string_uninit(&payload);
 
     trace_log_pop();

@@ -6,6 +6,7 @@
  * ============================================================================
  */
 #include <crypto/random/random.h>
+#include <memory/memory.h>
 
 /*==============================================================================
  * MARK: - Internal Constants
@@ -112,12 +113,18 @@ Result crypto_random_hex(char *const output, USize const byte_count) {
         Result const result = crypto_random_bytes(buffer, chunk);
 
         if (result_is_error(result)) {
+            memory_wipe(buffer, _CRYPTO_RANDOM_HEX_CHUNK_SIZE);
+
             trace_log_pop();
 
             return result;
         }
 
         encoding_hex_encode_1(buffer, chunk, at);
+
+        // The raw draw is the token material the hex now carries; do not leave
+        // it on the stack for the next iteration (or the caller's frame) to inherit.
+        memory_wipe(buffer, _CRYPTO_RANDOM_HEX_CHUNK_SIZE);
 
         at        += CRYPTO_RANDOM_HEX_SIZE(chunk);
         remaining -= chunk;
@@ -157,6 +164,8 @@ Result crypto_random_uniform(U64 const bound, U64 *const value) {
         Result const result = crypto_random_bytes((U8*) &draw, sizeof(draw));
 
         if (result_is_error(result)) {
+            memory_wipe(&draw, sizeof(draw));
+
             trace_log_pop();
 
             return result;
@@ -164,6 +173,8 @@ Result crypto_random_uniform(U64 const bound, U64 *const value) {
     } while (draw < threshold);
 
     *value = draw % bound;
+
+    memory_wipe(&draw, sizeof(draw));
 
     trace_log_pop();
 

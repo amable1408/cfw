@@ -1,5 +1,7 @@
 #include <http/service/auth/auth.h>
 
+#include <memory/memory.h>
+
 /* The decoy password never authenticates anything: it exists so that a login attempt against
  * an account that does NOT exist runs a full KDF pass and costs the same wall time as one
  * against an account with the wrong password. Without it, a missing row returns in
@@ -137,6 +139,7 @@ static bool _http_service_auth_token_verify_hash(HTTP_Service_Auth const *const 
         success = char_compare_equal_comptime_2(string_get_data(&candidate), string_get_size(&candidate), hash, hash_size);
     }
 
+    string_wipe(&candidate);
     string_uninit(&candidate);
 
     trace_log_pop();
@@ -422,12 +425,19 @@ HTTP_Service_Auth_Token http_service_auth_token_create(HTTP_Service_Auth const *
         .value      = _http_service_auth_string_init(self)
     };
 
+    // Reserved whole so the token is appended into its final block: a growing String would leave
+    // an unwiped copy of it in the block it outgrew. Two terminator bytes: the append's own, and the
+    // one string_terminate appends as a character.
+    string_reserve(&token.value, CRYPTO_RANDOM_HEX_SIZE(self->token_byte_count) + CHAR_END_CHARACTER + CHAR_END_CHARACTER);
+
     // allocator_borrow is the aborting variant, so buffer is never null here;
     // the only remaining failure is the CSPRNG, which leaves the token empty.
     if (result_is_success(crypto_random_hex(buffer, self->token_byte_count))) {
         string_add_last_2(&token.value, buffer, CRYPTO_RANDOM_HEX_SIZE(self->token_byte_count));
         _http_service_auth_string_terminate(&token.value);
     }
+
+    memory_wipe(buffer, CRYPTO_RANDOM_HEX_SIZE(self->token_byte_count) + CHAR_END_CHARACTER);
 
 #ifdef ARENA_IMPLEMENTATION
     allocator_release(buffer, nullptr);
@@ -494,6 +504,8 @@ String http_service_auth_token_hash(HTTP_Service_Auth const *const self, char co
     if (result_is_error(crypto_hash_sha256((U8 const*) token, char_length(token), hash))) {
         // Fail closed with an empty String - every persist site checks string_empty before
         // writing the hash, and verify_2 refuses an empty stored hash.
+        memory_wipe(hash, sizeof(hash));
+
         trace_log_pop();
 
         return (String) DEFAULT_INITIALIZATION;
@@ -503,8 +515,16 @@ String http_service_auth_token_hash(HTTP_Service_Auth const *const self, char co
 
     String string = _http_service_auth_string_init(self);
 
+    // Reserved whole so the digest is appended into its final block: a growing String would leave
+    // an unwiped copy of it in the block it outgrew. Two terminator bytes: the append's own, and the
+    // one string_terminate appends as a character.
+    string_reserve(&string, ENCODING_HEX_SIZE(_HTTP_SERVICE_AUTH_HASH_BYTE_COUNT) + CHAR_END_CHARACTER + CHAR_END_CHARACTER);
     string_add_last_2(&string, hex, ENCODING_HEX_SIZE(_HTTP_SERVICE_AUTH_HASH_BYTE_COUNT));
     _http_service_auth_string_terminate(&string);
+
+    // The digest is a stored verifier: nothing reads either copy again once the String holds it.
+    memory_wipe(hash, sizeof(hash));
+    memory_wipe(hex, sizeof(hex));
 
     trace_log_pop();
 
@@ -516,6 +536,7 @@ void http_service_auth_token_uninit(HTTP_Service_Auth_Token *const self) {
 
     error_check_null(LOG_METADATA, "self", (void*) self);
 
+    string_wipe(&self->value);
     string_uninit(&self->value);
 
     self->expires_at = 0;

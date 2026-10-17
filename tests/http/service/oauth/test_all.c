@@ -1742,6 +1742,75 @@ static void _test_state_2_contract_checks_precede_the_binding_refusal(Test *cons
  * MARK: - Entry point
  *============================================================================*/
 
+#ifdef ARENA_IMPLEMENTATION
+/* A linear arena reclaims nothing, so what an uninit "frees" stays readable at the same address:
+ * the only way to observe, without undefined behavior, whether a secret was wiped BEFORE its
+ * release. This reads that memory back. */
+static bool _test_span_contains(char const *const base, USize const span, char const *const needle, USize const needle_size) {
+    volatile U8 const *const bytes = (volatile U8 const*) base;
+
+    for (USize start = 0; start + needle_size <= span; start += 1) {
+        USize matched = 0;
+
+        while (matched < needle_size && bytes[start + matched] == (U8) needle[matched]) {
+            matched += 1;
+        }
+
+        if (matched == needle_size) {
+            return true;
+        }
+    }
+
+    return false;
+}
+#endif // ARENA_IMPLEMENTATION
+
+#ifdef ARENA_IMPLEMENTATION
+static void _test_secrets_wiped_on_release(Test *const test) {
+    test_case_begin(test, "uninit zeroes the client secret and token_uninit zeroes every credential String (arena readback)");
+
+    char const secret[]  = "oauth-client-secret-3318";
+    char const access[]  = "access-token-value-8841";
+    char const refresh[] = "refresh-token-value-2207";
+    Arena arena = arena_init_1(65536, ARENA_TYPE_LINEAR);
+    char const *const probe = (char const*) allocator_borrow(8, &arena);
+    USize const span = 8192;
+
+    HTTP_Service_OAuth oauth = DEFAULT_INITIALIZATION;
+
+    test_expect_true(test, "the arena service initializes", http_service_oauth_alloc_init_1(&oauth, &arena));
+
+    HTTP_Service_OAuth_Provider provider = _provider("google");
+
+    provider.client_secret = secret;
+
+    test_expect_true(test, "the provider registers", http_service_oauth_provider_add_1(&oauth, &provider));
+    test_expect_true(test, "the live client secret is in the arena", _test_span_contains(probe, span, secret, sizeof(secret) - 1));
+
+    HTTP_Service_OAuth_Token token = DEFAULT_INITIALIZATION;
+
+    token.access_token  = string_alloc_init_static(access, sizeof(access) - 1, &arena);
+    token.refresh_token = string_alloc_init_static(refresh, sizeof(refresh) - 1, &arena);
+
+    test_expect_true(test, "the live access token is in the arena", _test_span_contains(probe, span, access, sizeof(access) - 1));
+    test_expect_true(test, "the live refresh token is in the arena", _test_span_contains(probe, span, refresh, sizeof(refresh) - 1));
+
+    http_service_oauth_token_uninit(&token);
+
+    test_expect_true(test, "token_uninit leaves the access token empty", string_empty(&token.access_token));
+    test_expect_false(test, "token_uninit left no copy of the access token", _test_span_contains(probe, span, access, sizeof(access) - 1));
+    test_expect_false(test, "token_uninit left no copy of the refresh token", _test_span_contains(probe, span, refresh, sizeof(refresh) - 1));
+
+    http_service_oauth_uninit(&oauth);
+
+    test_expect_false(test, "uninit left no copy of the client secret", _test_span_contains(probe, span, secret, sizeof(secret) - 1));
+
+    arena_uninit(&arena, ARENA_TYPE_LINEAR);
+
+    test_case_end(test);
+}
+#endif // ARENA_IMPLEMENTATION
+
 int main(void) {
     LogConfig const log_config = {
         .level             = LOG_LEVEL_ERROR,
@@ -1784,6 +1853,9 @@ int main(void) {
     _test_refresh_body(&test);
     _test_revoke_paths(&test);
 
+#ifdef ARENA_IMPLEMENTATION
+    _test_secrets_wiped_on_release(&test);
+#endif // ARENA_IMPLEMENTATION
     test_suite_end(&test);
 
     return test_uninit(&test);

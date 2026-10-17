@@ -4,7 +4,7 @@
  *  @file    http_server.h
  *  @brief   HTTP/1.1 server over libwebsockets: routing, request accessors and
  *           response helpers.
- *  @version 0.5.3
+ *  @version 0.5.4
  *
  *  Features:
  *    - Exact and regex route registration on one server handle.
@@ -145,6 +145,8 @@
  *      are the arena spelling. alloc_delete runs http_server_uninit and then returns
  *      only the HANDLE to the arena: the route list is the module's own heap
  *      allocation and must not be handed to an arena's deallocate.
+ *    - The accumulated request body (it may hold a password or token) is wiped with
+ *      memory_wipe when the session releases it (a buffer outgrown mid-body is not wiped).
  *    - Request, response and route objects are stack objects owned by the callback
  *      that received them; a pointer kept past its return dangles.
  *    - Tier _1 (char*) and tier _4 (String) getters answer an OWNED copy - release

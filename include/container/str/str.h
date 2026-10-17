@@ -1,8 +1,11 @@
 /*
  * str.h - Canonical string buffer (Str) utilities for the C Libraries Framework
+ * @version 0.2.0
  *
  * Features:
  *   - Flexible, error-checked string buffer abstraction (Str)
+ *   - Secret hygiene (0.2.0): str_wipe zeroes an OWNER's bytes through memory_wipe, which the
+ *     optimizer may not remove, and answers false (touching nothing) for a VIEW
  *   - Arena and standard allocation support
  *   - Rich API for add, remove, slice, repeat, compare, copy, and more
  *   - Canonical memory ownership and free function
@@ -1143,6 +1146,8 @@ void str_reverse(Str *const self);
  * @param self Pointer to Str. Modified in place.
  * @param size New size to set. Must fit the underlying allocation. The one bound that IS
  *             checked: a non-zero size on the EMPTY Str (no buffer at all) is REFUSED.
+ * @note A shrink does not zero the bytes it leaves behind, and str_wipe (live size plus
+ *       terminator) does not reach them.
  */
 void str_set_size(Str *const self, USize const size);
 
@@ -1283,5 +1288,26 @@ void str_uninit(Str *const self);
  * @param self Pointer to Str. Modified in place.
  */
 void str_upper(Str *const self);
+
+/**
+ * @brief Mirror of string_wipe for Str: zero an OWNER's bytes through memory_wipe, then empty it.
+ *
+ * OWNER: size + 1 bytes (the live bytes and the terminator) are zeroed and size becomes 0; the
+ * buffer stays allocated and owned until str_uninit. EMPTY (data nullptr): no-op, answers true.
+ * VIEW (owned == false, str_init_2/3 and friends): untouched, answers false - the caller wipes
+ * the backing storage with memory_wipe.
+ *
+ * @param self Pointer to Str. Non-null: aborts under ERROR_CHECK_ENABLED otherwise.
+ * @return true if the Str owned its storage (or was EMPTY) and the bytes are now zero; false for
+ *         a VIEW, which was left untouched.
+ * @note Str is exact-fit and carries no capacity, so unlike string_wipe the extent is the live
+ *       size plus the terminator: stale bytes beyond it are NOT reached. (str_erase zeroes its
+ *       own vacated tail; the unreached residue comes from a str_set_size shrink, a str_move_2
+ *       adoption whose allocation exceeds size + 1, and realloc history.) Reserve or build the
+ *       secret at its final size.
+ * @note On an arena-backed owner the slice is zeroed but the arena block stays mapped.
+ * @see memory_wipe
+ */
+bool str_wipe(Str *const self);
 
 #endif // CONTAINER_STR_H

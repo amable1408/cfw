@@ -640,6 +640,8 @@ static void _http_server_payload_reset(HTTP_Session *const self) {
     }
 
     if (self->payload != nullptr) {
+        // The body can carry a login password or token: wipe the whole buffer before it is released.
+        memory_wipe(self->payload, self->payload_capacity);
         memory_delete((void**) &self->payload);
     }
 

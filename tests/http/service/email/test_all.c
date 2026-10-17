@@ -1409,6 +1409,82 @@ static void _test_configuration_invariants(Test *const test) {
  * MARK: - Entry
  *============================================================================*/
 
+#ifdef ARENA_IMPLEMENTATION
+/* A linear arena reclaims nothing, so what an uninit "frees" stays readable at the same address:
+ * the only way to observe, without undefined behavior, whether a secret was wiped BEFORE its
+ * release. This reads that memory back. */
+static bool _test_span_contains(char const *const base, USize const span, char const *const needle, USize const needle_size) {
+    volatile U8 const *const bytes = (volatile U8 const*) base;
+
+    for (USize start = 0; start + needle_size <= span; start += 1) {
+        USize matched = 0;
+
+        while (matched < needle_size && bytes[start + matched] == (U8) needle[matched]) {
+            matched += 1;
+        }
+
+        if (matched == needle_size) {
+            return true;
+        }
+    }
+
+    return false;
+}
+#endif // ARENA_IMPLEMENTATION
+
+#ifdef ARENA_IMPLEMENTATION
+static void _test_replaced_password_wiped(Test *const test) {
+    test_case_begin(test, "a password replaced by auth_set is zeroed before its block is released (arena readback)");
+
+    char const old_password[] = "rotated-out-pass-3318";
+    char const new_password[] = "rotated-in-pass-8827";
+    Arena            arena = arena_init_1(65536, ARENA_TYPE_LINEAR);
+    char const *const probe = (char const*) allocator_borrow(8, &arena);
+    USize      const  span  = 8192;
+
+    HTTP_Service_Email email = DEFAULT_INITIALIZATION;
+
+    test_expect_true(test, "the arena service initializes with credentials", http_service_email_alloc_init_2(&email, _URL, "mailer", old_password, _FROM, &arena));
+    test_expect_true(test, "the old password is in the arena", _test_span_contains(probe, span, old_password, sizeof(old_password) - 1));
+    test_expect_true(test, "auth_set accepts the new credentials", http_service_email_auth_set(&email, "mailer", new_password));
+    test_expect_true(test, "the new password is live", _test_span_contains(probe, span, new_password, sizeof(new_password) - 1));
+    test_expect_false(test, "the replaced password left no copy in the arena", _test_span_contains(probe, span, old_password, sizeof(old_password) - 1));
+
+    http_service_email_uninit(&email);
+    arena_uninit(&arena, ARENA_TYPE_LINEAR);
+
+    test_case_end(test);
+}
+#endif // ARENA_IMPLEMENTATION
+
+#ifdef ARENA_IMPLEMENTATION
+static void _test_credentials_wiped_on_uninit(Test *const test) {
+    test_case_begin(test, "uninit zeroes the SMTP username and password before releasing them (arena readback)");
+
+    char const password[] = "hunter2-smtp-pass-9042";
+    char const username[] = "mailer-user-7731";
+    Arena            arena = arena_init_1(65536, ARENA_TYPE_LINEAR);
+    char const *const probe = (char const*) allocator_borrow(8, &arena);
+    USize      const  span  = 8192;
+
+    HTTP_Service_Email email = DEFAULT_INITIALIZATION;
+
+    test_expect_true(test, "the arena service initializes with credentials", http_service_email_alloc_init_2(&email, _URL, username, password, _FROM, &arena));
+    test_expect_true(test, "the live password is in the arena", _test_span_contains(probe, span, password, sizeof(password) - 1));
+    test_expect_true(test, "the live username is in the arena", _test_span_contains(probe, span, username, sizeof(username) - 1));
+
+    http_service_email_uninit(&email);
+
+    test_expect_true(test, "uninit leaves the password String empty", string_empty(&email.password));
+    test_expect_false(test, "uninit left no copy of the password in the arena", _test_span_contains(probe, span, password, sizeof(password) - 1));
+    test_expect_false(test, "uninit left no copy of the username in the arena", _test_span_contains(probe, span, username, sizeof(username) - 1));
+
+    arena_uninit(&arena, ARENA_TYPE_LINEAR);
+
+    test_case_end(test);
+}
+#endif // ARENA_IMPLEMENTATION
+
 I32 main(void) {
     LogConfig const log_config = { .level = LOG_LEVEL_ERROR, .stream = stdout, .timestamp_enabled = true, .autoflush = true };
 
@@ -1439,6 +1515,10 @@ I32 main(void) {
     _test_init_from_env_diagnosis(&test);
     _test_configuration_invariants(&test);
 
+#ifdef ARENA_IMPLEMENTATION
+    _test_credentials_wiped_on_uninit(&test);
+    _test_replaced_password_wiped(&test);
+#endif // ARENA_IMPLEMENTATION
     test_suite_end(&test);
 
     return test_uninit(&test);

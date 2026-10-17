@@ -6,6 +6,7 @@
  * ============================================================================
  */
 #include <crypto/password/password.h>
+#include <memory/memory.h>
 
 /*==============================================================================
  * MARK: - Internal Constants
@@ -201,38 +202,39 @@ static String _crypto_password_hash(char const *const password, USize const pass
         return string;
     }
 
-    U8 salt[CRYPTO_PASSWORD_SALT_BYTE_COUNT] = DEFAULT_INITIALIZATION;
-    U8 hash[CRYPTO_PASSWORD_HASH_BYTE_COUNT] = DEFAULT_INITIALIZATION;
-
-    if (result_is_error(crypto_random_bytes(salt, CRYPTO_PASSWORD_SALT_BYTE_COUNT))) {
-        trace_log_pop();
-
-        return string;
-    }
-
-    if (result_is_error(crypto_kdf_pbkdf2_sha256(password, password_size, salt, CRYPTO_PASSWORD_SALT_BYTE_COUNT, iterations, hash, CRYPTO_PASSWORD_HASH_BYTE_COUNT))) {
-        trace_log_pop();
-
-        return string;
-    }
-
+    U8 salt[CRYPTO_PASSWORD_SALT_BYTE_COUNT]                                               = DEFAULT_INITIALIZATION;
+    U8 hash[CRYPTO_PASSWORD_HASH_BYTE_COUNT]                                               = DEFAULT_INITIALIZATION;
     char salt_hex[ENCODING_HEX_SIZE(CRYPTO_PASSWORD_SALT_BYTE_COUNT) + CHAR_END_CHARACTER] = DEFAULT_INITIALIZATION;
     char hash_hex[ENCODING_HEX_SIZE(CRYPTO_PASSWORD_HASH_BYTE_COUNT) + CHAR_END_CHARACTER] = DEFAULT_INITIALIZATION;
     char separator                                                                         = _CRYPTO_PASSWORD_FIELD_SEPARATOR;
-    char *const iterations_text                                                            = char_new_from_numbers_uint_1(iterations);
 
-    encoding_hex_encode_1(salt, CRYPTO_PASSWORD_SALT_BYTE_COUNT, salt_hex);
-    encoding_hex_encode_1(hash, CRYPTO_PASSWORD_HASH_BYTE_COUNT, hash_hex);
+    bool const derived = result_is_success(crypto_random_bytes(salt, CRYPTO_PASSWORD_SALT_BYTE_COUNT)) &&
+        result_is_success(crypto_kdf_pbkdf2_sha256(password, password_size, salt, CRYPTO_PASSWORD_SALT_BYTE_COUNT, iterations, hash, CRYPTO_PASSWORD_HASH_BYTE_COUNT));
 
-    string_add_last_2(&string, (char*) CRYPTO_PASSWORD_SCHEME, CHAR_STATIC_SIZE(CRYPTO_PASSWORD_SCHEME));
-    string_add_last_2(&string, &separator, 1);
-    string_add_last_2(&string, iterations_text, char_length(iterations_text));
-    string_add_last_2(&string, &separator, 1);
-    string_add_last_2(&string, salt_hex, ENCODING_HEX_SIZE(CRYPTO_PASSWORD_SALT_BYTE_COUNT));
-    string_add_last_2(&string, &separator, 1);
-    string_add_last_2(&string, hash_hex, ENCODING_HEX_SIZE(CRYPTO_PASSWORD_HASH_BYTE_COUNT));
+    if (derived) {
+        char *const iterations_text = char_new_from_numbers_uint_1(iterations);
 
-    char_delete(iterations_text);
+        encoding_hex_encode_1(salt, CRYPTO_PASSWORD_SALT_BYTE_COUNT, salt_hex);
+        encoding_hex_encode_1(hash, CRYPTO_PASSWORD_HASH_BYTE_COUNT, hash_hex);
+
+        string_add_last_2(&string, (char*) CRYPTO_PASSWORD_SCHEME, CHAR_STATIC_SIZE(CRYPTO_PASSWORD_SCHEME));
+        string_add_last_2(&string, &separator, 1);
+        string_add_last_2(&string, iterations_text, char_length(iterations_text));
+        string_add_last_2(&string, &separator, 1);
+        string_add_last_2(&string, salt_hex, ENCODING_HEX_SIZE(CRYPTO_PASSWORD_SALT_BYTE_COUNT));
+        string_add_last_2(&string, &separator, 1);
+        string_add_last_2(&string, hash_hex, ENCODING_HEX_SIZE(CRYPTO_PASSWORD_HASH_BYTE_COUNT));
+
+        char_delete(iterations_text);
+    }
+
+    // Single exit: the salt, derived key, and their hex renderings (the
+    // verifier) are wiped on every path, including a failed draw or derivation
+    // (a failed KDF may leave partial key bytes in hash).
+    memory_wipe(salt, CRYPTO_PASSWORD_SALT_BYTE_COUNT);
+    memory_wipe(hash, CRYPTO_PASSWORD_HASH_BYTE_COUNT);
+    memory_wipe(salt_hex, sizeof(salt_hex));
+    memory_wipe(hash_hex, sizeof(hash_hex));
 
     trace_log_pop();
 
@@ -254,6 +256,12 @@ static bool _crypto_password_verify(char const *const password, USize const pass
     bool const success = _crypto_password_parse(stored, &iterations, salt, stored_hash)                                                                                     &&
         result_is_success(crypto_kdf_pbkdf2_sha256(password, password_size, salt, CRYPTO_PASSWORD_SALT_BYTE_COUNT, iterations, candidate, CRYPTO_PASSWORD_HASH_BYTE_COUNT)) &&
         _crypto_password_bytes_equal(stored_hash, candidate, CRYPTO_PASSWORD_HASH_BYTE_COUNT);
+
+    // Single exit: the stored verifier parts and the candidate derivation are
+    // wiped on every path, including a parse or KDF failure.
+    memory_wipe(salt, CRYPTO_PASSWORD_SALT_BYTE_COUNT);
+    memory_wipe(stored_hash, CRYPTO_PASSWORD_HASH_BYTE_COUNT);
+    memory_wipe(candidate, CRYPTO_PASSWORD_HASH_BYTE_COUNT);
 
     trace_log_pop();
 

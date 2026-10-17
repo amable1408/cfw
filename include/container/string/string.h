@@ -1,6 +1,6 @@
 /*
  * string.h - Canonical String Object for the C Libraries Framework
- * @version 0.5.1
+ * @version 0.6.0
  *
  * Provides a high-level, mutable string object with dynamic or arena-backed memory management.
  *
@@ -11,6 +11,8 @@
  *   - Canonical error checking and memory safety
  *   - Non-aborting growth (0.5.0): string_try_reserve answers false and leaves the String
  *     untouched where string_reserve would end the process on an exhausted allocator
+ *   - Secret hygiene (0.6.0): string_wipe zeroes an OWNER's whole block through memory_wipe, which
+ *     the optimizer may not remove, and answers false (touching nothing) for a VIEW
  *
  * Usage Examples:
  *   @code
@@ -546,8 +548,10 @@ char string_at(String const *const self, USize const index);
 
 /**
  * @brief Clear the contents of a String: size becomes 0 and the whole old payload is SCRUBBED
- *        (zero-filled, O(old size)) - deliberate, so a cleared secret leaves no bytes behind.
+ *        (zero-filled, O(old size)).
  * @param self Pointer to the String object.
+ * @note NOT a secret wipe: the stores are ordinary and may be elided once the String is
+ *       released. For secrets use string_wipe.
  */
 void string_clear(String *const self);
 
@@ -1549,6 +1553,33 @@ void string_uninit(String *const self);
  * @param self Pointer to the String object.
  */
 void string_upper(String *const self);
+
+/**
+ * @brief Zero the owned block of a String that held a secret, then empty it.
+ *
+ * OWNER with data: memory_wipe(data, capacity) - the recorded capacity, not size, so bytes past a
+ * shrink and the terminator region are covered - then size = 0 (the zeroed block is already a terminated
+ * empty string). The block stays allocated until string_uninit.
+ * EMPTY (data nullptr): no-op, answers true.
+ * VIEW (owned == false): touches NOTHING (the view may sit on a literal or on an lws payload the
+ * server still owns) and answers false; the caller owns the backing storage and wipes it with
+ * memory_wipe.
+ *
+ * @param self Pointer to the String object. Non-null: aborts under ERROR_CHECK_ENABLED otherwise.
+ * @return true if the String owned its storage (or was EMPTY) and the bytes are now zero; false
+ *         for a VIEW, which was left untouched.
+ * @note Not string_clear: that is the O(size) scrub of a LIVE buffer (char_clear_2) whose stores
+ *       are ordinary and may be elided. Different purpose, different promise: this one is memory_wipe's.
+ * @note Realloc history is not reached: a String that GREW copied the secret into a new block and
+ *       the old one was released unwiped. Reserve the final size at construction.
+ * @note On an arena-backed owner the slice is zeroed but the arena block stays mapped.
+ * @see memory_wipe
+ * @code
+ * string_wipe(&token);
+ * string_uninit(&token);
+ * @endcode
+ */
+bool string_wipe(String *const self);
 
 /**
  * @brief Word-wrap a String to a column width, returning a new String - OWNED when

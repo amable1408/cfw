@@ -6,6 +6,7 @@
  * ============================================================================
  */
 #include <crypto/hash/hash.h>
+#include <memory/memory.h>
 
 /*==============================================================================
  * MARK: - Internal Constants
@@ -134,18 +135,25 @@ Result crypto_hash_final(Crypto_Hash *const self, U8 *const output, USize const 
     crypto_hash_uninit(self);
 
     if (!finalized) {
+        memory_wipe(staged, EVP_MAX_MD_SIZE);
+
         trace_log_pop();
 
         return _crypto_hash_failure("EVP_DigestFinal_ex");
     }
 
     if ((USize) written != size) {
+        memory_wipe(staged, EVP_MAX_MD_SIZE);
+
         trace_log_pop();
 
         return _crypto_hash_invariant("EVP_DigestFinal_ex", (USize) written, size);
     }
 
     memory_copy_1(output, staged, size);
+
+    // The staged digest may be a stored verifier; the caller owns the copy now.
+    memory_wipe(staged, EVP_MAX_MD_SIZE);
 
     trace_log_pop();
 

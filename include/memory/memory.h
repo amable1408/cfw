@@ -1,8 +1,10 @@
 /*
  * memory.h - Canonical memory management utilities for the C Libraries Framework
+ * @version 0.2.0
  *
  * Features:
  *   - Safe, flexible memory allocation, copying, and zeroing
+ *   - Optimizer-proof wiping of secret-holding buffers (memory_wipe, 0.2.0)
  *   - Macros for common memory sizes (KB, MB, GB, TB)
  *   - Error-checked, metadata-rich logging for all operations
  *   - Integration with the error and math modules
@@ -16,7 +18,9 @@
  *
  * Error Handling:
  *   All functions check for null pointers and invalid arguments. If invalid, the
- *   function returns early and logs an error.
+ *   function returns early and logs an error, except memory_alloc, memory_set and
+ *   memory_wipe: those ABORT on a null or zero contract violation under
+ *   ERROR_CHECK_ENABLED.
  *
  * Thread Safety:
  *   All functions are thread-safe if the underlying allocator is thread-safe.
@@ -208,6 +212,9 @@ void* memory_realloc(void const *const data, USize const old_byte_count, USize c
  * @param dst Buffer to set.
  * @param dst_size Number of bytes to set.
  * @param value Value to set each byte to.
+ * @note Not for secrets: once inlined (-flto) this is an ordinary store the optimizer may remove
+ *       as dead. For secrets use memory_wipe.
+ * @see memory_wipe
  * @code
  * memory_set(buffer, 128, 0);
  * @endcode
@@ -227,5 +234,57 @@ void memory_set(void *const dst, USize const dst_size, U8 const value);
  * @endcode
  */
 void* memory_try_alloc(USize const byte_count);
+
+/**
+ * @brief Overwrite a buffer with zero in a way the optimizer may not remove.
+ *
+ * Use it on any buffer that held a secret (password, token, key, digest that is a stored
+ * verifier) immediately after its last read and BEFORE the buffer is released, returned from,
+ * or reused. Unlike memory_set, the stores are guaranteed to be emitted at every optimization
+ * level, with and without -flto, and whether or not the buffer is ever read again.
+ *
+ * @param dst Buffer to wipe. nullptr ABORTS under ERROR_CHECK_ENABLED (pointer contract, same as
+ *            memory_set).
+ * @param dst_size Bytes to wipe. 0 is a documented NO-OP, never an abort: wipe sizes are
+ *                 data-derived (a String's capacity, a token's length) and an empty secret is a
+ *                 legal value.
+ *
+ * @note Not memory_set: that is an ordinary dead store once inlined (-flto) and is removed at -O3
+ *       when the buffer is never read again - which is precisely when a secret is wiped.
+ * @note Future drop-in: C23 memset_explicit, once glibc declares it (glibc 2.43 is the first to
+ *       ship it; 2.41 does not, ucrt64 already does) AND the proof script in tests/memory passes
+ *       on both lanes with it. Until then the single volatile-pointer path stays.
+ *
+ * Guarantees (promises):
+ *   1. After return every byte in [dst, dst + dst_size) is zero.
+ *   2. The stores are emitted at every optimization level, with or without -flto, whether or not
+ *      the object is read again (pinned by tests/memory wipe_proof).
+ *   3. dst_size 0 is a no-op; nullptr dst is a pointer-contract abort.
+ *   4. No allocation, no syscall on success; thread-safe (pure write to caller memory).
+ *
+ * Non-guarantees (each a real residue path the caller owns):
+ *   a. Registers, spills, by-value temporaries, SIMD lanes loaded from the buffer.
+ *   b. Copies made by code CFW does not control (OpenSSL contexts, lws receive buffers, curl's
+ *      header copies, libmysql/libpq/SQLite statement buffers, yyjson document arenas).
+ *   c. The process environment block (env putenv/setenv copies) - it outlives every wipe and is
+ *      inherited by children.
+ *   d. Swap, hibernation, core dumps, minidumps: no mlock/VirtualLock.
+ *   e. Realloc history: memory_realloc is libc realloc; a moved block leaves the old bytes
+ *      unwiped; string_format renders into the current block then grows and re-renders, leaving
+ *      a partial render in the freed first block. Reserve the final size up front for
+ *      secret-holding Strings.
+ *   f. The allocator-always-zeroes ruling is a NEXT-OWNER guarantee (a fresh allocation is
+ *      zeroed), not a residue guarantee; memory_free is unchanged by this primitive.
+ *   g. Not constant-time with respect to anything; unrelated to the comptime compares.
+ *   h. The volatile pointer lives in writable .data; "volatile" is an optimizer barrier, not a
+ *      tamper boundary.
+ *
+ * @see memory_set
+ * @code
+ * memory_wipe(buffer, HEX_SIZE + 1);
+ * memory_free(buffer);
+ * @endcode
+ */
+void memory_wipe(void *const dst, USize const dst_size);
 
 #endif // MEMORY_H

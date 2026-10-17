@@ -1,6 +1,6 @@
 /*
  * oauth.h - HTTP OAuth 2.0 client service for the C Libraries Framework
- * @version 0.4.2
+ * @version 0.4.3
  *
  * Provides provider configuration, signed state tokens bound to a provider, a
  * TTL and the user agent that started the login, PKCE (RFC 7636)
@@ -177,12 +177,17 @@
  *   - Returned String, token, and profile values must be uninitialized by caller
  *     (http_service_oauth_token_uninit / _profile_uninit / string_uninit).
  *   - token.raw and token.access_token CARRY THE CREDENTIAL - never log them.
- *     Their storage is released, not wiped, on uninit: a memory-wiping primitive
- *     is an open CFW gap, so the bytes can outlive the free. The same holds for
- *     the client_secret in the per-call provider snapshot, which is deep-copied
- *     and released unwiped once the round trip ends - and for the state key,
- *     which http_service_oauth_uninit zeroes with a plain memory_set that is a
- *     dead store to the optimizer, so LTO may elide it.
+ *     token_uninit zeroes access_token, id_token, raw and refresh_token
+ *     (string_wipe) before releasing them, and the service zeroes each row's
+ *     client_secret (str_wipe) and the state key (memory_wipe) on uninit. The
+ *     form-encoded request payload's FINAL block is wiped on every exit, as is
+ *     the token response's (and the per-call provider snapshot's client_secret
+ *     by its row uninit). NOT covered: blocks outgrown while the payload or the
+ *     response grew by appends (client_secret, code and code_verifier are
+ *     appended piecewise; the curl write callback appends the response), curl's
+ *     POST-body handling, the http_client header-list copy of the
+ *     "Authorization: Bearer" header (get_profile_2), and a token String that
+ *     grew after construction (the old block).
  *   - An arena-backed service allocates every String this module builds from
  *     that arena - returned values and per-call scratch alike - so size it for
  *     the response cap below, not just for the provider rows.
@@ -808,8 +813,9 @@ bool http_service_oauth_token_is_ok(HTTP_Service_OAuth_Token const *const self);
 /**
  * @brief Release token response storage.
  * @param self Token response.
- * @note Releases, does not WIPE: the credential bytes can outlive the free until
- *       CFW grows a memory-wiping primitive.
+ * @note Wipes access_token, id_token, raw and refresh_token (string_wipe) before
+ *       releasing them. A token String that grew after construction leaves its
+ *       old block unwiped.
  */
 void http_service_oauth_token_uninit(HTTP_Service_OAuth_Token *const self);
 

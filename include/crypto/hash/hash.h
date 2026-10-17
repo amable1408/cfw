@@ -4,6 +4,7 @@
  *  @file    hash.h
  *  @brief   Cryptographic digests over OpenSSL EVP — SHA-256 and SHA-512.
  *  @author  CFW
+ *  @version 0.2.0
  *  @date    2026-08-09
  *  @license MIT (see LICENSE file)
  *
@@ -93,9 +94,9 @@
  *      failure always releases. Uninit is idempotent. The caller owns every
  *      buffer, and final validates output_size then stages the digest
  *      internally, so nothing is ever written past the caller's capacity.
- *    - Digests are not wiped: neither the caller's output buffer nor the
- *      internal staging buffer is cleared after use. CFW has no memory_wipe
- *      primitive yet.
+ *    - The internal staging buffer is wiped (memory_wipe) on every exit of
+ *      crypto_hash_final. The caller's output buffer is NOT: a digest that is
+ *      a stored verifier is the caller's to memory_wipe when done.
  *
  *  Performance Characteristics:
  *    - Linear in message size; SHA-512 is faster than SHA-256 on 64-bit CPUs

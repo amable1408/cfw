@@ -6,7 +6,7 @@
  *           libcurl SMTP transport and an in-memory capture transport.
  *  @author  CFW
  *  @date    2026-09-06
- *  @version 0.4.0
+ *  @version 0.4.1
  *  @license MIT (see LICENSE file)
  *
  *  Sends account, security, receipt, and notification emails while keeping
@@ -129,8 +129,10 @@
  *    - Service and message values own COPIES of every string handed to them;
  *      the caller's buffers may go away immediately after the call.
  *    - Returned String and Result values must be uninitialized by the caller.
- *    - The password is freed but not zeroed on uninit (the tree has no
- *      memory_wipe yet); it can survive in freed heap until reused.
+ *    - The username and password are zeroed (string_wipe) before they are
+ *      released on uninit, and a value replaced by a setter is zeroed the same
+ *      way. Not covered: libcurl's own copy of the credentials while a send is
+ *      in flight.
  *    - The capture sink is BORROWED: the caller owns that String and must keep
  *      it alive for as long as the service points at it.
  *

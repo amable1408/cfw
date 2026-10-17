@@ -3172,6 +3172,36 @@ void string_upper(String *const self) {
     trace_log_pop();
 }
 
+bool string_wipe(String *const self) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+
+    /* EMPTY: nothing to wipe. Checked before `owned`, which is false in that state too. */
+    if (self->data == nullptr) {
+        trace_log_pop();
+
+        return true;
+    }
+
+    /* A VIEW is untouched: it may sit on a literal or on a payload another owner still uses. */
+    if (!self->owned) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    /* The whole block, not just size: bytes left past a shrink and the terminator region held
+     * the secret too. The zeroed block is already a terminated empty string. */
+    memory_wipe(self->data, self->capacity);
+
+    self->size = 0;
+
+    trace_log_pop();
+
+    return true;
+}
+
 String string_wrap(String const *const self, USize const width) {
     trace_log_push(LOG_METADATA);
 

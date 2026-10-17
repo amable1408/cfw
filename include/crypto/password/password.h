@@ -5,6 +5,7 @@
  *  @brief   Password hashing, verification, and rehash policy over
  *           PBKDF2-HMAC-SHA256 records.
  *  @author  CFW
+ *  @version 0.2.0
  *  @date    2026-08-09
  *  @license MIT (see LICENSE file)
  *
@@ -76,8 +77,9 @@
  *    - Heap hash results are owned by the caller (string_uninit); arena
  *      (alloc) results follow the arena's lifetime.
  *    - The salt, derived hash, verify candidate, and their hex forms live on
- *      the stack and are not zeroised on return; CFW has no memory_wipe yet.
- *      A caller that must erase the plaintext password scrubs its own buffer.
+ *      the stack and are wiped (memory_wipe) on every exit, including failure
+ *      paths. A caller that must erase the plaintext password memory_wipes
+ *      its own buffer.
  *
  *  Performance Characteristics:
  *    - Dominated by the KDF iteration count, deliberately (see crypto/kdf).

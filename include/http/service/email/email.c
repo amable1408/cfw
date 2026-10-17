@@ -276,6 +276,9 @@ static bool _http_service_email_string_set(String *const self, char const *const
         return false;
     }
 
+    /* The replaced value may be the SMTP password (credential rotation), so it is
+     * zeroed before release, as uninit does. */
+    string_wipe(self);
     string_uninit(self);
 
     *self = replacement;
@@ -2771,8 +2774,10 @@ void http_service_email_uninit(HTTP_Service_Email *const self) {
 
     error_check_null(LOG_METADATA, "self", (void*) self);
 
-    /* The password is freed, not zeroed: the tree has no memory_wipe yet, so it
-     * can survive in freed heap until the allocator reuses that block. */
+    /* The credentials are zeroed (string_wipe) before they are released, so they
+     * do not survive in freed heap until the allocator reuses the block. */
+    string_wipe(&self->password);
+    string_wipe(&self->username);
     string_uninit(&self->auth_mechanism);
     string_uninit(&self->ca_bundle);
     string_uninit(&self->from);

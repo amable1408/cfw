@@ -91,6 +91,9 @@ static Result _env_set_bytes(char const *const name, char const *const data, USi
 
     Result const result = env_set_1(name, buffer);
 
+    /* The value may be a secret: zero the whole copy before it is released. This does NOT
+     * reach the process environment block env_set_1 just wrote (it outlives every wipe). */
+    memory_wipe(buffer, size + CHAR_END_CHARACTER);
     memory_free(buffer);
 
     trace_log_pop();
@@ -405,6 +408,8 @@ Result env_from_char_2(char const *const data, USize const size, bool const over
 
     Result const result = _env_apply(buffer, size, override, "(data)");
 
+    /* The parser's working copy holds every secret in the text; zero it before release. */
+    memory_wipe(buffer, size + CHAR_END_CHARACTER);
     memory_free(buffer);
 
     trace_log_pop();
@@ -630,6 +635,7 @@ Result env_load_2(char const *const path, bool const override) {
     file_close(&file);
 
     if (string_get_size(&data) != expected) {
+        string_wipe(&data);
         string_uninit(&data);
 
         trace_log_pop();
@@ -639,6 +645,8 @@ Result env_load_2(char const *const path, bool const override) {
 
     Result const result = _env_apply(string_get_data(&data), string_get_size(&data), override, path);
 
+    /* The file text holds every secret in it; zero the whole block before release. */
+    string_wipe(&data);
     string_uninit(&data);
 
     trace_log_pop();

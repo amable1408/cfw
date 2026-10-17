@@ -50,6 +50,7 @@ static USize    _ledger_overflow  = 0;
 static USize    _append_calls     = 0;
 static USize    _append_fail_at   = 0;
 static USize    _perform_calls    = 0;
+static USize    _free_all_calls   = 0;
 
 void* __real_calloc(USize const count, USize const size);
 void __real_free(void *const pointer);
@@ -62,9 +63,11 @@ void __real_free(void *const pointer);
  * stays reachable as the __real___imp_X variable. */
 extern CURLcode (*__real___imp_curl_easy_perform)(CURL *handle);
 extern struct curl_slist* (*__real___imp_curl_slist_append)(struct curl_slist *list, char const *data);
+extern void (*__real___imp_curl_slist_free_all)(struct curl_slist *list);
 #else
 CURLcode __real_curl_easy_perform(CURL *const handle);
 struct curl_slist* __real_curl_slist_append(struct curl_slist *const list, char const *const data);
+void __real_curl_slist_free_all(struct curl_slist *const list);
 #endif // _WIN32
 
 static CURLcode _perform_real(CURL *const handle) {
@@ -80,6 +83,14 @@ static struct curl_slist* _append_real(struct curl_slist *const list, char const
     return __real___imp_curl_slist_append(list, data);
 #else
     return __real_curl_slist_append(list, data);
+#endif // _WIN32
+}
+
+static void _free_all_real(struct curl_slist *const list) {
+#ifdef _WIN32
+    __real___imp_curl_slist_free_all(list);
+#else
+    __real_curl_slist_free_all(list);
 #endif // _WIN32
 }
 
@@ -118,9 +129,16 @@ struct curl_slist* __wrap_curl_slist_append(struct curl_slist *const list, char 
     return _append_real(list, data);
 }
 
+void __wrap_curl_slist_free_all(struct curl_slist *const list) {
+    _free_all_calls += 1;
+
+    _free_all_real(list);
+}
+
 #ifdef _WIN32
 CURLcode (*__wrap___imp_curl_easy_perform)(CURL *handle) = __wrap_curl_easy_perform;
 struct curl_slist* (*__wrap___imp_curl_slist_append)(struct curl_slist *list, char const *data) = __wrap_curl_slist_append;
+void (*__wrap___imp_curl_slist_free_all)(struct curl_slist *list) = __wrap_curl_slist_free_all;
 #endif // _WIN32
 
 void __wrap_free(void *const pointer) {
@@ -141,13 +159,14 @@ static void _arm(USize const fail_at) {
     _append_calls    = 0;
     _append_fail_at  = fail_at;
     _perform_calls   = 0;
+    _free_all_calls  = 0;
 }
 
 /*==============================================================================
  * MARK: - Fixture
  *============================================================================*/
 
-static void _setup(HTTP_Service_OAuth *const oauth) {
+static void _setup(Test *const test, HTTP_Service_OAuth *const oauth) {
     HTTP_Service_OAuth_Provider const provider = {
         .authorize_url  = "https://example.invalid/authorize",
         .client_id      = "client-id",
@@ -160,8 +179,8 @@ static void _setup(HTTP_Service_OAuth *const oauth) {
         .token_url      = "http://127.0.0.1:1/token"
     };
 
-    http_service_oauth_init_1(oauth);
-    http_service_oauth_provider_add_1(oauth, &provider);
+    test_expect_true(test, "fixture: oauth instance initialised", http_service_oauth_init_1(oauth));
+    test_expect_true(test, "fixture: provider registered", http_service_oauth_provider_add_1(oauth, &provider));
 }
 
 /*==============================================================================
@@ -184,6 +203,7 @@ static void _expect_token_refusal(Test *const test, HTTP_Service_OAuth *const oa
     test_expect_u(test, "  response_code is 0", 0, token.response_code);
     test_expect_u(test, "  both header appends were attempted", 2, _append_calls);
     test_expect_u(test, "  nothing was sent", 0, _perform_calls);
+    test_expect_u(test, "  the partial header list was released exactly once", 1, _free_all_calls);
 
     http_service_oauth_token_uninit(&token);
 
@@ -195,7 +215,7 @@ static void _test_token_header_refusals(Test *const test) {
 
     HTTP_Service_OAuth oauth = DEFAULT_INITIALIZATION;
 
-    _setup(&oauth);
+    _setup(test, &oauth);
 
     _arm(0);
 
@@ -228,6 +248,7 @@ static void _expect_profile_refusal(Test *const test, HTTP_Service_OAuth *const 
     test_expect_u(test, "  response_code is 0", 0, profile.response_code);
     test_expect_u(test, "  both header appends were attempted", 2, _append_calls);
     test_expect_u(test, "  nothing was sent", 0, _perform_calls);
+    test_expect_u(test, "  the partial header list was released exactly once", 1, _free_all_calls);
 
     http_service_oauth_profile_uninit(&profile);
 
@@ -239,7 +260,7 @@ static void _test_profile_header_refusals(Test *const test) {
 
     HTTP_Service_OAuth oauth = DEFAULT_INITIALIZATION;
 
-    _setup(&oauth);
+    _setup(test, &oauth);
 
     _arm(0);
 
@@ -264,7 +285,7 @@ static void _test_revoke_header_refusal(Test *const test) {
 
     HTTP_Service_OAuth oauth = DEFAULT_INITIALIZATION;
 
-    _setup(&oauth);
+    _setup(test, &oauth);
 
     _arm(0);
 
@@ -279,6 +300,7 @@ static void _test_revoke_header_refusal(Test *const test) {
     test_expect_false(test, "Content-Type refused: false", http_service_oauth_revoke_1(&oauth, "local", "token"));
     test_expect_u(test, "  the header append was attempted", 1, _append_calls);
     test_expect_u(test, "  nothing was sent", 0, _perform_calls);
+    test_expect_u(test, "  no list node existed, so the null-list clear skipped curl_slist_free_all", 0, _free_all_calls);
     test_expect_u(test, "  nothing left allocated", live_before, _ledger_count);
 
     http_service_oauth_uninit(&oauth);

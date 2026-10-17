@@ -507,6 +507,42 @@ static bool     _send_file_missing_ok                   = true;
 static USize    _body_seen[4]                           = DEFAULT_INITIALIZATION;
 static USize    _body_seen_count                        = 0;
 
+/*== MARK: - memory_wipe observer ==*/
+
+/* The checked link passes -Wl,--wrap=memory_wipe, so the server's release of a request body
+ * lands here first: it records WHICH body was in the buffer at the moment of the wipe, then
+ * forwards to the real wipe. Without the wipe in _http_server_payload_reset nothing is seen. */
+extern void __real_memory_wipe(void *const dst, USize const dst_size);
+
+static volatile I32 _wiped_body_first  = 0;
+static volatile I32 _wiped_body_second = 0;
+
+static bool _wipe_starts_with(void const *const dst, USize const dst_size, char const *const text, USize const text_size) {
+    if (dst == nullptr || dst_size < text_size) {
+        return false;
+    }
+
+    for (USize index = 0; index < text_size; index += 1) {
+        if (((char const*) dst)[index] != text[index]) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void __wrap_memory_wipe(void *const dst, USize const dst_size) {
+    if (_wipe_starts_with(dst, dst_size, "AAAA", 4)) {
+        _wiped_body_first = 1;
+    }
+
+    if (_wipe_starts_with(dst, dst_size, "BBBBBBBBB", 9)) {
+        _wiped_body_second = 1;
+    }
+
+    __real_memory_wipe(dst, dst_size);
+}
+
 static void _send_text(HTTP_Server_Response *const response, char const *const text) {
     http_server_response_send_1(response, text, HTTP_SERVER_CONTENT_TYPE_TEXT_PLAIN, HTTP_SERVER_STATUS_CODE_OK);
 }
@@ -1314,7 +1350,12 @@ static bool _peer_socket_send_buffer(U16 const port, I32 *const out) {
 
         peer.size = (Net_Socket_Len) sizeof(peer.storage);
 
-        if (getpeername(candidate, (struct sockaddr*) &peer.storage, &peer.size) != 0 || peer.storage.ss_family != AF_INET || net_socket_address_port(&peer) != port) {
+        if (getpeername(candidate, (struct sockaddr*) &peer.storage, &peer.size) != 0) {
+            continue;
+        }
+
+        // A dual-stack listener reports an accepted 127.0.0.1 client as AF_INET6; only AF_INET/AF_INET6 carry a port.
+        if ((peer.storage.ss_family != AF_INET && peer.storage.ss_family != AF_INET6) || net_socket_address_port(&peer) != port) {
             continue;
         }
 
@@ -1722,6 +1763,11 @@ static void _test_bodies(Test *const test) {
 
         net_socket_close(socket);
     }
+
+    /* The body can carry a password or token: each one was wiped (its bytes still in the
+     * buffer when memory_wipe ran) before the session released it. */
+    test_expect_true(test, "the first request body is wiped before its buffer is released", _wiped_body_first != 0);
+    test_expect_true(test, "the second request body is wiped before its buffer is released", _wiped_body_second != 0);
 
     http_server_delete(&server);
 

@@ -6,6 +6,7 @@
  * ============================================================================
  */
 #include <crypto/hmac/hmac.h>
+#include <memory/memory.h>
 
 /*==============================================================================
  * MARK: - Internal Constants
@@ -96,17 +97,17 @@ static Result _crypto_hmac_mac_hex(
     U8              staged[EVP_MAX_MD_SIZE] = DEFAULT_INITIALIZATION;
     Result  const   result                  = _crypto_hmac_mac(algorithm, key, key_size, message, message_size, staged, digest_size);
 
-    if (result_is_error(result)) {
-        trace_log_pop();
-
-        return result;
+    if (result_is_success(result)) {
+        encoding_hex_encode_2(staged, digest_size, output, upper);
     }
 
-    encoding_hex_encode_2(staged, digest_size, output, upper);
+    // Single exit: the raw MAC of a live key is wiped on success AND failure
+    // (a failed MAC may still hold partial output).
+    memory_wipe(staged, EVP_MAX_MD_SIZE);
 
     trace_log_pop();
 
-    return RESULT_SUCCESS;
+    return result;
 }
 
 /** @brief Shared verify body: recompute the MAC and compare it against the
@@ -130,13 +131,12 @@ static bool _crypto_hmac_verify(
     // Sized for the widest supported MAC so one buffer serves both algorithms.
     char computed[CRYPTO_HMAC_SHA512_HEX_SIZE + CHAR_END_CHARACTER] = DEFAULT_INITIALIZATION;
 
-    if (result_is_error(_crypto_hmac_mac_hex(algorithm, key, key_size, message, message_size, computed, digest_size, false))) {
-        trace_log_pop();
+    bool const computed_ok = result_is_success(_crypto_hmac_mac_hex(algorithm, key, key_size, message, message_size, computed, digest_size, false));
+    bool const result      = computed_ok && char_compare_iequal_comptime_1(computed, expected_hex);
 
-        return false;
-    }
-
-    bool const result = char_compare_iequal_comptime_1(computed, expected_hex);
+    // Single exit: the recomputed MAC is a valid signature for this message; it
+    // is wiped whether or not the compare ran.
+    memory_wipe(computed, sizeof(computed));
 
     trace_log_pop();
 

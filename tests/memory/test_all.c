@@ -2,7 +2,7 @@
  * test_all.c - Behavioral tests for include/memory/memory.c.
  *
  * memory_alloc/memory_try_alloc/memory_copy_1/memory_copy_2/memory_delete/memory_free/
- * memory_realloc/memory_set all guard their arguments with error_check_* under
+ * memory_realloc/memory_set/memory_wipe all guard their arguments with error_check_* under
  * ERROR_CHECK_ENABLED, which aborts the process on failure. The abort half of each contract
  * cannot be observed in-process without killing the runner, so this suite spawns itself as a
  * child (re-entered through the --child-* flags below, the same pattern tests/error/test_all.c
@@ -147,6 +147,14 @@ static I32 _child_set_null(void) {
     log_init(_child_log_config());
 
     memory_set(nullptr, 4, 0);
+
+    return 0;
+}
+
+static I32 _child_wipe_null(void) {
+    log_init(_child_log_config());
+
+    memory_wipe(nullptr, 4);
 
     return 0;
 }
@@ -308,6 +316,80 @@ static void _test_set(Test *const test) {
     test_case_end(test);
 }
 
+/* Counts the bytes of buffer that differ from expected, read through a volatile pointer so the
+ * read-back itself can never be folded away. */
+static USize _count_bytes_not(U8 const *const buffer, USize const size, U8 const expected) {
+    volatile U8 const *const at = (volatile U8 const*) buffer;
+    USize mismatches = 0;
+
+    for (USize i = 0; i < size; i += 1) {
+        if (at[i] != expected) {
+            mismatches += 1;
+        }
+    }
+
+    return mismatches;
+}
+
+static void _test_wipe(Test *const test) {
+    test_case_begin(test, "memory_wipe");
+
+    /* Heap: the fill is verified first, so a zero read-back is a real wipe and not a buffer that
+     * was zero all along. */
+    USize const heap_size = 300;
+    U8 *const heap = (U8*) memory_alloc(heap_size);
+
+    memory_set(heap, heap_size, 0xA5);
+
+    test_expect_u(test, "heap buffer is filled before the wipe", 0, _count_bytes_not(heap, heap_size, 0xA5));
+
+    memory_wipe(heap, heap_size);
+
+    test_expect_u(test, "memory_wipe zeroes every byte of a heap buffer", 0, _count_bytes_not(heap, heap_size, 0));
+
+    /* Wipe, then release: the buffer must still be a valid block (ASan/the allocator would
+     * flag an overrun past heap_size) and free cleanly. */
+    memory_free(heap);
+
+    /* Stack. */
+    U8 stack[97] = DEFAULT_INITIALIZATION;
+
+    memory_set(stack, sizeof stack, 0x5A);
+
+    test_expect_u(test, "stack buffer is filled before the wipe", 0, _count_bytes_not(stack, sizeof stack, 0x5A));
+
+    memory_wipe(stack, sizeof stack);
+
+    test_expect_u(test, "memory_wipe zeroes every byte of a stack buffer", 0, _count_bytes_not(stack, sizeof stack, 0));
+
+    /* Size 0 is a documented no-op, never an abort: the filled buffer is left intact. */
+    U8 untouched[16] = DEFAULT_INITIALIZATION;
+
+    memory_set(untouched, sizeof untouched, 0xC3);
+    memory_wipe(untouched, 0);
+
+    test_expect_u(test, "memory_wipe(dst, 0) leaves the buffer untouched", 0, _count_bytes_not(untouched, sizeof untouched, 0xC3));
+
+    /* One byte: the neighbours on both sides survive. */
+    U8 single[3] = DEFAULT_INITIALIZATION;
+
+    memory_set(single, sizeof single, 0xFF);
+    memory_wipe(&single[1], 1);
+
+    test_expect_true(test, "memory_wipe of one byte zeroes exactly that byte", single[0] == 0xFF && single[1] == 0 && single[2] == 0xFF);
+
+    /* Only [dst, dst + dst_size) is touched: a partial wipe stops at its size. */
+    U8 partial[32] = DEFAULT_INITIALIZATION;
+
+    memory_set(partial, sizeof partial, 0x77);
+    memory_wipe(partial, 20);
+
+    test_expect_u(test, "partial wipe zeroes the requested prefix", 0, _count_bytes_not(partial, 20, 0));
+    test_expect_u(test, "partial wipe leaves the tail intact", 0, _count_bytes_not(&partial[20], sizeof partial - 20, 0x77));
+
+    test_case_end(test);
+}
+
 static void _test_realloc(Test *const test) {
     test_case_begin(test, "memory_realloc");
 
@@ -400,6 +482,7 @@ static void _test_abort_probes(Test *const test) {
     _test_abort_probe(test, "memory_free(nullptr)", "--child-free-null", "NULL_POINTER");
     _test_abort_probe(test, "memory_realloc(..., byte_count=0)", "--child-realloc-zero", "NON_VALUE");
     _test_abort_probe(test, "memory_set(nullptr, ...)", "--child-set-null", "NULL_POINTER");
+    _test_abort_probe(test, "memory_wipe(nullptr, ...)", "--child-wipe-null", "NULL_POINTER");
     _test_abort_probe(test, "memory_fit_size(byte_size=0, ...)", "--child-fit-size-zero-size", "NON_VALUE");
     _test_abort_probe(test, "memory_fit_size(..., byte_count=0)", "--child-fit-size-zero-count", "NON_VALUE");
 
@@ -446,6 +529,10 @@ int main(int argc, char **argv) {
             return _child_set_null();
         }
 
+        if (strcmp(argv[1], "--child-wipe-null") == 0) {
+            return _child_wipe_null();
+        }
+
         if (strcmp(argv[1], "--child-fit-size-zero-size") == 0) {
             return _child_fit_size_zero_size();
         }
@@ -471,6 +558,7 @@ int main(int argc, char **argv) {
     _test_empty(&test);
     _test_fit_size(&test);
     _test_set(&test);
+    _test_wipe(&test);
     _test_realloc(&test);
     _test_abort_probes(&test);
     test_suite_end(&test);

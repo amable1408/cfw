@@ -11,6 +11,10 @@
  * per init would take minutes. The one exception is the decoy-timing case, which needs a cost
  * it can measure.
  */
+#include <stdio.h>
+
+#include <allocator/allocator.h>
+#include <arena/arena.h>
 #include <chrono/chrono.h>
 #include <http/server/http_server.h>
 #include <http/service/auth/auth.h>
@@ -535,6 +539,94 @@ static void _test_uninit_releases_the_decoy(Test *const test) {
     test_case_end(test);
 }
 
+/*
+ * A linear arena reclaims nothing, so what string_uninit "frees" stays readable at the same
+ * address: the only way to observe, without undefined behavior, whether a secret was wiped
+ * BEFORE its release. These two helpers read that memory back.
+ */
+static USize _test_nonzero_bytes(char const *const at, USize const byte_count) {
+    volatile U8 const *const bytes = (volatile U8 const*) at;
+
+    USize count = 0;
+
+    for (USize index = 0; index < byte_count; index += 1) {
+        if (bytes[index] != 0) {
+            count += 1;
+        }
+    }
+
+    return count;
+}
+
+static bool _test_span_contains(char const *const base, USize const span, char const *const needle, USize const needle_size) {
+    volatile U8 const *const bytes = (volatile U8 const*) base;
+
+    for (USize start = 0; start + needle_size <= span; start += 1) {
+        USize matched = 0;
+
+        while (matched < needle_size && bytes[start + matched] == (U8) needle[matched]) {
+            matched += 1;
+        }
+
+        if (matched == needle_size) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void _test_wipe_on_release(Test *const test) {
+    test_case_begin(test, "secrets are wiped before release: token_uninit and token_verify_3 leave no token or digest bytes behind in an arena");
+
+    Arena arena  = arena_init_1(1 << 20, ARENA_TYPE_LINEAR);
+    Arena mirror = arena_init_1(1 << 20, ARENA_TYPE_LINEAR);
+
+    /* Everything the service allocates lands after this probe, so [probe, probe + span) covers it. */
+    char const *const probe = (char const*) allocator_borrow(8, &arena);
+    USize      const  span  = 16384;
+
+    HTTP_Service_Auth auth  = http_service_auth_alloc_init_3(_MIN_LENGTH, _MAX_LENGTH, _FAST_ITERATIONS, _TOKEN_BYTE_COUNT, _RESET_TTL, _EMAIL_TTL, &arena);
+    HTTP_Service_Auth other = http_service_auth_alloc_init_3(_MIN_LENGTH, _MAX_LENGTH, _FAST_ITERATIONS, _TOKEN_BYTE_COUNT, _RESET_TTL, _EMAIL_TTL, &mirror);
+
+    HTTP_Service_Auth_Token token = http_service_auth_token_create(&auth, 60);
+
+    char const *const at = string_get_data(&token.value);
+
+    test_expect_u(test, "the live token holds its nonzero bytes", _TOKEN_BYTE_COUNT * 2, _test_nonzero_bytes(at, _TOKEN_BYTE_COUNT * 2));
+
+    char value[(_TOKEN_BYTE_COUNT * 2) + 1] = DEFAULT_INITIALIZATION;
+
+    snprintf(value, sizeof(value), "%s", at);
+
+    /* The stored digest is made by a MIRROR service on its own arena, so the only place its text
+     * can appear in `arena` is the candidate digest that verify computes and releases. */
+    String stored = http_service_auth_token_hash(&other, value);
+
+    char digest[(_TOKEN_BYTE_COUNT * 2) + 1] = DEFAULT_INITIALIZATION;
+
+    snprintf(digest, sizeof(digest), "%s", string_get_data(&stored));
+
+    USize const expires_at = token.expires_at;
+
+    http_service_auth_token_uninit(&token);
+
+    test_expect_true(test, "token_uninit leaves the String empty", string_empty(&token.value));
+    test_expect_u(test, "token_uninit zeroed the released token bytes", 0, _test_nonzero_bytes(at, _TOKEN_BYTE_COUNT * 2));
+
+    test_expect_false(test, "token_uninit left no copy of the token in the arena", _test_span_contains(probe, span, value, _TOKEN_BYTE_COUNT * 2));
+    test_expect_true(test, "token_verify_3 accepts the stored digest", http_service_auth_token_verify_3(&auth, value, digest, expires_at));
+    test_expect_false(test, "token_verify_3 left no copy of the candidate digest in the arena", _test_span_contains(probe, span, digest, _TOKEN_BYTE_COUNT * 2));
+
+    string_uninit(&stored);
+    http_service_auth_uninit(&other);
+    http_service_auth_uninit(&auth);
+    arena_uninit(&mirror, ARENA_TYPE_LINEAR);
+    arena_uninit(&arena, ARENA_TYPE_LINEAR);
+
+    test_case_end(test);
+}
+
 static void _test_arena(Test *const test) {
     test_case_begin(test, "arena-backed service");
 
@@ -787,6 +879,7 @@ I32 main(void) {
     _test_decoy_timing(&test);
     _test_uninit_releases_the_decoy(&test);
     _test_arena(&test);
+    _test_wipe_on_release(&test);
 
     test_suite_end(&test);
 

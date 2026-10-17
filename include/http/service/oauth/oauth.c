@@ -224,6 +224,8 @@ static void _http_service_oauth_row_uninit(HTTP_Service_OAuth_Row *const self) {
 
     error_check_null(LOG_METADATA, "self", (void*) self);
 
+    str_wipe(&self->client_secret);
+
     str_uninit(&self->authorize_url);
     str_uninit(&self->client_id);
     str_uninit(&self->client_secret);
@@ -582,6 +584,7 @@ static void _http_service_oauth_json_copy_string(Json const *const json, char co
             string_copy(output, &value);
         }
 
+        string_wipe(&value);
         string_uninit(&value);
     }
 
@@ -827,6 +830,7 @@ static HTTP_Service_OAuth_Token _http_service_oauth_send_token_request(HTTP_Serv
 
     _http_service_oauth_token_parse(&token);
 
+    string_wipe(&response);
     string_uninit(&response);
     http_client_header_clear(client);
 
@@ -1225,7 +1229,7 @@ static bool _http_service_oauth_construct(HTTP_Service_OAuth *const self, U8 con
     if (result_is_error(thread_mutex_init(&self->mutex))) {
         log_message_2(LOG_LEVEL_ERROR, LOG_METADATA, "http_service_oauth: mutex init failed - refusing to run without locking");
 
-        memory_set(self->state_key, sizeof(self->state_key), 0);
+        memory_wipe(self->state_key, sizeof(self->state_key));
 
         self->state_key_size = 0;
 
@@ -1256,6 +1260,8 @@ bool http_service_oauth_alloc_init_1(HTTP_Service_OAuth *const self, Arena *cons
     if (result_is_error(crypto_random_bytes(key, sizeof(key)))) {
         log_message_2(LOG_LEVEL_ERROR, LOG_METADATA, "http_service_oauth: state key generation failed");
 
+        memory_wipe(key, sizeof(key));
+
         trace_log_pop();
 
         return false;
@@ -1263,7 +1269,7 @@ bool http_service_oauth_alloc_init_1(HTTP_Service_OAuth *const self, Arena *cons
 
     bool const constructed = http_service_oauth_alloc_init_2(self, allocator, key, sizeof(key));
 
-    memory_set(key, sizeof(key), 0);
+    memory_wipe(key, sizeof(key));
 
     trace_log_pop();
 
@@ -1389,6 +1395,7 @@ HTTP_Service_OAuth_Token http_service_oauth_exchange_code_2(HTTP_Service_OAuth *
     if (!encoded) {
         log_message_1(LOG_LEVEL_ERROR, "oauth: provider=%s token request body incomplete - not sent\n", provider);
 
+        string_wipe(&payload);
         string_uninit(&payload);
 
         _http_service_oauth_row_uninit(&row);
@@ -1402,6 +1409,7 @@ HTTP_Service_OAuth_Token http_service_oauth_exchange_code_2(HTTP_Service_OAuth *
 
     HTTP_Service_OAuth_Token token = _http_service_oauth_send_token_request(self, _http_service_oauth_str_text(&row.token_url), &payload);
 
+    string_wipe(&payload);
     string_uninit(&payload);
 
     _http_service_oauth_row_uninit(&row);
@@ -1661,6 +1669,7 @@ HTTP_Service_OAuth_Profile http_service_oauth_get_profile_2(HTTP_Service_OAuth *
         _http_service_oauth_string_add(&profile.error, "invalid_request");
 
         string_uninit(&response);
+        string_wipe(&header);
         string_uninit(&header);
         http_client_delete(&client);
 
@@ -1709,6 +1718,7 @@ HTTP_Service_OAuth_Profile http_service_oauth_get_profile_2(HTTP_Service_OAuth *
     _http_service_oauth_profile_parse(&profile);
 
     string_uninit(&response);
+    string_wipe(&header);
     string_uninit(&header);
     http_client_header_clear(client);
     http_client_delete(&client);
@@ -1731,6 +1741,8 @@ bool http_service_oauth_init_1(HTTP_Service_OAuth *const self) {
     if (result_is_error(crypto_random_bytes(key, sizeof(key)))) {
         log_message_2(LOG_LEVEL_ERROR, LOG_METADATA, "http_service_oauth: state key generation failed");
 
+        memory_wipe(key, sizeof(key));
+
         trace_log_pop();
 
         return false;
@@ -1738,7 +1750,7 @@ bool http_service_oauth_init_1(HTTP_Service_OAuth *const self) {
 
     bool const constructed = http_service_oauth_init_2(self, key, sizeof(key));
 
-    memory_set(key, sizeof(key), 0);
+    memory_wipe(key, sizeof(key));
 
     trace_log_pop();
 
@@ -1822,7 +1834,7 @@ bool http_service_oauth_pkce_verifier_create(char *const out) {
 
     encoding_base64_url_encode_1(bytes, _HTTP_SERVICE_OAUTH_PKCE_VERIFIER_BYTES, out);
 
-    memory_set(bytes, sizeof(bytes), 0);
+    memory_wipe(bytes, sizeof(bytes));
 
     trace_log_pop();
 
@@ -1983,6 +1995,7 @@ HTTP_Service_OAuth_Token http_service_oauth_refresh(HTTP_Service_OAuth *const se
     if (!encoded) {
         log_message_1(LOG_LEVEL_ERROR, "oauth: provider=%s refresh request body incomplete - not sent\n", provider);
 
+        string_wipe(&payload);
         string_uninit(&payload);
 
         _http_service_oauth_row_uninit(&row);
@@ -1996,6 +2009,7 @@ HTTP_Service_OAuth_Token http_service_oauth_refresh(HTTP_Service_OAuth *const se
 
     HTTP_Service_OAuth_Token token = _http_service_oauth_send_token_request(self, _http_service_oauth_str_text(&row.token_url), &payload);
 
+    string_wipe(&payload);
     string_uninit(&payload);
 
     _http_service_oauth_row_uninit(&row);
@@ -2080,6 +2094,7 @@ bool http_service_oauth_revoke_2(HTTP_Service_OAuth *const self, char const *con
         log_message_1(LOG_LEVEL_ERROR, "oauth: provider=%s revoke request %s incomplete - not sent\n", provider, !encoded ? "body" : "headers");
 
         string_uninit(&response);
+        string_wipe(&payload);
         string_uninit(&payload);
         http_client_delete(&client);
 
@@ -2098,6 +2113,7 @@ bool http_service_oauth_revoke_2(HTTP_Service_OAuth *const self, char const *con
 
     http_client_result_uninit(&result);
     string_uninit(&response);
+    string_wipe(&payload);
     string_uninit(&payload);
     http_client_header_clear(client);
     http_client_delete(&client);
@@ -2188,6 +2204,11 @@ void http_service_oauth_token_uninit(HTTP_Service_OAuth_Token *const self) {
 
     error_check_null(LOG_METADATA, "self", (void*) self);
 
+    string_wipe(&self->access_token);
+    string_wipe(&self->id_token);
+    string_wipe(&self->raw);
+    string_wipe(&self->refresh_token);
+
     string_uninit(&self->access_token);
     string_uninit(&self->error);
     string_uninit(&self->error_description);
@@ -2220,9 +2241,8 @@ void http_service_oauth_uninit(HTTP_Service_OAuth *const self) {
 #endif // ARENA_IMPLEMENTATION
 
     /* The key signs state tokens; a released service should not leave it lying in the struct.
-     * Best effort only: this is a dead store as far as the optimizer can tell, and LTO is free
-     * to elide it - the same memory-wiping gap the header's Memory Management names. */
-    memory_set(self->state_key, sizeof(self->state_key), 0);
+     * memory_wipe, not memory_set: a plain store here is dead to the optimizer and LTO may elide it. */
+    memory_wipe(self->state_key, sizeof(self->state_key));
 
     self->state_key_size = 0;
 
