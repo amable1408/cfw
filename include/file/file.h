@@ -1,6 +1,6 @@
 /*
  * file.h - Canonical file I/O interface for reading, writing, and managing files
- * @version 0.7.1
+ * @version 0.8.0
  *
  * Features:
  *   - Cross-platform support (Linux, Windows)
@@ -21,8 +21,11 @@
  *     ERROR_NOT_SAME_DEVICE explicitly rather than silently falling back to a copy), and
  *     file_set_modified_* (pairs with the file_modified_* getter)
  *   - Win32 spelling predicates, pure byte rules compiled on every OS: file_name_reserved_windows
- *     (a component that names a device) and file_path_aliased_windows (a relative path that
- *     carries a second spelling of some other name)
+ *     (a component that names a device), file_path_aliased_windows (a relative path that
+ *     carries a second spelling of some other name) and file_path_trimmed_windows (a path Win32
+ *     would trim onto a different entry)
+ *   - Path splitting by pointer: file_basename and file_extension, separating on the host
+ *     platform's own separators ('/' on Linux, '/' and '\\' on Windows)
  *   - Opening a path chosen by someone else: file_open_nofollow_try_* (read-only; refuses a
  *     final-component link, a directory, a FIFO / socket / device - a Windows device or UNC
  *     path by its spelling, before any open), file_final_path_*
@@ -33,7 +36,7 @@
  *   @code
  *   File *file = file_open_try_1("data.txt", "r");
  *
- *   if (file != nullptr) {
+ *   if (!memory_empty((void*) file)) {
  *       char *const contents = file_read_all_1(file);
  *
  *       file_close(&file);
@@ -51,6 +54,17 @@
  *     file_set_modified_* all check it. A SIXTH by-path mutator added later must check it too.
  *     The refusal carries FILE_ARGUMENT_UNADDRESSABLE_PATH in its code field: ask
  *     file_result_is_unaddressable rather than comparing categories.
+ *   - THE SAME REFUSAL FOR A TRIMMED NAME, encoding aside: Win32 path normalisation strips a
+ *     trailing '.' or ' ' from every component, so "report." would remove "report" and
+ *     "sub./a.txt" would act on "sub/a.txt" - a different entry, when both exist side by side
+ *     (a WSL, network-share or "\\?\" create makes such pairs). A path any of whose components
+ *     ends in '.' or ' ' (other than "." and "..") is refused by the same five families with the
+ *     same ARGUMENT / FILE_ARGUMENT_UNADDRESSABLE_PATH answer, pure-ASCII or not. A path that
+ *     already carries the "\\?\" prefix is exempt - Win32 does not trim it, so it addresses the
+ *     literal name and is the one spelling that can reach "report." at all. ("\\.\" and "//?/"
+ *     are normalised and are not exempt.) The rule is the trailing-dot clause of
+ *     file_path_aliased_windows and the one trash_send_* applies, so the three agree; a caller
+ *     asks it directly, before any call, through file_path_trimmed_windows.
  *   - The check converts a non-ASCII path to UTF-16 twice, into ONE memory_try_alloc block.
  *     When THAT allocation fails the call reports RESULT_CATEGORY_MEMORY, never the unaddressable
  *     refusal: nothing is known about the path yet, so a caller must not route it to the trash
@@ -74,16 +88,23 @@
  *     refused, but "exists? no -> file_open_1(path, "wb")" is precisely the destructive path.
  *     They are left for the W-API port rather than half-guarded here, because unlike the family
  *     above the openers hand back a live handle whose later writes this module no longer sees.
- *   - trash_send_* (see trash.h) converts to UTF-16 and has none of this, so a path purgo can
- *     send to the recycle bin is not necessarily one file_remove_1 can delete - the trash path
- *     is the one that keeps working for such names. Linux is unaffected: paths are bytes there,
+ *   - trash_send_* (see trash.h) converts to UTF-16 and has none of the code-page half, so a
+ *     path purgo can send to the recycle bin is not necessarily one file_remove_1 can delete -
+ *     the trash path is the one that keeps working for such names. It refuses a TRIMMED name
+ *     just as this module does (TRASH_ARGUMENT_TRIMMED_NAME), so for that half neither path
+ *     works without the "\\?\" prefix. Linux is unaffected: paths are bytes there,
  *     and the check compiles out.
  *   - THE FIRST WIDE OPENERS: file_open_nofollow_try_* and file_final_path_1/2/3 convert the
  *     UTF-8 path to UTF-16 with MB_ERR_INVALID_CHARS and call CreateFile2, so they are NOT
  *     subject to the rule above - there is no code-page reading to disagree with. Invalid UTF-8
  *     is refused (ERROR_NO_UNICODE_TRANSLATION), and a non-ASCII name file_open_try_1 cannot
  *     reach on cp1252 opens through them. No `\\?\` prefix is added, so Win32 normalization
- *     (trailing-dot strip, '/' -> '\\') stays in force and the spelling predicates still apply.
+ *     (trailing-dot strip, '/' -> '\\') stays in force and the spelling predicates still apply -
+ *     which is why they refuse a TRIMMED name too, by value (nullptr / false with
+ *     ERROR_INVALID_NAME, before any open): a read-only open of "report." would otherwise hand
+ *     back a handle on "report", and a final path of it would answer for "report". The same
+ *     rule and exemptions as the by-path family above; a "\\?\" path is still exempt for
+ *     file_final_path_*, and file_open_nofollow_try_* refuses every "\\?\" spelling anyway.
  *
  * Error Handling:
  *   - file_open_1/2/3 abort (through error_check_null) when the path cannot be
@@ -106,6 +127,26 @@
  *     checked build - the process ends first. RESULT_CATEGORY_MEMORY therefore covers the
  *     sites that can genuinely report it, and is unreachable at the rest. Converting these to
  *     a try-form allocator is tracked work, not a thing this header can promise today.
+ *   - AN EMBEDDED NUL IS REFUSED, never truncated at: a Str/String is sized, so it can carry a
+ *     NUL byte inside its size, and the _1 form every _2/_3 wrapper forwards to reads only up to
+ *     the first one - file_remove_2("victim\0x") would remove "victim", a file the caller never
+ *     named, and report success. Every _2/_3 wrapper checks the whole Str first, with no
+ *     exception: file_copy_*, file_replace_*, file_remove_*, file_rename_* (either path) and
+ *     file_set_modified_* answer RESULT_CATEGORY_ARGUMENT with FILE_ARGUMENT_EMBEDDED_NUL, and
+ *     file_exists_*, file_size_* and file_modified_* answer false; nothing is touched. The
+ *     openers return a File*, not a Result, so they refuse it by value: file_open_try_2/3 and
+ *     file_open_wait_2/3 answer nullptr with EINVAL (and ERROR_INVALID_NAME on Windows) and open
+ *     nothing - in a write mode, create or truncate nothing - and file_open_2/3 refuse it the same
+ *     way and then end a checked process on it, as they do on any path that cannot be opened. The
+ *     wide openers (file_open_nofollow_try_2/3, file_final_path_2/3) refuse it with the same codes.
+ *   - A SIZED PATH OPENS EXACTLY ITS SIZE: file_open_2/3, file_open_try_2/3 and
+ *     file_open_wait_2/3 hand fopen a terminated copy of the Str's named bytes (char_new_3, as
+ *     file_exists_2 does), never the Str's own buffer - so a VIEW of "victim.bak" sized 6 opens,
+ *     and in a write mode creates or truncates, "victim", and "victim.bak" is not touched. The
+ *     copy is a working buffer, so its allocation failing aborts (the exception above); without
+ *     ERROR_CHECK_ENABLED the opener answers nullptr with ENOMEM (and ERROR_NOT_ENOUGH_MEMORY on
+ *     Windows) and opens nothing. The copy is freed before return with the open's errno /
+ *     GetLastError preserved.
  *   - file_open_nofollow_try_*, file_final_path_*, file_get_final_path and file_get_modified
  *     abort only on a nullptr CONTRACT pointer; the path is data, so every other outcome is a
  *     by-value refusal (nullptr / false) and nothing is allocated on any path. The opener leaves
@@ -137,8 +178,9 @@
  *
  * Dependencies:
  *   - container/string (Str, String), result.h (Result)
- *   - sys/stat.h, unistd.h, utime.h, fcntl.h, limits.h (Linux) or platform/windows/windows.h,
- *     io.h, fcntl.h (Windows)
+ *   - file.c's own, not exported by this header: sys/stat.h, unistd.h, utime.h, fcntl.h,
+ *     limits.h (Linux) or platform/windows/windows.h, io.h, fcntl.h (Windows). A caller that
+ *     needs one of them includes it itself.
  *   - Linux REQUIRES -D_GNU_SOURCE (or _POSIX_C_SOURCE >= 200809L) under a strict -std=cNN:
  *     fileno, fdopen, O_NOFOLLOW, O_CLOEXEC, realpath and readlink are POSIX, not ISO C.
  *
@@ -150,15 +192,7 @@
 /*==============================================================================
  * MARK: - Includes
  *============================================================================*/
-#ifdef __linux__
-#include <sys/stat.h>
-#include <unistd.h>
-#elif defined(_WIN32)
-// The shim comes first by contract, ahead of alphabetical order: everything
-// else here is an extras-after header (see platform/windows/windows.h).
-#include <platform/windows/windows.h>
-#include <io.h>
-#endif
+#include <container/str/str.h>
 #include <container/string/string.h>
 #include <result.h>
 
@@ -241,9 +275,10 @@ typedef enum FileArgument : U32 {
      * category guard every OS-code predicate below carries: a memsec round found the plain
      * 1/2/3 values collided with ENOENT/ERROR_FILE_NOT_FOUND/ERROR_PATH_NOT_FOUND, and
      * file_result_is_not_found answered true for this module's OWN refusal. */
-    FILE_ARGUMENT_UNADDRESSABLE_PATH = 0x8001, /**< Windows: the UTF-8 and code-page readings of the path differ (Character Encoding above). */
+    FILE_ARGUMENT_UNADDRESSABLE_PATH = 0x8001, /**< Windows: the UTF-8 and code-page readings of the path differ, or a component ends in '.' or ' ' (Character Encoding above). */
     FILE_ARGUMENT_NOT_REGULAR        = 0x8002, /**< The source opened but is not a regular file - a directory, on Linux. */
-    FILE_ARGUMENT_EMPTY_PATH         = 0x8003  /**< A zero-length Str/String path handed to a _2/_3 wrapper. */
+    FILE_ARGUMENT_EMPTY_PATH         = 0x8003, /**< A zero-length Str/String path handed to a _2/_3 wrapper. */
+    FILE_ARGUMENT_EMBEDDED_NUL       = 0x8004  /**< A Str/String path carrying a NUL byte inside its size, handed to a _2/_3 wrapper (Error Handling). */
 } FileArgument;
 
 /*==============================================================================
@@ -289,11 +324,18 @@ void file_at(File *const self, USize const index, File_Position const position);
 
 /**
  * @brief Get the final path component (basename) of a path, by pointer (char*).
- * @param path Null-terminated path, '/' or '\\' separated. Must not be nullptr.
+ *
+ * PLATFORM RULE - the separators are the host OS's own. Windows: both '/' and '\\' separate,
+ * since Win32 opens either. Linux / POSIX: '/' ONLY - '\\' is a legal filename byte there, so
+ * "a\\b" is ONE name and its basename is "a\\b" (on Windows it is "b"), and "dir/x\\b" answers
+ * "x\\b". A caller handling a Windows-spelled path on Linux converts its separators first.
+ *
+ * @param path Null-terminated path. Must not be nullptr.
  * @return Read-only pointer into `path` just past the last separator (the whole string
- *         when there is none). Do not free; valid only while `path` lives.
+ *         when there is none; empty when the path ends in one). Do not free; valid only while
+ *         `path` lives.
  */
-char* file_basename_1(char const *const path);
+char* file_basename(char const *const path);
 
 /**
  * @brief Close a file and set pointer to nullptr.
@@ -325,7 +367,10 @@ void file_close(File **const self);
  *         failure: a missing or unreadable source, a source that is not a regular file
  *         (RESULT_CATEGORY_ARGUMENT with FILE_ARGUMENT_NOT_REGULAR on Linux; on Windows fopen
  *         refuses a directory itself, so it arrives as the OS's open failure), an existing
- *         destination (file_result_is_exists), or an I/O failure partway through.
+ *         destination (file_result_is_exists), or an I/O failure partway through. On Windows
+ *         either path refused as unaddressable - a code-page mismatch, or a component ending
+ *         in '.' or ' ' outside a "\\?\" path - answers file_result_is_unaddressable before
+ *         anything is opened (Character Encoding).
  */
 Result file_copy_1(char const *const source, char const *const destination);
 
@@ -394,11 +439,16 @@ bool file_exists_3(String const *const file_name);
 /**
  * @brief Get a file's extension by pointer — the text after the last '.' of the final
  *        path component (char*). A leading dot (e.g. ".gitignore") is not an extension.
+ *
+ * The final component is file_basename's, so the same PLATFORM RULE applies: Windows splits on
+ * '/' and '\\', Linux / POSIX on '/' only. "a.b\\c" is one name on Linux, whose extension is
+ * "b\\c"; on Windows its final component is "c", which has none.
+ *
  * @param path Null-terminated path. Must not be nullptr.
  * @return Read-only pointer into `path` just past the basename's last '.', or an empty
  *         string when there is none. Do not free; valid only while `path` lives.
  */
-char* file_extension_1(char const *const path);
+char* file_extension(char const *const path);
 
 /**
  * @brief The canonical absolute path of what a path resolves to, every symlink, junction and
@@ -421,7 +471,9 @@ char* file_extension_1(char const *const path);
  * @param buffer   Receives the null-terminated final path. Must not be nullptr.
  * @param capacity Bytes in @p buffer. 0 is a legal value and answers false.
  * @return true and @p buffer filled; false when the path cannot be resolved, is not valid UTF-8
- *         or exceeds FILE_PATH_WIDE_MAX (Windows), or the final path does not fit @p capacity -
+ *         or exceeds FILE_PATH_WIDE_MAX (Windows), has a component ending in '.' or ' ' outside a
+ *         "\\?\" path (Windows, ERROR_INVALID_NAME - it would resolve the trimmed twin), or the
+ *         final path does not fit @p capacity -
  *         @p buffer is then EMPTY (when @p capacity > 0), never truncated: a truncated path can
  *         compare equal to a prefix it is not.
  */
@@ -560,7 +612,7 @@ bool file_modified_3(String const *const file_name, I64 *const out);
  * A later Str / String twin, once a caller needs one, takes `_2` / `_3` and this keeps the bare
  * name.
  *
- * @param name      One component, not a path - pass a base name (file_basename_1). Need not
+ * @param name      One component, not a path - pass a base name (file_basename). Need not
  *                  be null-terminated. Must not be nullptr.
  * @param name_size Bytes in @p name. 0 is a legal value and answers false.
  * @return true when Win32 would open a device for this component.
@@ -581,25 +633,29 @@ File* file_open_1(char const *const file_name, char const *const file_mode);
 
 /**
  * @brief Open a file (Str).
- * @param file_name File name as Str*.
+ * @param file_name File name as Str*; exactly its size is opened. An empty one, or one carrying
+ *                  an embedded NUL byte, is refused before any open (file_open_try_2) - a
+ *                  failure like any other, so it ends a checked process.
  * @param file_mode File mode string.
  * @return Pointer to the opened file. Does NOT return on failure: the result is
  *         run through error_check_null, which under ERROR_CHECK_ENABLED ends the
  *         process. Use file_open_try_2 when a missing or unreadable path is an
  *         outcome to handle rather than a bug - testing this function's result
- *         against null is dead code.
+ *         against null is dead code. Without ERROR_CHECK_ENABLED a failure returns
+ *         nullptr, and a refused path has still opened, created and truncated nothing.
  */
 File* file_open_2(Str const *const file_name, char const *const file_mode);
 
 /**
  * @brief Open a file (String).
- * @param file_name File name as String*.
+ * @param file_name File name as String*; exactly its size is opened. Empty and embedded-NUL
+ *                  paths are refused as in file_open_2.
  * @param file_mode File mode string.
  * @return Pointer to the opened file. Does NOT return on failure: the result is
  *         run through error_check_null, which under ERROR_CHECK_ENABLED ends the
  *         process. Use file_open_try_3 when a missing or unreadable path is an
  *         outcome to handle rather than a bug - testing this function's result
- *         against null is dead code.
+ *         against null is dead code. Without ERROR_CHECK_ENABLED, as file_open_2.
  */
 File* file_open_3(String const *const file_name, char const *const file_mode);
 
@@ -637,7 +693,7 @@ File* file_open_3(String const *const file_name, char const *const file_mode);
  * Intermediate components are followed like any open; a caller that must refuse a linked
  * ANCESTOR compares file_get_final_path against the path it meant.
  *
- * Three refusals happen before any open:
+ * Four refusals happen before any open:
  *   - a UNC path (two leading separators, any mix of \ and /: it would connect to the named host
  *     over SMB / NTLM, or to a local named pipe through the loopback; open network-share files
  *     with file_open_try_*), which also covers the device namespaces \\.\ and \\?\ (and the
@@ -658,6 +714,8 @@ File* file_open_3(String const *const file_name, char const *const file_mode);
  *   - a path that does not fit FILE_PATH_WIDE_MAX UTF-16 units (Windows,
  *     ERROR_FILENAME_EXCED_RANGE) or PATH_MAX bytes (Linux, ENAMETOOLONG).
  *   - invalid UTF-8 (Windows, ERROR_NO_UNICODE_TRANSLATION).
+ *   - a component ending in '.' or ' ' (Windows, ERROR_INVALID_NAME): Win32 would trim it and
+ *     open a DIFFERENT file - "report." opens "report" (Character Encoding).
  * Two can happen after it, on Windows only, when the CRT cannot wrap the verified handle in a
  * stream - both answer ERROR_TOO_MANY_OPEN_FILES: the descriptor table is full
  * (_open_osfhandle), or the CRT's stream table is (_fdopen; 512 streams by default, see
@@ -730,7 +788,11 @@ File* file_open_try_1(char const *const file_name, char const *const file_mode);
  * Carries file_open_try_1's contract: the OS error state from a failed open is
  * preserved for the caller to classify.
  *
- * @param file_name File name as Str*.
+ * @param file_name File name as Str*; exactly its size is opened, through a terminated copy, so a
+ *                  VIEW over a longer buffer names only its own bytes. Empty answers nullptr with
+ *                  no syscall (the OS error state is not touched); one carrying an embedded NUL
+ *                  byte answers nullptr with EINVAL / ERROR_INVALID_NAME and no open, since
+ *                  fopen would otherwise open - or create - the shorter name in front of it.
  * @param file_mode File mode string.
  * @return Pointer to the opened file, or nullptr when it could not be opened.
  */
@@ -742,7 +804,8 @@ File* file_open_try_2(Str const *const file_name, char const *const file_mode);
  * Carries file_open_try_1's contract: the OS error state from a failed open is
  * preserved for the caller to classify.
  *
- * @param file_name File name as String*.
+ * @param file_name File name as String*; exactly its size is opened, as in file_open_try_2.
+ *                  Empty and embedded-NUL paths answer as in file_open_try_2.
  * @param file_mode File mode string.
  * @return Pointer to the opened file, or nullptr when it could not be opened.
  */
@@ -764,7 +827,9 @@ File* file_open_wait_1(char const *const file_name, char const *const file_mode,
  * @brief Open a file, retrying while it is unavailable (Str).
  *        The retry is BOUNDED at FILE_OPEN_WAIT_ATTEMPTS_MAX attempts, not
  *        indefinite - after the last one it gives up and returns nullptr.
- * @param file_name File name as Str*.
+ * @param file_name File name as Str*; exactly its size is opened, as in file_open_try_2.
+ *                  Empty and embedded-NUL paths answer as in file_open_try_2, at once - no attempt is made and no
+ *                  wait taken.
  * @param file_mode File mode string.
  * @param ms        Milliseconds to wait between attempts (at most
  *                  FILE_OPEN_WAIT_ATTEMPTS_MAX - 1 waits in total).
@@ -776,7 +841,8 @@ File* file_open_wait_2(Str const *const file_name, char const *const file_mode, 
  * @brief Open a file, retrying while it is unavailable (String).
  *        The retry is BOUNDED at FILE_OPEN_WAIT_ATTEMPTS_MAX attempts, not
  *        indefinite - after the last one it gives up and returns nullptr.
- * @param file_name File name as String*.
+ * @param file_name File name as String*; exactly its size is opened, as in file_open_try_2.
+ *                  Empty and embedded-NUL paths answer as in file_open_wait_2.
  * @param file_mode File mode string.
  * @param ms        Milliseconds to wait between attempts (at most
  *                  FILE_OPEN_WAIT_ATTEMPTS_MAX - 1 waits in total).
@@ -822,6 +888,33 @@ File* file_open_wait_3(String const *const file_name, char const *const file_mod
  * @return true when the path carries one of the shapes above.
  */
 bool file_path_aliased_windows(char const *const path, USize const path_size);
+
+/**
+ * @brief Whether Win32 would TRIM some component of this path before acting on it - so the call
+ *        would address a DIFFERENT entry than the one spelled.
+ *
+ * Win32 path normalisation strips a trailing '.' or ' ' from every component of a path that does
+ * not carry the "\\?\" prefix: "report." names "report", "sub./a.txt" names "sub/a.txt". When both
+ * entries exist side by side (a WSL, network-share or "\\?\" create makes such pairs), a remove,
+ * rename or open of the spelled name acts on its trimmed twin instead. Ask this first and REFUSE
+ * such a name rather than hand it to a Win32 call.
+ *
+ * Answers what Win32 would do to this spelling, so it is a pure byte rule compiled on EVERY OS: a
+ * Linux build of a tool that may run on Windows, or that writes names a Windows peer will read,
+ * asks it too. Both '/' and '\\' separate components here, as they do for Win32, on every OS.
+ *
+ * The rule, the one this module's by-path family, its wide openers and trash_send_* all refuse on
+ * (Character Encoding): true when any component, intermediate ones included, ends in '.' or ' ',
+ * other than the real components "." and ".."; always false for a path beginning with the "\\?\"
+ * prefix, which Win32 does not normalise ("\\.\" and "//?/" ARE normalised, and are not exempt).
+ * Narrower than file_path_aliased_windows's trailing-dot clause, which also answers true for "."
+ * and "..": a caller resolving dot segments itself asks this one.
+ *
+ * @param path Null-terminated path. Must not be nullptr (a programmer error, checked by
+ *             error_check_null).
+ * @return true when some component would be trimmed onto another name.
+ */
+bool file_path_trimmed_windows(char const *const path);
 
 /**
  * @brief Read from file into buffer.
@@ -929,6 +1022,19 @@ String file_read_all_3(File *const self);
 char* file_read_to_char(char const *const file_name);
 
 /**
+ * @brief Read a whole file by path, retrying briefly while unavailable (char*).
+ *
+ * A path that NEVER APPEARS and a file that is present but EMPTY both yield an
+ * empty result rather than ending the process.
+ *
+ * @param file_name Path to read.
+ * @param ms        Milliseconds to sleep between attempts.
+ * @return An owned, NUL-terminated buffer the caller frees with memory_free -
+ *         never null, and empty when the file never became readable.
+ */
+char* file_read_to_char_wait(char const *const file_name, U32 const ms);
+
+/**
  * @brief Read a whole file by path (Str).
  *
  * A MISSING file and an EMPTY file both yield an empty result rather than ending
@@ -946,6 +1052,18 @@ char* file_read_to_char(char const *const file_name);
 Str file_read_to_str(char const *const file_name);
 
 /**
+ * @brief Read a whole file by path, retrying briefly while unavailable (Str).
+ *
+ * A path that NEVER APPEARS and a file that is present but EMPTY both yield an
+ * empty result rather than ending the process.
+ *
+ * @param file_name Path to read.
+ * @param ms        Milliseconds to sleep between attempts.
+ * @return The file's contents as a Str owning its buffer, or an empty Str.
+ */
+Str file_read_to_str_wait(char const *const file_name, U32 const ms);
+
+/**
  * @brief Read a whole file by path (String).
  *
  * A MISSING file and an EMPTY file both yield an empty result rather than ending
@@ -961,31 +1079,6 @@ Str file_read_to_str(char const *const file_name);
  *         or an empty String when the file is missing or empty.
  */
 String file_read_to_string(char const *const file_name);
-
-/**
- * @brief Read a whole file by path, retrying briefly while unavailable (char*).
- *
- * A path that NEVER APPEARS and a file that is present but EMPTY both yield an
- * empty result rather than ending the process.
- *
- * @param file_name Path to read.
- * @param ms        Milliseconds to sleep between attempts.
- * @return An owned, NUL-terminated buffer the caller frees with memory_free -
- *         never null, and empty when the file never became readable.
- */
-char* file_read_to_char_wait(char const *const file_name, U32 const ms);
-
-/**
- * @brief Read a whole file by path, retrying briefly while unavailable (Str).
- *
- * A path that NEVER APPEARS and a file that is present but EMPTY both yield an
- * empty result rather than ending the process.
- *
- * @param file_name Path to read.
- * @param ms        Milliseconds to sleep between attempts.
- * @return The file's contents as a Str owning its buffer, or an empty Str.
- */
-Str file_read_to_str_wait(char const *const file_name, U32 const ms);
 
 /**
  * @brief Read a whole file by path, retrying briefly while unavailable (String).
@@ -1020,6 +1113,9 @@ bool file_regular(File *const self);
  * @return RESULT_SUCCESS on success; otherwise a Result classifying the failure
  *         (missing path, a directory, or permission), captured immediately via
  *         result_from_os() after the failing call.
+ * @note Windows: a path with a component ending in '.' or ' ' (not "." / "..", not under
+ *       "\\?\") is REFUSED with file_result_is_unaddressable and nothing is deleted - Win32
+ *       would trim "report." to "report" and delete THAT file (Character Encoding).
  */
 Result file_remove_1(char const *const path);
 
@@ -1059,6 +1155,10 @@ Result file_remove_3(String const *const path);
  *                 filesystem; a different filesystem fails with EXDEV/ERROR_NOT_SAME_DEVICE
  *                 as above).
  * @return RESULT_SUCCESS on success; otherwise a Result classifying the failure.
+ * @note Windows: BOTH ends are checked - a component ending in '.' or ' ' (not "." / "..",
+ *       not under "\\?\") in either path is REFUSED with file_result_is_unaddressable and
+ *       nothing moves, since Win32 would trim it and move or REPLACE a different entry
+ *       (Character Encoding).
  */
 Result file_rename_1(char const *const source, char const *const destination);
 
@@ -1128,6 +1228,11 @@ Result file_rename_3(String const *const source, String const *const destination
  *         any failure before the rename step. If every candidate temp name beside the
  *         destination is taken (64 of them, each stepping past a stale temp from a killed run),
  *         the answer is the STATE/EEXIST spelling file_result_is_exists recognises.
+ * @note Windows: a destination with a component ending in '.' or ' ' (not "." / "..", not
+ *       under "\\?\") is refused with file_result_is_unaddressable before the destination
+ *       changes - any temp already written beside it is removed, and the entry its trimmed
+ *       spelling names is left untouched; a source so spelled is refused before anything is
+ *       written.
  */
 Result file_replace_1(char const *const source, char const *const destination);
 
@@ -1181,7 +1286,10 @@ bool file_result_is_exists(Result const result);
  * @return true for the platform's own not-found code. Never true for this family's own
  *         RESULT_CATEGORY_ARGUMENT refusals (see file_result_is_unaddressable for those) -
  *         FILE_ARGUMENT_NOT_REGULAR / _EMPTY_PATH are NOT the OS's own not-found answer,
- *         even though nothing stopped an early caller from reading them that way.
+ *         even though nothing stopped an early caller from reading them that way. Never true
+ *         for RESULT_CATEGORY_STATE either, whatever its code: no module produces a STATE
+ *         not-found (this one's STATE is the EEXIST refusal, trash's STATE codes are refusals
+ *         about the trash itself), so a STATE is never "the path is not there".
  */
 bool file_result_is_not_found(Result const result);
 
@@ -1190,7 +1298,9 @@ bool file_result_is_not_found(Result const result);
  *
  * The Windows fail-closed refusal from the Character Encoding block, and the one ARGUMENT
  * refusal with a remedy the caller can offer: the trash path (trash_send_*) converts to
- * UTF-16 and still handles such a name.
+ * UTF-16 and still handles a code-page-mismatched name. The remedy does NOT cover a TRIMMED
+ * name (a component ending in '.' or ' '): trash refuses that too, with
+ * TRASH_ARGUMENT_TRIMMED_NAME, and only a "\\?\" spelling reaches it.
  *
  * @param result A Result returned by this family.
  * @return true for RESULT_CATEGORY_ARGUMENT with FILE_ARGUMENT_UNADDRESSABLE_PATH; never on
@@ -1228,6 +1338,9 @@ bool file_seek_try(File *const self, USize const index, File_Position const posi
  *         distinguish "the path is gone" from "the filesystem has no sub-second attribute
  *         support" cannot say anything useful about a failed --preserve, and porto's only
  *         caller was discarding the answer precisely because the answer said nothing.
+ * @note Windows: a path with a component ending in '.' or ' ' (not "." / "..", not under
+ *       "\\?\") is refused with file_result_is_unaddressable, never stamped onto the entry
+ *       its trimmed spelling names (Character Encoding).
  */
 Result file_set_modified_1(char const *const path, I64 const seconds);
 

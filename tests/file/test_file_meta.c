@@ -1,22 +1,35 @@
-#include <test/test.h>
-
 #include <char/char.h>
 #include <container/str/str.h>
 #include <container/string/string.h>
 #include <file/file.h>
+#include <test/test.h>
 
 /* Coverage for the by-path metadata primitives file_size_1/2/3 and file_modified_1/2/3,
  * including the empty-Str/String guard in the _2/_3 converters, which answer false for an
  * empty path by choice (char_new_3 yields "" for a zero-length copy, so this is a
  * value-dependent refusal, not an abort avoided). */
 
+/*==============================================================================
+ * MARK: - Typedefs
+ *============================================================================*/
+/* One spelling and the answer a Win32 predicate must give for it. The label names rows whose
+ * spelling carries non-printable bytes. */
+typedef struct {
+    char const  *label;
+    char const  *spelling;
+    bool        expected;
+} WindowsSpellingCase;
+
+/*==============================================================================
+ * MARK: - Test Cases
+ *============================================================================*/
 static void _test_metadata(Test *const test) {
     test_case_begin(test, "file_size / file_modified via char* / Str / String");
 
-    char path[] = "file_meta_test.tmp";
+    char const path[] = "file_meta_test.tmp";
     FILE *const handle = fopen(path, "wb");
 
-    test_expect_true(test, "temp opened", handle != nullptr);
+    test_expect_true(test, "temp opened", !memory_empty((void*) handle));
 
     fwrite("hello", 1, 5, handle);
     fclose(handle);
@@ -29,7 +42,7 @@ static void _test_metadata(Test *const test) {
     test_expect_true(test, "modified_1 ok", file_modified_1(path, &mtime));
     test_expect_true(test, "modified_1 > 0", mtime > 0);
 
-    Str const path_str = str_init_2(path);
+    Str const path_str = str_init_2((char *) path);
     USize size_str     = 0;
     I64 mtime_str      = 0;
 
@@ -37,7 +50,7 @@ static void _test_metadata(Test *const test) {
     test_expect_u(test, "size_2 == 5", 5, size_str);
     test_expect_true(test, "modified_2 ok", file_modified_2(&path_str, &mtime_str));
 
-    String const path_string = string_init_3(path);
+    String const path_string = string_init_3((char *) path);
     USize size_string        = 0;
     I64 mtime_string         = 0;
 
@@ -70,27 +83,54 @@ static void _test_empty_path_guard(Test *const test) {
     test_case_end(test);
 }
 
-static void _test_extension(Test *const test) {
-    test_case_begin(test, "file_extension_1");
+static void _test_basename(Test *const test) {
+    test_case_begin(test, "file_basename: the host platform's separators");
 
-    test_expect_true(test, "simple extension", char_equal_1(file_extension_1("file.txt"), "txt"));
-    test_expect_true(test, "double extension takes last", char_equal_1(file_extension_1("archive.tar.gz"), "gz"));
-    test_expect_true(test, "extension within a path", char_equal_1(file_extension_1("a/b/main.c"), "c"));
-    test_expect_true(test, "no extension", char_equal_1(file_extension_1("README"), ""));
-    test_expect_true(test, "leading dot is not an extension", char_equal_1(file_extension_1(".gitignore"), ""));
-    test_expect_true(test, "leading dot in a path component", char_equal_1(file_extension_1("dir/.hidden"), ""));
-    test_expect_true(test, "dotfile with a real extension", char_equal_1(file_extension_1("dir/.config.json"), "json"));
+    test_expect_true(test, "final component of a '/' path", char_equal_1(file_basename("a/b/c.txt"), "c.txt"));
+    test_expect_true(test, "no separator: the whole string", char_equal_1(file_basename("name"), "name"));
+    test_expect_true(test, "trailing separator: empty", char_equal_1(file_basename("dir/"), ""));
+    test_expect_true(test, "absolute '/' path", char_equal_1(file_basename("/x"), "x"));
+
+#ifdef __linux__
+    // POSIX: '\\' is a filename byte, never a separator.
+    test_expect_true(test, "Linux: dir/x\\b -> x\\b (one name)", char_equal_1(file_basename("dir/x\\b"), "x\\b"));
+    test_expect_true(test, "Linux: a\\b is one name", char_equal_1(file_basename("a\\b"), "a\\b"));
+#endif // __linux__
+
+#ifdef _WIN32
+    // Win32 opens either separator, so both split.
+    test_expect_true(test, "Windows: dir/x\\b -> b", char_equal_1(file_basename("dir/x\\b"), "b"));
+    test_expect_true(test, "Windows: a\\b -> b", char_equal_1(file_basename("a\\b"), "b"));
+    test_expect_true(test, "Windows: C:\\dir\\f.txt -> f.txt", char_equal_1(file_basename("C:\\dir\\f.txt"), "f.txt"));
+#endif // _WIN32
 
     test_case_end(test);
 }
 
-/* One spelling and the answer a Win32 predicate must give for it. The label names rows whose
- * spelling carries non-printable bytes. */
-typedef struct {
-    char const  *label;
-    char const  *spelling;
-    bool        expected;
-} WindowsSpellingCase;
+static void _test_extension(Test *const test) {
+    test_case_begin(test, "file_extension");
+
+    test_expect_true(test, "simple extension", char_equal_1(file_extension("file.txt"), "txt"));
+    test_expect_true(test, "double extension takes last", char_equal_1(file_extension("archive.tar.gz"), "gz"));
+    test_expect_true(test, "extension within a path", char_equal_1(file_extension("a/b/main.c"), "c"));
+    test_expect_true(test, "no extension", char_equal_1(file_extension("README"), ""));
+    test_expect_true(test, "leading dot is not an extension", char_equal_1(file_extension(".gitignore"), ""));
+    test_expect_true(test, "leading dot in a path component", char_equal_1(file_extension("dir/.hidden"), ""));
+    test_expect_true(test, "dotfile with a real extension", char_equal_1(file_extension("dir/.config.json"), "json"));
+
+#ifdef __linux__
+    // One name on POSIX, so its last '.' is the one before the backslash.
+    test_expect_true(test, "Linux: a.b\\c -> b\\c", char_equal_1(file_extension("a.b\\c"), "b\\c"));
+#endif // __linux__
+
+#ifdef _WIN32
+    // The final component is "c": no extension, and the directory's dot does not leak through.
+    test_expect_true(test, "Windows: a.b\\c -> none", char_equal_1(file_extension("a.b\\c"), ""));
+    test_expect_true(test, "Windows: dir.x\\file.txt -> txt", char_equal_1(file_extension("dir.x\\file.txt"), "txt"));
+#endif // _WIN32
+
+    test_case_end(test);
+}
 
 /* Pure byte rules, so every row runs on every OS - no device is ever opened. */
 static void _test_windows_names(Test *const test) {
@@ -186,6 +226,46 @@ static void _test_windows_names(Test *const test) {
     test_case_end(test);
 }
 
+/* Pure string logic with Windows semantics, so every row runs on every OS: both separators split
+ * here, and the "\\?\" prefix exempts, on Linux too. */
+static void _test_path_trimmed_windows(Test *const test) {
+    test_case_begin(test, "file_path_trimmed_windows");
+
+    static WindowsSpellingCase const rows[] = {
+        { "report. (trailing dot)", "report.", true },
+        { "report  (trailing space)", "report ", true },
+        { "sub./a.txt (intermediate dot)", "sub./a.txt", true },
+        { "sub /a.txt (intermediate space)", "sub /a.txt", true },
+        { "sub\\x./a (backslash separates on every OS)", "sub\\x./a", true },
+        { "a\\b. (backslash-separated last component)", "a\\b.", true },
+        { "... (three dots is a name, not a dot segment)", "...", true },
+        { "a/b. (last component)", "a/b.", true },
+        { "//?/C:/report. (not the verbatim prefix: normalised)", "//?/C:/report.", true },
+        { "\\\\.\\x. (device namespace: normalised)", "\\\\.\\x.", true },
+        { "\\\\?\\C:\\report. (verbatim prefix: exempt)", "\\\\?\\C:\\report.", false },
+        { ". (dot segment)", ".", false },
+        { ".. (dot segment)", "..", false },
+        { "./a (leading dot segment)", "./a", false },
+        { "a/../b (dot segment mid-path)", "a/../b", false },
+        { "a\\..\\b (backslash dot segment)", "a\\..\\b", false },
+        { "x.y (interior dot)", "x.y", false },
+        { "normal/path.txt", "normal/path.txt", false },
+        { "a/b/ (trailing separator: empty component)", "a/b/", false },
+        { "a//b (empty component)", "a//b", false },
+        { ".gitignore (leading dot)", ".gitignore", false },
+        { "empty", "", false }
+    };
+
+    for (USize i = 0; i < sizeof(rows) / sizeof(rows[0]); i += 1) {
+        test_expect_bool(test, rows[i].label, rows[i].expected, file_path_trimmed_windows(rows[i].spelling));
+    }
+
+    test_case_end(test);
+}
+
+/*==============================================================================
+ * MARK: - Entry Point
+ *============================================================================*/
 int main(void) {
     LogConfig const log_config = {
         .level             = LOG_LEVEL_ERROR,
@@ -201,8 +281,10 @@ int main(void) {
     test_suite_begin(&test, "file_meta");
     _test_metadata(&test);
     _test_empty_path_guard(&test);
+    _test_basename(&test);
     _test_extension(&test);
     _test_windows_names(&test);
+    _test_path_trimmed_windows(&test);
     test_suite_end(&test);
 
     return test_uninit(&test);

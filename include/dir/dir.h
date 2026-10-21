@@ -1,5 +1,6 @@
 /*
  * dir.h - Directory operations for the C Libraries Framework
+ * @version 0.1.2
  *
  * Features:
  *   - Cross-platform directory operations (Linux, Windows)
@@ -38,6 +39,18 @@
  *   - A name that cannot be decoded to UTF-8 fails the operation rather than being skipped:
  *     silently omitting an entry from a recursive copy or removal would report success on an
  *     incomplete result.
+ *   - WINDOWS - A TRIMMED NAME IS REFUSED: Win32 path normalisation strips a trailing '.' or
+ *     ' ' from every component, so RemoveDirectoryW("d.") removes "d" and "d./sub" names
+ *     "d/sub" - a DIFFERENT entry when both exist side by side (a WSL, network-share or "\\?\"
+ *     create makes such pairs). A path any of whose components ends in '.' or ' ' (other than
+ *     "." and "..") is therefore REFUSED by EVERY function here - remove, remove_all, rename
+ *     (either end), copy_all (either root), create, and the queries alike - with false and
+ *     GetLastError() == ERROR_INVALID_NAME; nothing is acted on. A path that already carries
+ *     the "\\?\" prefix is exempt: Win32 does not trim it, so it addresses the literal name.
+ *     ("\\.\" and "//?/" are normalised and are not exempt.) Inside a recursive walk an entry
+ *     so named fails that entry and so the whole call, rather than being acted on under its
+ *     trimmed spelling. The same rule file.h's management family and trash_send_* apply.
+ *     Linux is unaffected: paths are bytes there.
  *
  * Error Handling:
  *   - All API functions null-check their arguments first; see the error macros.
@@ -59,6 +72,13 @@
  *     and inspect it per entry if you need detail.
  *   - The Str (_2) and String (_3) variants return false for empty paths
  *     instead of converting them.
+ *   - AN EMBEDDED NUL IS REFUSED, never truncated at: a Str/String is sized and can carry a NUL
+ *     byte inside its size, while the _1 form every _2/_3 overload forwards to reads only up to
+ *     the first one - dir_remove_all_2("important\0junk") would remove "important", a tree the
+ *     caller never named, and report success. EVERY _2/_3 overload (copy_all and rename on
+ *     either path) checks the whole Str before converting it and answers false with errno ==
+ *     EINVAL (Linux) / GetLastError() == ERROR_INVALID_NAME (Windows); nothing is acted on. Unlike
+ *     the empty-path refusal, this one DOES set the last error, so it is classifiable.
  *   - dir_remove_all refuses dangerous paths (empty, root, drive root, "." or
  *     ".." segments) and never follows symbolic links or reparse points.
  *   - Both recursive walks REFUSE below 512 levels of nesting rather than descending. Tree depth
@@ -86,7 +106,8 @@
  * String Type Support:
  *   - Every path-taking function follows the framework overload pattern:
  *     _1 takes char*, _2 takes Str, _3 takes String. The _2/_3 variants copy
- *     the path to a NUL-terminated buffer and forward to _1.
+ *     the path to a NUL-terminated buffer and forward to _1, after refusing an empty path or
+ *     one carrying an embedded NUL (Error Handling).
  *
  * Performance Characteristics:
  *   - dir_create/dir_exists/dir_remove/dir_rename/dir_set_current are single
@@ -114,6 +135,8 @@
  *   - <container/string/string.h> for the framework types and the Str/String overloads.
  *     Declared directly: it used to arrive transitively via the retired dir_list family's
  *     al_string.h, so this header depended on a type source it never named.
+ *   - dir.c's own platform headers, not exported by this header (a caller that needs one
+ *     includes it itself):
  *   - Linux: <dirent.h>, <errno.h>, <fcntl.h> (AT_SYMLINK_NOFOLLOW), <sys/stat.h>, <unistd.h>
  *   - Linux REQUIRES -D_GNU_SOURCE. The single-scan listing path uses dirfd + fstatat with
  *     AT_SYMLINK_NOFOLLOW, none of which are declared without it - the build fails outright,
@@ -131,20 +154,11 @@
 /*==============================================================================
  * MARK: - Includes
  *============================================================================*/
-#ifdef __linux__
-#include <dirent.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#elif defined(_WIN32)
-#include <platform/windows/windows.h>
-#endif
-
 /* Direct, not transitive. The framework types (USize, I64) and the Str/String overload types
  * used to arrive here only because the retired dir_list family included al_string.h; removing it
- * revealed that this header had never declared its own type dependency. string.h chains str.h,
- * so listing both would violate the no-redundant-chained-include rule. */
+ * revealed that this header had never declared its own type dependency. Both are listed because
+ * the API names both, even though string.h chains str.h. */
+#include <container/str/str.h>
 #include <container/string/string.h>
 
 /*==============================================================================
@@ -182,6 +196,9 @@ typedef struct DirEntry {
  *                  Refused when it textually equals or lies inside the source.
  * @return true when the whole tree was copied, false when refused or when any
  *         entry could not be copied.
+ * @note Windows: a root with a component ending in '.' or ' ' (not under "\\?\") is refused,
+ *       and an entry so named inside the tree fails the call - neither is read from, nor
+ *       written over, under its trimmed spelling (Character Encoding).
  */
 bool dir_copy_all_1(char const *const path, char const *const path_new);
 
@@ -309,6 +326,10 @@ char* dir_get_current(void);
  *                     and every entry name with dir_list_entries_uninit.
  * @param out_count    Receives the number of entries written (0 when empty).
  * @return true when the directory was listed, false when it could not be opened.
+ * @note Windows: a LINK whose name ends in '.' or ' ' keeps its own record (is_dir, size and
+ *       mtime as the enumeration gave them) unless the directory was named with "\\?\": resolving
+ *       it by path would let Win32 trim the name and measure a different entry (Character
+ *       Encoding).
  */
 bool dir_list_entries_1(char const *const path, DirEntry **const out_entries, USize *const out_count);
 
@@ -341,6 +362,9 @@ void dir_list_entries_uninit(DirEntry *const entries, USize const count);
  * @brief Remove an empty directory (char*).
  * @param path  Directory path to remove; fails when the directory is not empty.
  * @return true when the directory was removed, false on failure.
+ * @note Windows: a path with a component ending in '.' or ' ' (not "." / "..", not under
+ *       "\\?\") is refused - false, ERROR_INVALID_NAME, nothing removed - because Win32 would
+ *       trim "d." to "d" and remove THAT directory (Character Encoding).
  */
 bool dir_remove_1(char const *const path);
 
@@ -368,12 +392,16 @@ bool dir_remove_3(String const *const path);
  *              traversed like plain entries.
  * @return true when the whole tree was removed, false when refused or when any
  *         entry could not be removed.
+ * @note Windows: a root with a component ending in '.' or ' ' (not under "\\?\") is refused
+ *       before anything is walked, and an entry so named inside the tree is left in place and
+ *       fails the call - neither is removed under its trimmed spelling (Character Encoding).
  */
 bool dir_remove_all_1(char const *const path);
 
 /**
  * @brief Recursively remove a directory and everything inside it (Str).
- * @param path  Directory path as Str*.
+ * @param path  Directory path as Str*. A NUL byte inside its size is refused (false,
+ *              EINVAL / ERROR_INVALID_NAME) rather than truncated at (Error Handling).
  * @return true when the whole tree was removed, false otherwise.
  */
 bool dir_remove_all_2(Str const *const path);
@@ -390,6 +418,10 @@ bool dir_remove_all_3(String const *const path);
  * @param path      Existing directory path.
  * @param path_new  New directory path; must not already exist.
  * @return true when the directory was renamed, false on failure.
+ * @note Windows: BOTH paths are checked - a component ending in '.' or ' ' (not "." / "..",
+ *       not under "\\?\") in either is refused (false, ERROR_INVALID_NAME) and nothing moves,
+ *       since Win32 would trim it and move a different directory, or move onto one
+ *       (Character Encoding).
  */
 bool dir_rename_1(char const *const path, char const *const path_new);
 

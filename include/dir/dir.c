@@ -1,10 +1,33 @@
+/*==============================================================================
+ * MARK: - Includes
+ *============================================================================*/
 #include <dir/dir.h>
+
+#ifdef __linux__
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#elif defined(_WIN32)
+#include <platform/windows/windows.h>
+#endif
+
+// Named directly: the char_* helpers the forwarders and walks call reach dir.h only through str.h.
+#include <char/char.h>
 
 /*==============================================================================
  * MARK: - Macros and Constants
  *============================================================================*/
 #define _DIR_COPY_CHUNK_SIZE           65536
+// Mode a new directory is created with (before the umask).
+#define _DIR_CREATE_MODE               0755
 #define _DIR_CURRENT_CAPACITY          4096
+// Length of the ".." component.
+#define _DIR_DOT_DOT_SIZE              CHAR_STATIC_SIZE("..")
+// A bare drive root ("C:", "C:\", "C:/") is 2 or 3 bytes long.
+#define _DIR_DRIVE_ROOT_SIZE_MAX       3
+#define _DIR_DRIVE_ROOT_SIZE_MIN       2
 #define _DIR_ENTRIES_GROWTH_FACTOR     2
 #define _DIR_ENTRIES_INITIAL_CAPACITY  16
 // FILETIME ticks between 1601-01-01 and the Unix epoch, and ticks per second (100 ns each).
@@ -56,6 +79,69 @@ static void _dir_last_error_set_oom(void) {
 #elif OS_WINDOWS
     SetLastError(ERROR_NOT_ENOUGH_MEMORY);
 #endif
+}
+
+/* Whether a Str path may be copied and forwarded to a _1 form: not empty, and with no NUL inside
+ * its size. A NUL is REFUSED, not truncated at: char_new_3 copies all of the Str, but the _1 form
+ * reads only up to the first NUL, so dir_remove_all_2("important\0junk") would remove "important" -
+ * a tree the caller never named, reported as a success. Refused with the code the OS gives a name
+ * it will not address (ERROR_INVALID_NAME / EINVAL), so the header's last-error guarantee holds for
+ * it too. An empty path sets nothing: that branch stays the documented caller-argument refusal. */
+static bool _dir_str_path_usable(Str const *const path) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "path", (void*) path);
+
+    if (str_get_size(path) == 0) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    if (str_contains_2(path, "\0", 1)) {
+#ifdef __linux__
+        errno = EINVAL;
+#elif OS_WINDOWS
+        SetLastError(ERROR_INVALID_NAME);
+#endif
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    trace_log_pop();
+
+    return true;
+}
+
+// The String twin of _dir_str_path_usable, for the same reason.
+static bool _dir_string_path_usable(String const *const path) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "path", (void*) path);
+
+    if (string_get_size(path) == 0) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    if (string_contains_2(path, "\0", 1)) {
+#ifdef __linux__
+        errno = EINVAL;
+#elif OS_WINDOWS
+        SetLastError(ERROR_INVALID_NAME);
+#endif
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    trace_log_pop();
+
+    return true;
 }
 
 // Append one entry, growing the array geometrically. Returns false only when the growth
@@ -128,9 +214,9 @@ static char* _dir_utf8_from_wide(WCHAR const *const data, USize const data_size)
     }
 
     /* memory_try_alloc, not char_new_1: this is the per-entry name on every Windows walk, so it
-     * is filesystem-driven and must fail recoverably like the entry array. The +1 is the
-     * terminator char_new_1 used to add implicitly. */
-    char *const utf8 = (char*) memory_try_alloc((USize) needed + 1);
+     * is filesystem-driven and must fail recoverably like the entry array. The CHAR_END_CHARACTER
+     * slot is the terminator char_new_1 used to add implicitly. */
+    char *const utf8 = (char*) memory_try_alloc((USize) needed + CHAR_END_CHARACTER);
 
     if (memory_empty(utf8)) {
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
@@ -165,14 +251,76 @@ static char* _dir_utf8_from_wide(WCHAR const *const data, USize const data_size)
     return utf8;
 }
 
+/*
+ * Whether Win32 path normalisation would TRIM some component of this path before acting on it:
+ * a component ending in '.' or ' ' loses those characters in every W-API handed a non-"\\?\"
+ * path, so RemoveDirectoryW("d.") removes "d" and "d./sub" names "d/sub" - a DIFFERENT entry
+ * when both exist side by side (a WSL, network-share or "\\?\" create makes such pairs). Spelled
+ * identically to file.c's _file_path_trimmed_windows and trash's _trash_name_trimmed, so the
+ * three modules refuse the same set. "." and ".." are real components, not trimmed names. A
+ * "\\?\" path bypasses the normaliser, so it is passed through untouched; "\\.\" and "//?/" are
+ * normalised and are not exempt.
+ */
+static bool _dir_path_trimmed_windows(char const *const path) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "path", (void*) path);
+
+    if (path[0] == '\\' && path[1] == '\\' && path[2] == '?' && path[3] == '\\') {
+        trace_log_pop();
+
+        return false;
+    }
+
+    USize const size = char_length(path);
+    USize start      = 0;
+
+    for (USize i = 0; i <= size; i += 1) {
+        bool const boundary = i == size || path[i] == '/' || path[i] == '\\';
+
+        if (!boundary) {
+            continue;
+        }
+
+        USize const length = i - start;
+        bool const dots    = (length == 1 && path[start] == '.') || (length == 2 && path[start] == '.' && path[start + 1] == '.');
+
+        if (length > 0 && !dots && (path[i - 1] == '.' || path[i - 1] == ' ')) {
+            trace_log_pop();
+
+            return true;
+        }
+
+        start = i + 1;
+    }
+
+    trace_log_pop();
+
+    return false;
+}
+
 /* Wide copy of a UTF-8 path, or nullptr when it cannot be converted. Release with memory_free.
  *
  * GUARANTEE: every nullptr return leaves a meaningful GetLastError set. That is what lets the
  * nine Win32 wrappers below simply forward a null instead of each repeating a SetLastError
  * prologue, and it is the foundation of the module's documented last-error contract - a caller
- * that gets false from dir_* can read the real OS reason. */
+ * that gets false from dir_* can read the real OS reason.
+ *
+ * THE ONE PLACE A TRIMMED NAME IS REFUSED. Every Win32 call in this module takes its path from
+ * here, so refusing a component ending in '.' or ' ' (see _dir_path_trimmed_windows) here
+ * covers remove, remove_all, rename, copy_all, create, and the queries alike: none of them can
+ * act on the entry the trimmed spelling names. Refused with ERROR_INVALID_NAME, the code the
+ * W-APIs themselves give a name they will not address. */
 static WCHAR* _dir_wide_from_utf8(char const *const path) {
     trace_log_push(LOG_METADATA);
+
+    if (_dir_path_trimmed_windows(path)) {
+        SetLastError(ERROR_INVALID_NAME);
+
+        trace_log_pop();
+
+        return nullptr;
+    }
 
     /* MB_ERR_INVALID_CHARS for the same reason as the reverse conversion: with flag 0 an
      * ill-formed UTF-8 path is silently repaired into U+FFFD rather than rejected, so the module
@@ -243,7 +391,7 @@ static bool _dir_entry_name_valid_wide(WCHAR const *const name, USize const name
     trace_log_push(LOG_METADATA);
 
     bool const dot     = name_size == 1 && name[0] == L'.';
-    bool const dot_dot = name_size == 2 && name[0] == L'.' && name[1] == L'.';
+    bool const dot_dot = name_size == _DIR_DOT_DOT_SIZE && name[0] == L'.' && name[1] == L'.';
 
     trace_log_pop();
 
@@ -558,7 +706,7 @@ static WCHAR* _dir_win_search_pattern(char const *const path) {
 
     search[wide_size]     = L'\\';
     search[wide_size + 1] = L'*';
-    search[wide_size + 2] = L'\0';
+    search[wide_size + _DIR_WILDCARD_SUFFIX_SIZE - 1] = L'\0';
 
     memory_free(wide);
 
@@ -579,7 +727,7 @@ static bool _dir_list_entries_find(WCHAR const *const search, DirEntry **const o
     DirEntry *entries = nullptr;
     USize count       = 0;
     USize capacity    = 0;
-    bool ok           = true;
+    bool success      = true;
 
     WIN32_FIND_DATAW data = DEFAULT_INITIALIZATION;
 
@@ -603,7 +751,7 @@ static bool _dir_list_entries_find(WCHAR const *const search, DirEntry **const o
         item.name = _dir_utf8_from_wide(data.cFileName, name_size);
 
         if (memory_empty(item.name)) {
-            ok = false;
+            success = false;
 
             break;
         }
@@ -625,15 +773,24 @@ static bool _dir_list_entries_find(WCHAR const *const search, DirEntry **const o
          * file on Windows and the real size on Linux, from one API that claims to follow the
          * target. Only entries that are actually links pay the extra call, which is the cost the
          * header already budgets ("plus one per link"). A broken link keeps the link's own
-         * record: the target cannot be measured, and reporting zeroes would be a worse lie. */
-        if (item.is_link) {
+         * record: the target cannot be measured, and reporting zeroes would be a worse lie.
+         *
+         * So does a link whose name ends in '.' or ' ': the follow-up is a by-path call, and
+         * Win32 would trim "x." to "x" and measure THAT entry - another file's size and mtime
+         * reported as this link's, the mis-target _dir_path_trimmed_windows refuses everywhere
+         * else. Under a "\\?\" search nothing is trimmed, so there the follow-up is exact. */
+        WCHAR const last           = data.cFileName[name_size - 1];
+        bool const long_prefixed   = search[0] == L'\\' && search[1] == L'\\' && search[2] == L'?' && search[3] == L'\\';
+        bool const trimmed_spelled = (last == L'.' || last == L' ') && !long_prefixed;
+
+        if (item.is_link && !trimmed_spelled) {
             /* Built in WIDE from the search pattern rather than by converting the UTF-8 name
              * back: `search` is already "<parent><sep>*", so dropping its trailing '*' yields the
              * parent prefix and the enumeration hands us the name as WCHAR. Round-tripping
              * through UTF-8 would add two conversions per link and a failure mode for names the
              * conversion rejects - on a path where the name is already known-good. */
             USize const prefix_size = _dir_wide_length(search) - 1;
-            WCHAR *const target_path = (WCHAR*) memory_try_alloc((prefix_size + name_size + 1) * sizeof(WCHAR));
+            WCHAR *const target_path = (WCHAR*) memory_try_alloc((prefix_size + name_size + CHAR_END_CHARACTER) * sizeof(WCHAR));
 
             if (!memory_empty(target_path)) {
                 for (USize i = 0; i < prefix_size; i += 1) {
@@ -674,7 +831,7 @@ static bool _dir_list_entries_find(WCHAR const *const search, DirEntry **const o
              * header's guaranteed list that did not honour the guarantee on Windows. */
             SetLastError(ERROR_NOT_ENOUGH_MEMORY);
 
-            ok = false;
+            success = false;
 
             break;
         }
@@ -686,7 +843,7 @@ static bool _dir_list_entries_find(WCHAR const *const search, DirEntry **const o
 
     FindClose(find);
 
-    if (!ok) {
+    if (!success) {
         dir_list_entries_uninit(entries, count);
 
         _dir_last_error_set(reason);
@@ -709,7 +866,7 @@ static bool _dir_entry_name_valid(char const *const name) {
     trace_log_push(LOG_METADATA);
 
     bool const dot     = name[0] == '.' && name[1] == '\0';
-    bool const dot_dot = name[0] == '.' && name[1] == '.' && name[2] == '\0';
+    bool const dot_dot = name[0] == '.' && name[1] == '.' && name[_DIR_DOT_DOT_SIZE] == '\0';
 
     trace_log_pop();
 
@@ -724,7 +881,7 @@ static char* _dir_path_join(char const *const parent, USize const parent_size, c
      * adjacent allocation in the SAME loop killed the process - so under identical memory
      * pressure the contract was "returns false" or "dies" depending on which line failed first.
      * One policy: every allocation here is recoverable, and callers null-check. */
-    char *const path = (char*) memory_try_alloc(parent_size + 1 + name_size + 1);
+    char *const path = (char*) memory_try_alloc(parent_size + 1 + name_size + CHAR_END_CHARACTER);
 
     if (memory_empty(path)) {
         trace_log_pop();
@@ -966,7 +1123,7 @@ static bool _dir_copy_all_recurse(char const *const path, char const *const path
     return copied;
 }
 
-#ifdef OS_WINDOWS
+#if OS_WINDOWS
 static bool _dir_delete_retry(char const *const path, bool const directory) {
     trace_log_push(LOG_METADATA);
 
@@ -1036,7 +1193,7 @@ static bool _dir_path_has_dot_segment(char const *const path, USize const path_s
             USize const segment_size = i - segment_start;
 
             bool const dot     = segment_size == 1 && path[segment_start] == '.';
-            bool const dot_dot = segment_size == 2 && path[segment_start] == '.' && path[segment_start + 1] == '.';
+            bool const dot_dot = segment_size == _DIR_DOT_DOT_SIZE && path[segment_start] == '.' && path[segment_start + 1] == '.';
 
             found = dot || dot_dot;
 
@@ -1064,7 +1221,7 @@ static bool _dir_remove_all_allowed(char const *const path, USize const path_siz
         allowed = !separators_only;
     }
 
-    if (allowed && path_size <= 3 && path_size >= 2 && path[1] == ':') {
+    if (allowed && path_size <= _DIR_DRIVE_ROOT_SIZE_MAX && path_size >= _DIR_DRIVE_ROOT_SIZE_MIN && path[1] == ':') {
         allowed = false;
     }
 
@@ -1251,7 +1408,7 @@ bool dir_copy_all_2(Str const *const path, Str const *const path_new) {
 
     bool copied = false;
 
-    if (str_get_size(path) > 0 && str_get_size(path_new) > 0) {
+    if (_dir_str_path_usable(path) && _dir_str_path_usable(path_new)) {
         char *const data     = char_new_3(str_get_data(path), str_get_size(path));
         char *const data_new = char_new_3(str_get_data(path_new), str_get_size(path_new));
 
@@ -1282,7 +1439,7 @@ bool dir_copy_all_3(String const *const path, String const *const path_new) {
 
     bool copied = false;
 
-    if (string_get_size(path) > 0 && string_get_size(path_new) > 0) {
+    if (_dir_string_path_usable(path) && _dir_string_path_usable(path_new)) {
         char *const data     = char_new_3(string_get_data(path), string_get_size(path));
         char *const data_new = char_new_3(string_get_data(path_new), string_get_size(path_new));
 
@@ -1318,7 +1475,7 @@ bool dir_create_1(char const *const path) {
      * live: crm.c gates a file open on this result, so a stray file at an upload path produced
      * a success here and then an unexplained write failure one line later. */
 #ifdef __linux__
-    created = mkdir(path, 0755) == 0 || (errno == EEXIST && dir_exists_1(path));
+    created = mkdir(path, _DIR_CREATE_MODE) == 0 || (errno == EEXIST && dir_exists_1(path));
 #elif OS_WINDOWS
     created = _dir_win_create_directory(path) || (GetLastError() == ERROR_ALREADY_EXISTS && dir_exists_1(path));
 #endif
@@ -1335,7 +1492,7 @@ bool dir_create_2(Str const *const path) {
 
     bool created = false;
 
-    if (str_get_size(path) > 0) {
+    if (_dir_str_path_usable(path)) {
         char *const data = char_new_3(str_get_data(path), str_get_size(path));
 
         created = dir_create_1(data);
@@ -1360,7 +1517,7 @@ bool dir_create_3(String const *const path) {
 
     bool created = false;
 
-    if (string_get_size(path) > 0) {
+    if (_dir_string_path_usable(path)) {
         char *const data = char_new_3(string_get_data(path), string_get_size(path));
 
         created = dir_create_1(data);
@@ -1394,7 +1551,7 @@ bool dir_create_all_1(char const *const path) {
          * recursive copy that the module documents as returning false. The allocation-failure
          * sweep found this; three reading rounds and 257 assertions did not, because nothing had
          * ever made an allocation fail. */
-        char *const prefix = (char*) memory_try_alloc(path_size + 1);
+        char *const prefix = (char*) memory_try_alloc(path_size + CHAR_END_CHARACTER);
 
         if (memory_empty(prefix)) {
             _dir_last_error_set_oom();
@@ -1448,7 +1605,7 @@ bool dir_create_all_2(Str const *const path) {
 
     bool created = false;
 
-    if (str_get_size(path) > 0) {
+    if (_dir_str_path_usable(path)) {
         char *const data = char_new_3(str_get_data(path), str_get_size(path));
 
         created = dir_create_all_1(data);
@@ -1473,7 +1630,7 @@ bool dir_create_all_3(String const *const path) {
 
     bool created = false;
 
-    if (string_get_size(path) > 0) {
+    if (_dir_string_path_usable(path)) {
         char *const data = char_new_3(string_get_data(path), string_get_size(path));
 
         created = dir_create_all_1(data);
@@ -1556,7 +1713,7 @@ bool dir_empty_2(Str const *const path) {
 
     bool empty = false;
 
-    if (str_get_size(path) > 0) {
+    if (_dir_str_path_usable(path)) {
         char *const data = char_new_3(str_get_data(path), str_get_size(path));
 
         empty = dir_empty_1(data);
@@ -1581,7 +1738,7 @@ bool dir_empty_3(String const *const path) {
 
     bool empty = false;
 
-    if (string_get_size(path) > 0) {
+    if (_dir_string_path_usable(path)) {
         char *const data = char_new_3(string_get_data(path), string_get_size(path));
 
         empty = dir_empty_1(data);
@@ -1628,7 +1785,7 @@ bool dir_exists_2(Str const *const path) {
 
     bool exists = false;
 
-    if (str_get_size(path) > 0) {
+    if (_dir_str_path_usable(path)) {
         char *const data = char_new_3(str_get_data(path), str_get_size(path));
 
         exists = dir_exists_1(data);
@@ -1653,7 +1810,7 @@ bool dir_exists_3(String const *const path) {
 
     bool exists = false;
 
-    if (string_get_size(path) > 0) {
+    if (_dir_string_path_usable(path)) {
         char *const data = char_new_3(string_get_data(path), string_get_size(path));
 
         exists = dir_exists_1(data);
@@ -1738,7 +1895,7 @@ bool dir_list_entries_1(char const *const path, DirEntry **const out_entries, US
              * are sized by the CALLER's own string, not by the directory. */
             USize const name_length = char_length(entry->d_name);
 
-            item.name = (char*) memory_try_alloc(name_length + 1);
+            item.name = (char*) memory_try_alloc(name_length + CHAR_END_CHARACTER);
 
             if (memory_empty(item.name)) {
                 errno = ENOMEM;
@@ -1834,7 +1991,7 @@ bool dir_list_entries_1(char const *const path, DirEntry **const out_entries, US
 
                 search[wide_size]     = L'\\';
                 search[wide_size + 1] = L'*';
-                search[wide_size + 2] = L'\0';
+                search[wide_size + _DIR_WILDCARD_SUFFIX_SIZE - 1] = L'\0';
 
                 listed = _dir_list_entries_find(search, &entries, &count);
 
@@ -1877,7 +2034,7 @@ bool dir_list_entries_2(Str const *const path, DirEntry **const out_entries, USi
 
     bool listed = false;
 
-    if (str_get_size(path) > 0) {
+    if (_dir_str_path_usable(path)) {
         char *const data = char_new_3(str_get_data(path), str_get_size(path));
 
         listed = dir_list_entries_1(data, out_entries, out_count);
@@ -1902,7 +2059,7 @@ bool dir_list_entries_3(String const *const path, DirEntry **const out_entries, 
 
     bool listed = false;
 
-    if (string_get_size(path) > 0) {
+    if (_dir_string_path_usable(path)) {
         char *const data = char_new_3(string_get_data(path), string_get_size(path));
 
         listed = dir_list_entries_1(data, out_entries, out_count);
@@ -1965,7 +2122,7 @@ bool dir_remove_2(Str const *const path) {
 
     bool removed = false;
 
-    if (str_get_size(path) > 0) {
+    if (_dir_str_path_usable(path)) {
         char *const data = char_new_3(str_get_data(path), str_get_size(path));
 
         removed = dir_remove_1(data);
@@ -1990,7 +2147,7 @@ bool dir_remove_3(String const *const path) {
 
     bool removed = false;
 
-    if (string_get_size(path) > 0) {
+    if (_dir_string_path_usable(path)) {
         char *const data = char_new_3(string_get_data(path), string_get_size(path));
 
         removed = dir_remove_1(data);
@@ -2039,7 +2196,7 @@ bool dir_remove_all_2(Str const *const path) {
 
     bool removed = false;
 
-    if (str_get_size(path) > 0) {
+    if (_dir_str_path_usable(path)) {
         char *const data = char_new_3(str_get_data(path), str_get_size(path));
 
         removed = dir_remove_all_1(data);
@@ -2064,7 +2221,7 @@ bool dir_remove_all_3(String const *const path) {
 
     bool removed = false;
 
-    if (string_get_size(path) > 0) {
+    if (_dir_string_path_usable(path)) {
         char *const data = char_new_3(string_get_data(path), string_get_size(path));
 
         removed = dir_remove_all_1(data);
@@ -2112,7 +2269,7 @@ bool dir_rename_2(Str const *const path, Str const *const path_new) {
 
     bool renamed = false;
 
-    if (str_get_size(path) > 0 && str_get_size(path_new) > 0) {
+    if (_dir_str_path_usable(path) && _dir_str_path_usable(path_new)) {
         char *const data     = char_new_3(str_get_data(path), str_get_size(path));
         char *const data_new = char_new_3(str_get_data(path_new), str_get_size(path_new));
 
@@ -2143,7 +2300,7 @@ bool dir_rename_3(String const *const path, String const *const path_new) {
 
     bool renamed = false;
 
-    if (string_get_size(path) > 0 && string_get_size(path_new) > 0) {
+    if (_dir_string_path_usable(path) && _dir_string_path_usable(path_new)) {
         char *const data     = char_new_3(string_get_data(path), string_get_size(path));
         char *const data_new = char_new_3(string_get_data(path_new), string_get_size(path_new));
 
@@ -2191,7 +2348,7 @@ bool dir_set_current_2(Str const *const path) {
 
     bool changed = false;
 
-    if (str_get_size(path) > 0) {
+    if (_dir_str_path_usable(path)) {
         char *const data = char_new_3(str_get_data(path), str_get_size(path));
 
         changed = dir_set_current_1(data);
@@ -2216,7 +2373,7 @@ bool dir_set_current_3(String const *const path) {
 
     bool changed = false;
 
-    if (string_get_size(path) > 0) {
+    if (_dir_string_path_usable(path)) {
         char *const data = char_new_3(string_get_data(path), string_get_size(path));
 
         changed = dir_set_current_1(data);

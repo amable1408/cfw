@@ -1,3 +1,6 @@
+/*==============================================================================
+ * MARK: - Includes
+ *============================================================================*/
 #include <file/file.h>
 
 // Both platforms: open's O_* flags on Linux, _open_osfhandle's _O_* flags on Windows.
@@ -5,10 +8,169 @@
 
 #ifdef __linux__
 #include <limits.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <utime.h>
+#elif defined(_WIN32)
+// The shim comes first by contract, ahead of alphabetical order: everything
+// else here is an extras-after header (see platform/windows/windows.h).
+#include <platform/windows/windows.h>
+#include <io.h>
 #endif // __linux__
 
 #include <char/char.h>
+
+/*==============================================================================
+ * MARK: - Macros and Constants
+ *============================================================================*/
+/* Blocks an empty document's padded buffer holds: the round-up block plus the spare block a
+ * non-empty read gets, so a vector load past the (absent) content stays in bounds. */
+#define _FILE_ALIGN_EMPTY_BLOCKS 2
+
+// The first byte value outside 7-bit ASCII: every byte below it reads the same in every code page.
+#define _FILE_ASCII_END 0x80
+
+/* The per-platform codes the three predicates below classify. Kept here, once, so no
+ * consumer has to know them - the whole point of the predicates.
+ *
+ * MEASURED on this toolchain, and the reason these are not a simple code comparison:
+ *   EEXIST = 17    ERROR_NOT_SAME_DEVICE = 17   <- THE SAME NUMBER
+ *   ENOENT = 2     ERROR_FILE_NOT_FOUND  = 2    ERROR_PATH_NOT_FOUND = 3
+ *   ERROR_FILE_EXISTS = 80   ERROR_ALREADY_EXISTS = 183
+ *
+ * So on Windows the code alone cannot separate "the destination exists" from "different
+ * filesystem" - the natural `if (is_exists) ... else if (is_cross_device)` took the wrong
+ * branch for every cross-device rename. The CATEGORY is what disambiguates: the STATE
+ * spelling is file_copy_1's own refusal (which carries the C errno), and every other
+ * spelling came from the OS - on Windows the copy path files _doserrno, the Win32 code the
+ * CRT keeps beside errno, so every OS-shaped code in this family is Win32-shaped there.
+ */
+#ifdef _WIN32
+#define _FILE_CODE_CROSS_DEVICE ERROR_NOT_SAME_DEVICE
+#else
+#define _FILE_CODE_CROSS_DEVICE EXDEV
+#endif
+
+// Streaming copy buffer size: large enough to amortize the fread/fwrite call overhead
+// without holding a whole large file in memory the way the module's whole-file readers do.
+#define _FILE_COPY_BUFFER_BYTES ((USize) 64 * 1024)
+
+// The ordinary create mode for a copy's destination; the umask narrows it, as for any new file.
+#define _FILE_CREATE_MODE 0666
+
+// Length of "COM" and "LPT", the device stems a superscript digit can follow.
+#define _FILE_DEVICE_DIGIT_STEM_SIZE CHAR_STATIC_SIZE("COM")
+
+// FILETIME counts 100ns ticks: ten million of them make one second.
+#define _FILE_FILETIME_TICKS_PER_SECOND 10000000ULL
+
+/* Length of the "\\?\" prefix that exempts a path from Win32's trailing-dot/space trimming. Every
+ * OS: file_path_trimmed_windows answers the Win32 question as a pure string rule. */
+#define _FILE_LONG_PREFIX_SIZE CHAR_STATIC_SIZE("\\\\?\\")
+
+// usleep counts microseconds; the wait helpers take milliseconds.
+#define _FILE_MICROSECONDS_PER_MILLISECOND 1000
+
+// The permission bits of st_mode (rwx for all three classes, plus setuid, setgid and sticky).
+#define _FILE_MODE_PERMISSION_BITS 07777
+
+// Text of a USize: at most 20 digits plus the terminator, rounded up.
+#define _FILE_NUMBER_TEXT_MAX 32
+
+// How many readings of a non-ASCII path the addressability check holds at once: UTF-8 and the code page.
+#define _FILE_PATH_READINGS 2
+
+// How many temp names file_replace_1 will try before giving up. Only a stale temp from a
+// killed run makes attempt 0 fail, so this is generous by orders of magnitude.
+#define _FILE_REPLACE_ATTEMPTS_MAX 64
+
+// The NTFS 8.3 short-name limits: at most 3 extension bytes after an at-most-8-byte stem.
+#define _FILE_SHORT_NAME_EXTENSION_MAX 3
+#define _FILE_SHORT_NAME_STEM_MAX 8
+
+// file_replace_1's temp is created owner-only; the destination's real mode is carried over afterwards.
+#define _FILE_TEMP_CREATE_MODE 0600
+
+#ifdef _WIN32
+// Length of the "X:" drive spec dropped from a final component before the device-name check.
+#define _FILE_DRIVE_SPEC_SIZE CHAR_STATIC_SIZE("X:")
+
+// The NT object-namespace prefix Win32 passes through verbatim, and its length.
+#define _FILE_NT_PREFIX "\\??\\"
+#define _FILE_NT_PREFIX_SIZE CHAR_STATIC_SIZE(_FILE_NT_PREFIX)
+
+// Length of the prefix every path the nofollow opener refuses as UNC begins with: two separators,
+// '/' and '\' alike in either place - \\server, //server, \/server, and the namespaces \\. and \\?.
+#define _FILE_UNC_PREFIX_SIZE CHAR_STATIC_SIZE("\\\\")
+
+// The long-path prefix GetFinalPathNameByHandleW puts in front of a drive path, and its length.
+#define _FILE_WIDE_PREFIX L"\\\\?\\"
+// In WCHAR units, less one terminator unit (CHAR_END_CHARACTER).
+#define _FILE_WIDE_PREFIX_SIZE (sizeof(_FILE_WIDE_PREFIX) / sizeof(WCHAR) - CHAR_END_CHARACTER)
+
+// Its UNC form, and how many of its units go when `\\?\UNC\server` becomes `\\server`: all of
+// them but the `\\` a UNC path begins with.
+#define _FILE_WIDE_PREFIX_UNC L"\\\\?\\UNC\\"
+#define _FILE_WIDE_PREFIX_UNC_DROPPED (sizeof(_FILE_WIDE_PREFIX_UNC) / sizeof(WCHAR) - sizeof(L"\\\\") / sizeof(WCHAR))
+#else
+// The symlink naming an open descriptor, followed by the descriptor's decimal text.
+#define _FILE_PROC_FD_PREFIX "/proc/self/fd/"
+#endif // _WIN32
+
+/*==============================================================================
+ * MARK: - Private Functions
+ *============================================================================*/
+/*
+ * Whether Win32 path normalisation would TRIM some component of this path before acting on it:
+ * a component ending in '.' or ' ' loses those characters (GetFullPathName, and every A- and
+ * W-API handed a non-"\\?\" path), so "report." names "report" and "sub./a.txt" names
+ * "sub/a.txt". The same rule as file_path_aliased_windows's trailing-dot clause and trash's
+ * _trash_name_trimmed, and spelled identically to the latter so the two modules refuse the
+ * same set. "." and ".." are real components, not trimmed names. A "\\?\" path bypasses the
+ * normaliser - nothing is trimmed - so it is passed through untouched; "\\.\" and "//?/" are
+ * normalised and are not exempt.
+ *
+ * Sized rather than terminated, so the wide openers can ask it of a Str without a copy; the
+ * by-path family passes char_length. The one implementation of the rule: compiled on every OS,
+ * because it is pure byte logic and file_path_trimmed_windows publishes it to callers that must
+ * refuse such a name before handing it to Win32.
+ */
+static bool _file_path_trimmed_windows(char const *const path, USize const size) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "path", (void*) path);
+
+    if (size >= _FILE_LONG_PREFIX_SIZE && path[0] == '\\' && path[1] == '\\' && path[2] == '?' && path[3] == '\\') {
+        trace_log_pop();
+
+        return false;
+    }
+
+    USize start = 0;
+
+    for (USize i = 0; i <= size; i += 1) {
+        bool const boundary = i == size || path[i] == '/' || path[i] == '\\';
+
+        if (!boundary) {
+            continue;
+        }
+
+        USize const length = i - start;
+        bool const dots    = (length == 1 && path[start] == '.') || (length == 2 && path[start] == '.' && path[start + 1] == '.');
+
+        if (length > 0 && !dots && (path[i - 1] == '.' || path[i - 1] == ' ')) {
+            trace_log_pop();
+
+            return true;
+        }
+
+        start = i + 1;
+    }
+
+    trace_log_pop();
+
+    return false;
+}
 
 /*
  * Can the ANSI Win32 / CRT entry points below actually ADDRESS this path?
@@ -32,6 +194,13 @@
  *
  * Linux has no such split: paths there are bytes, and the byte string IS the name.
  *
+ * THE SECOND MIS-TARGET, which has nothing to do with encoding: Win32 path normalisation TRIMS
+ * a trailing '.' or ' ' from a component, so "report." removes "report" - a different file,
+ * when both exist side by side (the ordinary result of a WSL, network-share or "\\?\" create).
+ * Refused first, on the same ARGUMENT / FILE_ARGUMENT_UNADDRESSABLE_PATH answer, because it is
+ * the same defect: the call would act on a name other than the one it was given. See
+ * _file_path_trimmed_windows for the exemptions.
+ *
  * THREE ANSWERS, not two, and the third is why this returns a Result rather than a bool:
  * RESULT_SUCCESS when the path can be acted on; ARGUMENT with FILE_ARGUMENT_UNADDRESSABLE_PATH
  * when the two readings genuinely differ; MEMORY when the conversion block (one, holding both
@@ -47,13 +216,22 @@ static Result _file_path_addressable(char const *const path) {
 
     error_check_null(LOG_METADATA, "path", (void*) path);
 
+    Result const unaddressable = result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_UNADDRESSABLE_PATH, 0);
+
+    // Ahead of the ASCII fast path: "report." is pure ASCII and still names the wrong file.
+    if (_file_path_trimmed_windows(path, char_length(path))) {
+        trace_log_pop();
+
+        return unaddressable;
+    }
+
     // Every ANSI code page maps 0x00-0x7F to itself, so a pure-ASCII path reads identically
     // both ways by construction - a byte scan proves it, with no conversion and no allocation.
     // file_replace_1 runs this up to four times per call, so the common case has to be free.
     bool ascii = true;
 
     for (USize i = 0; ascii && path[i] != '\0'; i += 1) {
-        ascii = (unsigned char) path[i] < 0x80;
+        ascii = (U8) path[i] < _FILE_ASCII_END;
     }
 
     if (ascii) {
@@ -61,8 +239,6 @@ static Result _file_path_addressable(char const *const path) {
 
         return RESULT_SUCCESS;
     }
-
-    Result const unaddressable = result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_UNADDRESSABLE_PATH, 0);
 
     // Invalid UTF-8 is refused outright: there is no reading of it this module can honour.
     int const utf8_size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, nullptr, 0);
@@ -85,7 +261,7 @@ static Result _file_path_addressable(char const *const path) {
     // ONE block for both readings, the UTF-8 one and the code-page one (the sizes are equal by now):
     // the code-page half starts where the UTF-8 half ends, so there is a single allocation to
     // refuse and a single one to free.
-    WCHAR *const as_utf8 = (WCHAR*) memory_try_alloc((USize) 2 * (USize) utf8_size * sizeof(WCHAR));
+    WCHAR *const as_utf8 = (WCHAR*) memory_try_alloc((USize) _FILE_PATH_READINGS * (USize) utf8_size * sizeof(WCHAR));
 
     if (memory_empty(as_utf8)) {
         /* Refused rather than assumed safe - but as MEMORY, not as unaddressable: nothing is
@@ -96,10 +272,9 @@ static Result _file_path_addressable(char const *const path) {
     }
 
     WCHAR *const as_acp = as_utf8 + utf8_size;
-    bool addressable    = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, as_utf8, utf8_size) > 0
-        && MultiByteToWideChar(CP_ACP, 0, path, -1, as_acp, acp_size) > 0;
+    bool addressable    = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, as_utf8, utf8_size) > 0 && MultiByteToWideChar(CP_ACP, 0, path, -1, as_acp, acp_size) > 0;
 
-    for (int i = 0; addressable && i < utf8_size; i += 1) {
+    for (I32 i = 0; addressable && i < utf8_size; i += 1) {
         addressable = as_utf8[i] == as_acp[i];
     }
 
@@ -169,9 +344,7 @@ static String _file_align_read_to(File *const self, USize const padding) {
         // Still a padded, zeroed buffer rather than an empty String: the whole
         // promise of this reader is that a vector load past the content is in
         // bounds, and a caller scanning an empty document still issues one.
-        String empty_buffer = string_init_2(padding * 2);
-
-        memory_set(string_get_data(&empty_buffer), padding * 2, 0);
+        String const empty_buffer = string_init_2(padding * _FILE_ALIGN_EMPTY_BLOCKS);
 
         trace_log_pop();
 
@@ -361,111 +534,6 @@ static Str _file_read_to_str(File *const self) {
     return file_str;
 }
 
-String file_align_read_to_string(char const *const file_name, U16 const padding) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
-
-    File *file = file_open_try_1(file_name, "r");
-
-    String const file_buffer = _file_align_read_to(file, padding);
-
-    _file_close_try(&file);
-
-    trace_log_pop();
-
-    return (String) file_buffer;
-}
-
-void file_at(File *const self, USize const index, File_Position const position) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "self", (void*) self);
-    // The caller's own enum (contract, not data): a value outside it would reach the C runtime as a bad whence.
-    error_check_wrong_value(LOG_METADATA, "position", (U32) position > (U32) FILE_POSITION_END);
-#ifdef ERROR_CHECK_ENABLED
-    USize const file_size = file_get_size(self);
-
-    error_check_out_of_bound_uint(LOG_METADATA, "index", index, "file_size", file_size, "index > file_size", index > file_size);
-#endif
-    /* 64-bit seek: fseek's long offset truncates 'index' for files over 2 GiB. */
-#ifdef _WIN32
-    _fseeki64(self, (long long) index, position);
-#else
-    fseeko(self, (off_t) index, position);
-#endif
-
-    trace_log_pop();
-}
-
-char* file_basename_1(char const *const path) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "path", (void*) path);
-
-    char const *result = path;
-
-    for (char const *scan = path; *scan != '\0'; scan += 1) {
-        if (*scan == '/' || *scan == '\\') {
-            result = scan + 1;
-        }
-    }
-
-    trace_log_pop();
-
-    return (char*) result;
-}
-
-void file_close(File **const self) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "self", (void*) self);
-    error_check_null(LOG_METADATA, "*self", (void*) *self);
-
-    fclose(*self);
-
-    *self = nullptr;
-
-    trace_log_pop();
-}
-
-// Streaming copy buffer size: large enough to amortize the fread/fwrite call overhead
-// without holding a whole large file in memory the way the module's whole-file readers do.
-#define _FILE_COPY_BUFFER_BYTES ((USize) 64 * 1024)
-
-// FILETIME counts 100ns ticks: ten million of them make one second.
-#define _FILE_FILETIME_TICKS_PER_SECOND 10000000ULL
-
-// Text of a USize: at most 20 digits plus the terminator, rounded up.
-#define _FILE_NUMBER_TEXT_MAX 32
-
-// How many temp names file_replace_1 will try before giving up. Only a stale temp from a
-// killed run makes attempt 0 fail, so this is generous by orders of magnitude.
-#define _FILE_REPLACE_ATTEMPTS_MAX 64
-
-#ifdef _WIN32
-// Length of the "X:" drive spec dropped from a final component before the device-name check.
-#define _FILE_DRIVE_SPEC_SIZE CHAR_STATIC_SIZE("X:")
-
-// The NT object-namespace prefix Win32 passes through verbatim, and its length.
-#define _FILE_NT_PREFIX "\\??\\"
-#define _FILE_NT_PREFIX_SIZE CHAR_STATIC_SIZE(_FILE_NT_PREFIX)
-
-// Length of the prefix every path the nofollow opener refuses as UNC begins with: two separators,
-// '/' and '\' alike in either place - \\server, //server, \/server, and the namespaces \\. and \\?.
-#define _FILE_UNC_PREFIX_SIZE CHAR_STATIC_SIZE("\\\\")
-
-// The long-path prefix GetFinalPathNameByHandleW puts in front of a drive path, and its length.
-#define _FILE_WIDE_PREFIX L"\\\\?\\"
-// In WCHAR units, less one terminator unit (CHAR_END_CHARACTER).
-#define _FILE_WIDE_PREFIX_SIZE (sizeof(_FILE_WIDE_PREFIX) / sizeof(WCHAR) - CHAR_END_CHARACTER)
-
-// Its UNC form, and how many of its units go when `\\?\UNC\server` becomes `\\server`: all of
-// them but the `\\` a UNC path begins with.
-#define _FILE_WIDE_PREFIX_UNC L"\\\\?\\UNC\\"
-#define _FILE_WIDE_PREFIX_UNC_DROPPED (sizeof(_FILE_WIDE_PREFIX_UNC) / sizeof(WCHAR) - sizeof(L"\\\\") / sizeof(WCHAR))
-#endif // _WIN32
-
 /*
  * Stream one open handle into another, reporting a read failure as a failure.
  *
@@ -486,7 +554,7 @@ static Result _file_copy_stream(File *const reader, File *const writer) {
     }
 
     Result result = RESULT_SUCCESS;
-    USize read_count;
+    USize read_count = 0;
 
     while ((read_count = file_read_1(reader, buffer, 1, _FILE_COPY_BUFFER_BYTES)) > 0) {
         USize const written_count = file_write_1(writer, buffer, 1, read_count);
@@ -522,9 +590,7 @@ static Result _file_copy_stream(File *const reader, File *const writer) {
          * through the write loop above, and used to arrive with no code at all. */
         Result const flush_failure = result_from_os();
 
-        result = result_is_error(flush_failure)
-            ? result_with_flag(flush_failure, RESULT_FLAG_PARTIAL)
-            : result_make(RESULT_CATEGORY_IO, 0, RESULT_FLAG_PARTIAL);
+        result = result_is_error(flush_failure) ? result_with_flag(flush_failure, RESULT_FLAG_PARTIAL) : result_make(RESULT_CATEGORY_IO, 0, RESULT_FLAG_PARTIAL);
     }
 
     trace_log_pop();
@@ -685,217 +751,6 @@ static Result _file_copy_exclusive(char const *const source, char const *const d
     return result;
 }
 
-Result file_copy_1(char const *const source, char const *const destination) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "source", (void*) source);
-    error_check_null(LOG_METADATA, "destination", (void*) destination);
-
-    // 0666 is the ordinary create mode; the umask narrows it, as it does for any new file.
-    Result const result = _file_copy_exclusive(source, destination, 0666);
-
-    trace_log_pop();
-
-    return result;
-}
-
-Result file_copy_2(Str const *const source, Str const *const destination) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "source", (void*) source);
-    error_check_null(LOG_METADATA, "destination", (void*) destination);
-
-    if (str_get_size(source) == 0 || str_get_size(destination) == 0) {
-        trace_log_pop();
-
-        return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_EMPTY_PATH, 0);
-    }
-
-    char *const source_text      = char_new_3(str_get_data(source), str_get_size(source));
-    char *const destination_text = char_new_3(str_get_data(destination), str_get_size(destination));
-
-    /* The _1 below opens with error_check_null, which ABORTS - inside a family whose header
-     * promises it never aborts on an outcome. Each delete is guarded because the other
-     * allocation may have succeeded, and CFW's free aborts on nullptr. */
-    if (memory_empty(source_text) || memory_empty(destination_text)) {
-        if (!memory_empty(source_text)) {
-            char_delete(source_text);
-        }
-
-        if (!memory_empty(destination_text)) {
-            char_delete(destination_text);
-        }
-
-        trace_log_pop();
-
-        return result_make(RESULT_CATEGORY_MEMORY, 0, 0);
-    }
-
-    Result const result = file_copy_1(source_text, destination_text);
-
-    char_delete(source_text);
-    char_delete(destination_text);
-
-    trace_log_pop();
-
-    return result;
-}
-
-Result file_copy_3(String const *const source, String const *const destination) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "source", (void*) source);
-    error_check_null(LOG_METADATA, "destination", (void*) destination);
-
-    if (string_get_size(source) == 0 || string_get_size(destination) == 0) {
-        trace_log_pop();
-
-        return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_EMPTY_PATH, 0);
-    }
-
-    char *const source_text      = char_new_3(string_get_data(source), string_get_size(source));
-    char *const destination_text = char_new_3(string_get_data(destination), string_get_size(destination));
-
-    /* The _1 below opens with error_check_null, which ABORTS - inside a family whose header
-     * promises it never aborts on an outcome. Each delete is guarded because the other
-     * allocation may have succeeded, and CFW's free aborts on nullptr. */
-    if (memory_empty(source_text) || memory_empty(destination_text)) {
-        if (!memory_empty(source_text)) {
-            char_delete(source_text);
-        }
-
-        if (!memory_empty(destination_text)) {
-            char_delete(destination_text);
-        }
-
-        trace_log_pop();
-
-        return result_make(RESULT_CATEGORY_MEMORY, 0, 0);
-    }
-
-    Result const result = file_copy_1(source_text, destination_text);
-
-    char_delete(source_text);
-    char_delete(destination_text);
-
-    trace_log_pop();
-
-    return result;
-}
-
-bool file_empty(File *const self) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "self", (void*) self);
-
-    trace_log_pop();
-
-    return file_get_size(self) == 0;
-}
-
-bool file_error(File *const self) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "self", (void*) self);
-
-    bool const failed = ferror(self) != 0;
-
-    trace_log_pop();
-
-    return failed;
-}
-
-bool file_exists_1(char const *const file_name) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
-
-    bool exists = false;
-
-    #ifdef __linux__
-    // Was `exists = true;` unconditionally, which reported every path as present
-    // - including paths that are not. Every caller guarding a read with this
-    // function was therefore unguarded on Linux.
-    struct stat info = DEFAULT_INITIALIZATION;
-
-    exists = stat(file_name, &info) == 0 && S_ISREG(info.st_mode);
-    #elif defined(_WIN32)
-    DWORD dwAttrib = GetFileAttributes((LPCSTR) file_name);
-
-    exists = (dwAttrib != INVALID_FILE_ATTRIBUTES && !(dwAttrib & FILE_ATTRIBUTE_DIRECTORY));
-    #endif
-
-    trace_log_pop();
-
-    return exists;
-}
-
-bool file_exists_2(Str const *const file_name) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
-
-    // An empty Str carries a nullptr buffer (str.h's EMPTY value), and char_new_3 aborts on a
-    // nullptr source - the abort primitive file_modified_2/_size_2 already refuse instead of.
-    if (str_get_size(file_name) == 0) {
-        trace_log_pop();
-
-        return false;
-    }
-
-    char *const path_text = char_new_3(str_get_data(file_name), str_get_size(file_name));
-
-    bool exists = file_exists_1(path_text);
-
-    char_delete(path_text);
-
-    trace_log_pop();
-
-    return exists;
-}
-
-bool file_exists_3(String const *const file_name) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
-
-    // See file_exists_2: an empty String's buffer is nullptr, which char_new_3 would abort on.
-    if (string_get_size(file_name) == 0) {
-        trace_log_pop();
-
-        return false;
-    }
-
-    char *const path_text = char_new_3(string_get_data(file_name), string_get_size(file_name));
-
-    bool exists = file_exists_1(path_text);
-
-    char_delete(path_text);
-
-    trace_log_pop();
-
-    return exists;
-}
-
-char* file_extension_1(char const *const path) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "path", (void*) path);
-
-    char const *const base = file_basename_1(path);
-    char const *dot        = nullptr;
-
-    for (USize i = 0; base[i] != '\0'; i += 1) {
-        if (base[i] == '.' && i != 0) {
-            dot = &base[i + 1];
-        }
-    }
-
-    trace_log_pop();
-
-    return (char*) (!memory_empty((void*) dot) ? dot : "");
-}
-
 #ifdef _WIN32
 /*
  * Whether the first units of a wide string spell PREFIX (terminated). Used to strip the `\\?\`
@@ -983,10 +838,14 @@ static bool _file_final_path_wide(HANDLE const handle, char *const buffer, USize
  * Fails closed and leaves the error state the callers document:
  *   - an embedded NUL -> ERROR_INVALID_NAME: the W-API would stop at it and open the SHORTER
  *     name in front of it, a name the caller never passed;
+ *   - a component ending in '.' or ' ' outside a "\\?\" path -> ERROR_INVALID_NAME, the code dir.c
+ *     gives the same refusal: CreateFile2 would trim "report." to "report" and open THAT file, a
+ *     read-only twin the caller never named (_file_path_trimmed_windows has the exemptions);
  *   - invalid UTF-8 -> ERROR_NO_UNICODE_TRANSLATION, set by the conversion itself;
  *   - a path that does not fit -> ERROR_FILENAME_EXCED_RANGE.
  * A zero-size path converts to an empty wide string; the open that follows reports it as the
- * OS reports any missing path.
+ * OS reports any missing path. Every wide opener takes its path from here, so this is the one
+ * place both refusals live, the way _file_path_addressable is for the by-path family.
  */
 static bool _file_path_wide(char const *const path, USize const path_size, WCHAR *const wide) {
     trace_log_push(LOG_METADATA);
@@ -1002,6 +861,15 @@ static bool _file_path_wide(char const *const path, USize const path_size, WCHAR
 
             return false;
         }
+    }
+
+    // After the NUL scan, so the component walk below reads only the bytes the caller named.
+    if (_file_path_trimmed_windows(path, path_size)) {
+        SetLastError(ERROR_INVALID_NAME);
+
+        trace_log_pop();
+
+        return false;
     }
 
     if (path_size > (USize) I32_MAX) {
@@ -1071,9 +939,6 @@ static HANDLE _file_open_wide(WCHAR const *const wide, DWORD const access, DWORD
     return handle;
 }
 #else
-// The symlink naming an open descriptor, followed by the descriptor's decimal text.
-#define _FILE_PROC_FD_PREFIX "/proc/self/fd/"
-
 /*
  * Where an open descriptor physically lives, by readlink on its /proc/self/fd entry. Answers
  * false - leaving the caller to empty the buffer - when /proc is not mounted, the descriptor is
@@ -1081,7 +946,7 @@ static HANDLE _file_open_wide(WCHAR const *const wide, DWORD const access, DWORD
  * silently truncates to the size it is given, so an answer that FILLS the buffer is treated as
  * truncated: it might be.
  */
-static bool _file_final_path_descriptor(int const descriptor, char *const buffer, USize const capacity) {
+static bool _file_final_path_descriptor(I32 const descriptor, char *const buffer, USize const capacity) {
     trace_log_push(LOG_METADATA);
 
     error_check_null(LOG_METADATA, "buffer", (void*) buffer);
@@ -1097,7 +962,7 @@ static bool _file_final_path_descriptor(int const descriptor, char *const buffer
 
     char_from_numbers_uint_1(&link[prefix_size], sizeof(link) - prefix_size, (USize) descriptor);
 
-    ssize_t const written = readlink(link, buffer, capacity);
+    ISize const written = (ISize) readlink(link, buffer, capacity);
 
     if (written < 0 || (USize) written >= capacity) {
         trace_log_pop();
@@ -1210,116 +1075,6 @@ static bool _file_final_path(char const *const path, USize const path_size, char
     return found;
 }
 
-bool file_final_path_1(char const *const path, char *const buffer, USize const capacity) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "path", (void*) path);
-    error_check_null(LOG_METADATA, "buffer", (void*) buffer);
-
-    bool const found = _file_final_path(path, char_length(path), buffer, capacity);
-
-    trace_log_pop();
-
-    return found;
-}
-
-bool file_final_path_2(Str const *const path, char *const buffer, USize const capacity) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "path", (void*) path);
-    error_check_null(LOG_METADATA, "buffer", (void*) buffer);
-
-    // An empty Str carries a nullptr buffer: refused by value before it reaches the core's own
-    // pointer check, with no syscall.
-    if (str_get_size(path) == 0) {
-        if (capacity > 0) {
-            buffer[0] = '\0';
-        }
-
-        trace_log_pop();
-
-        return false;
-    }
-
-    bool const found = _file_final_path(str_get_data(path), str_get_size(path), buffer, capacity);
-
-    trace_log_pop();
-
-    return found;
-}
-
-bool file_final_path_3(String const *const path, char *const buffer, USize const capacity) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "path", (void*) path);
-    error_check_null(LOG_METADATA, "buffer", (void*) buffer);
-
-    // See file_final_path_2.
-    if (string_get_size(path) == 0) {
-        if (capacity > 0) {
-            buffer[0] = '\0';
-        }
-
-        trace_log_pop();
-
-        return false;
-    }
-
-    bool const found = _file_final_path(string_get_data(path), string_get_size(path), buffer, capacity);
-
-    trace_log_pop();
-
-    return found;
-}
-
-bool file_flush(File *const self) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "self", (void*) self);
-
-    /* fflush is otherwise unreachable in-framework: callers that must know the
-     * bytes reached the OS (an upload endpoint answering 200) had to rely on
-     * fclose, which reports nothing. */
-    bool const flushed = fflush(self) == 0;
-
-    trace_log_pop();
-
-    return flushed;
-}
-
-bool file_get_final_path(File *const self, char *const buffer, USize const capacity) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "self", (void*) self);
-    error_check_null(LOG_METADATA, "buffer", (void*) buffer);
-
-    if (capacity == 0) {
-        trace_log_pop();
-
-        return false;
-    }
-
-    bool found = false;
-#ifdef _WIN32
-    // The handle under the stream, asked directly: nothing is re-resolved by path.
-    HANDLE const handle = (HANDLE) _get_osfhandle(fileno(self));
-
-    if (handle != INVALID_HANDLE_VALUE) {
-        found = _file_final_path_wide(handle, buffer, capacity);
-    }
-#else
-    found = _file_final_path_descriptor(fileno(self), buffer, capacity);
-#endif // _WIN32
-
-    if (!found) {
-        buffer[0] = '\0';
-    }
-
-    trace_log_pop();
-
-    return found;
-}
-
 #ifdef _WIN32
 /*
  * FILETIME ticks -> Unix epoch seconds, shared by the by-handle and by-path mtime getters so the
@@ -1345,254 +1100,6 @@ static I64 _file_epoch_from_filetime(FILETIME const filetime) {
     return seconds;
 }
 #endif // _WIN32
-
-bool file_get_modified(File *const self, I64 *const out) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "self", (void*) self);
-    error_check_null(LOG_METADATA, "out", (void*) out);
-
-    bool success = false;
-#ifdef _WIN32
-    HANDLE const handle = (HANDLE) _get_osfhandle(fileno(self));
-    FILETIME written    = DEFAULT_INITIALIZATION;
-
-    // Only the last-write slot is asked for, matching file_modified_1's ftLastWriteTime.
-    if (handle != INVALID_HANDLE_VALUE && GetFileTime(handle, nullptr, nullptr, &written)) {
-        *out    = _file_epoch_from_filetime(written);
-        success = true;
-    }
-#else
-    struct stat status = DEFAULT_INITIALIZATION;
-
-    if (fstat(fileno(self), &status) == 0) {
-        *out    = (I64) status.st_mtime;
-        success = true;
-    }
-#endif // _WIN32
-
-    trace_log_pop();
-
-    return success;
-}
-
-USize file_get_size(File *const self) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "self", (void*) self);
-
-    USize file_size = 0;
-#ifdef __linux__
-    /* fstat by HANDLE, not fseek/ftell: the seek pair moved the stream position
-     * (rewinding it to 0), so file_at's bound check silently reset the very
-     * position it was about to seek from, and a stat-less error turned ftell's
-     * -1 into a huge USize. This also removes the platform caveat the whole-file
-     * readers used to document. */
-    struct stat file_status = DEFAULT_INITIALIZATION;
-
-    /* The magnitude check runs BEFORE the narrowing cast: on a 32-bit target
-     * off_t outranges USize, and a >4 GiB file would otherwise wrap to a small
-     * size that sails through FILE_READ_BYTES_MAX. */
-    if (fstat(fileno(self), &file_status) == 0 && file_status.st_size > 0 && (U64) file_status.st_size <= (U64) USIZE_MAX) {
-        file_size = (USize) file_status.st_size;
-    }
-#elif defined(_WIN32)
-    HANDLE _handle = (HANDLE) _get_osfhandle(fileno(self));
-
-    // Into a LARGE_INTEGER and then assigned, never straight into file_size:
-    // GetFileSizeEx always writes 8 bytes, so casting a USize to
-    // PLARGE_INTEGER overwrites 4 bytes of stack past it on a 32-bit target.
-    LARGE_INTEGER _file_size = DEFAULT_INITIALIZATION;
-
-    if (GetFileSizeEx(_handle, &_file_size)) {
-        file_size = (USize) _file_size.QuadPart;
-    }
-#endif
-
-    trace_log_pop();
-
-    return file_size;
-}
-
-bool file_modified_1(char const *const file_name, I64 *const out) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
-    error_check_null(LOG_METADATA, "out", (void*) out);
-
-    bool success = false;
-#ifdef _WIN32
-    WIN32_FILE_ATTRIBUTE_DATA data = DEFAULT_INITIALIZATION;
-
-    if (GetFileAttributesExA((LPCSTR) file_name, GetFileExInfoStandard, &data)) {
-        *out    = _file_epoch_from_filetime(data.ftLastWriteTime);
-        success = true;
-    }
-#else
-    struct stat status = DEFAULT_INITIALIZATION;
-
-    if (stat(file_name, &status) == 0) {
-        *out = (I64) status.st_mtime;
-        success = true;
-    }
-#endif
-
-    trace_log_pop();
-
-    return success;
-}
-
-bool file_modified_2(Str const *const file_name, I64 *const out) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
-    error_check_null(LOG_METADATA, "out", (void*) out);
-
-    if (str_get_size(file_name) == 0) {
-        trace_log_pop();
-
-        return false;
-    }
-
-    char *const path_text = char_new_3(str_get_data(file_name), str_get_size(file_name));
-
-    bool const success = file_modified_1(path_text, out);
-
-    char_delete(path_text);
-
-    trace_log_pop();
-
-    return success;
-}
-
-bool file_modified_3(String const *const file_name, I64 *const out) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
-    error_check_null(LOG_METADATA, "out", (void*) out);
-
-    if (string_get_size(file_name) == 0) {
-        trace_log_pop();
-
-        return false;
-    }
-
-    char *const path_text = char_new_3(string_get_data(file_name), string_get_size(file_name));
-
-    bool const success = file_modified_1(path_text, out);
-
-    char_delete(path_text);
-
-    trace_log_pop();
-
-    return success;
-}
-
-bool file_name_reserved_windows(char const *const name, USize const name_size) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "name", (void*) name);
-
-    /* The superscript-digit COM/LPT forms are not listed: the non-ASCII rule below answers them
-     * in both their single-byte ANSI and their UTF-8 spellings. */
-    static char const *const reserved[] = {
-        "AUX", "CLOCK$", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "CON", "CONIN$", "CONOUT$",
-        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "NUL", "PRN"
-    };
-
-    /* Win32 strips trailing spaces and dots from a component before it looks the name up, so
-     * "nul " and "con." reach the device namespace exactly like "nul" and "con" do. Trim them
-     * first, then cut the stem at the first dot - or the first ':', since Win32 reads "CON:" and
-     * "CON::$DATA" as the device too (a stream name after a device name is ignored). */
-    USize trimmed_size = name_size;
-
-    while (trimmed_size > 0 && (name[trimmed_size - 1] == ' ' || name[trimmed_size - 1] == '.')) {
-        trimmed_size -= 1;
-    }
-
-    USize stem_size = trimmed_size;
-
-    for (USize i = 0; i < trimmed_size; i += 1) {
-        if (name[i] == '.' || name[i] == ':') {
-            stem_size = i;
-
-            break;
-        }
-    }
-
-    /* Win32 trims the stem too before its device check: "CONIN$ .txt" and "AUX .html" open the
-     * device exactly like "CONIN$.txt" and "AUX.html" do. */
-    while (stem_size > 0 && (name[stem_size - 1] == ' ' || name[stem_size - 1] == '.')) {
-        stem_size -= 1;
-    }
-
-    bool is_reserved = false;
-
-    for (USize i = 0; i < sizeof(reserved) / sizeof(reserved[0]); i += 1) {
-        if (char_compare_iequal_2(name, stem_size, reserved[i], char_length(reserved[i]))) {
-            is_reserved = true;
-
-            break;
-        }
-    }
-
-    /* COM or LPT followed only by bytes >= 0x80: the ANSI APIs read the single cp1252 byte
-     * 0xB9/0xB2/0xB3 as the superscript device digit, the wide APIs the UTF-8 pair. */
-    if (!is_reserved && stem_size > 3 && (char_compare_iequal_2(name, 3, "COM", 3) || char_compare_iequal_2(name, 3, "LPT", 3))) {
-        is_reserved = true;
-
-        for (USize i = 3; i < stem_size; i += 1) {
-            if ((U8) name[i] < 0x80) {
-                is_reserved = false;
-
-                break;
-            }
-        }
-    }
-
-    trace_log_pop();
-
-    return is_reserved;
-}
-
-File* file_open_1(char const *const file_name, char const *const file_mode) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
-    error_check_null(LOG_METADATA, "file_mode", (void*) file_mode);
-
-    File *file = file_open_try_1(file_name, file_mode);
-
-    error_check_null(LOG_METADATA, "file", (void*) file);
-
-    trace_log_pop();
-
-    return file;
-}
-
-File* file_open_2(Str const *const file_name, char const *const file_mode) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
-
-    File *file = file_open_1(str_get_data(file_name), file_mode);
-
-    trace_log_pop();
-
-    return file;
-}
-
-File* file_open_3(String const *const file_name, char const *const file_mode) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
-
-    File *file = file_open_1(string_get_data(file_name), file_mode);
-
-    trace_log_pop();
-
-    return file;
-}
 
 #ifdef _WIN32
 /*
@@ -1860,6 +1367,901 @@ static File* _file_open_nofollow(char const *const path, USize const path_size) 
     return file;
 }
 
+/*
+ * Whether one path component has the shape of an NTFS 8.3 short alias: a stem (the bytes before
+ * the first '.') of at most 8 bytes holding '~' followed by an ASCII digit, an extension of at
+ * most 3 bytes after that dot, and no space anywhere. Narrower than "contains ~digit": a stem
+ * longer than 8 bytes or an extension longer than 3 can never be a short name, so a long name
+ * like "my-report~2.pdf" is not refused for looking like one.
+ */
+static bool _file_component_short_name_shaped(char const *const component, USize const component_size) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "component", (void*) component);
+
+    USize stem_size = component_size;
+
+    for (USize i = 0; i < component_size; i += 1) {
+        if (component[i] == ' ') {
+            trace_log_pop();
+
+            return false;
+        }
+
+        if (component[i] == '.' && stem_size == component_size) {
+            stem_size = i;
+        }
+    }
+
+    USize const extension_size = stem_size < component_size ? component_size - stem_size - 1 : 0;
+
+    bool shaped = false;
+
+    if (stem_size <= _FILE_SHORT_NAME_STEM_MAX && extension_size <= _FILE_SHORT_NAME_EXTENSION_MAX) {
+        for (USize i = 0; i + 1 < stem_size; i += 1) {
+            if (component[i] == '~' && char_is_number(component[i + 1])) {
+                shaped = true;
+
+                break;
+            }
+        }
+    }
+
+    trace_log_pop();
+
+    return shaped;
+}
+
+/*
+ * The by-value refusal of a sized path holding a NUL byte, for the fopen-based Str/String openers
+ * (file_open_try_2/3, file_open_wait_2/3, and file_open_2/3 through them). fopen reads only up
+ * to the first NUL, so "victim\0x" would open - in a write mode create or truncate - "victim", a
+ * file the caller never named. Nothing is opened; the OS error state is set to the codes
+ * file_open_nofollow_try_2 answers the same refusal with (EINVAL, and ERROR_INVALID_NAME on
+ * Windows), so a caller classifying the failure sees a bad name, never a stale earlier code.
+ */
+static File* _file_open_refuse_embedded_nul(void) {
+    trace_log_push(LOG_METADATA);
+
+#ifdef _WIN32
+    SetLastError(ERROR_INVALID_NAME);
+#endif // _WIN32
+    errno = EINVAL;
+
+    trace_log_pop();
+
+    return nullptr;
+}
+
+/*
+ * The by-value refusal of a Str/String opener whose terminated path copy could not be allocated -
+ * reachable only without ERROR_CHECK_ENABLED, where memory_alloc reports instead of ending the
+ * process. Nothing is opened; the OS error state reads as out of memory (ENOMEM, and
+ * ERROR_NOT_ENOUGH_MEMORY on Windows), never as a stale earlier code or a bad name.
+ */
+static File* _file_open_refuse_unallocated(void) {
+    trace_log_push(LOG_METADATA);
+
+#ifdef _WIN32
+    SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+#endif // _WIN32
+    errno = ENOMEM;
+
+    trace_log_pop();
+
+    return nullptr;
+}
+
+/*
+ * Releases the terminated copy a Str/String opener built for fopen, leaving the OS error state as
+ * the open left it: file_open_try_2/3 and file_open_wait_2/3 carry file_open_try_1's promise that
+ * a failed open's errno / GetLastError survive for the caller, and the free in between must not
+ * be what the caller then classifies.
+ */
+static void _file_open_path_delete(char *const path_text) {
+    trace_log_push(LOG_METADATA);
+
+#ifdef _WIN32
+    DWORD const last_error = GetLastError();
+#endif // _WIN32
+    int const open_errno = errno;
+
+    char_delete(path_text);
+
+    errno = open_errno;
+#ifdef _WIN32
+    SetLastError(last_error);
+#endif // _WIN32
+
+    trace_log_pop();
+}
+
+/*
+ * A path beside the destination (same directory, by construction - it is just the destination plus a
+ * suffix), unique enough for one process's own use: the OS pid rules out collision with
+ * another concurrently-replacing process, though not with a second file_replace_1 call
+ * racing itself within this same process against the same destination (out of scope - CFW's
+ * own callers are single-threaded per file per the module's Thread Safety contract).
+ */
+static char* _file_replace_temp_path(char const *const destination, USize const attempt) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "destination", (void*) destination);
+
+#ifdef _WIN32
+    USize const pid = (USize) GetCurrentProcessId();
+#else
+    USize const pid = (USize) getpid();
+#endif
+
+    char pid_text[_FILE_NUMBER_TEXT_MAX]     = DEFAULT_INITIALIZATION;
+    char attempt_text[_FILE_NUMBER_TEXT_MAX] = DEFAULT_INITIALIZATION;
+
+    char_from_numbers_uint_1(pid_text, sizeof(pid_text), pid);
+    char_from_numbers_uint_1(attempt_text, sizeof(attempt_text), attempt);
+
+    /* The pid alone was not enough. It rules out a COLLISION WITH ANOTHER PROCESS, which is
+     * the case the original comment considered - but not the cross-TIME case that actually
+     * bites: a killed run, or a recycled pid, leaves a stale temp behind, the exclusive
+     * create then refuses it, and file_replace_1 fails FOREVER for that destination while
+     * reporting "destination exists" about a hidden file the caller never named. The attempt
+     * counter walks past it, exactly as the trash module's name-claiming loop does. */
+    char const *const parts[] = { destination, ".tmp.", pid_text, ".", attempt_text };
+    char *const temp_path     = char_join_1(parts, sizeof(parts) / sizeof(parts[0]), "");
+
+    trace_log_pop();
+
+    return temp_path;
+}
+
+/*
+ * Carry the destination's existing permissions onto the temp that is about to become it.
+ *
+ * Without this, file_replace_1 SILENTLY RESET them: the temp is a fresh file created under
+ * the umask, and the rename makes that fresh file the destination - so a 0600 secrets file
+ * came back 0644 on a successful "replace the contents" call. Nothing in the contract hinted
+ * that a success changes destination metadata, and a permission regression is not the kind
+ * of surprise a caller finds quickly.
+ *
+ * Windows is a documented gap rather than a silent one: an explicit ACL on the destination
+ * is replaced by fresh inheritance, which needs the security-descriptor APIs to carry over
+ * and is out of this function's scope.
+ */
+static void _file_replace_carry_mode(char const *const destination, char const *const temp_path) {
+    trace_log_push(LOG_METADATA);
+
+#ifdef __linux__
+    struct stat status = DEFAULT_INITIALIZATION;
+
+    if (stat(destination, &status) != 0) {
+        // Nothing to carry: a destination that does not exist yet has no mode to preserve.
+        trace_log_pop();
+
+        return;
+    }
+
+    /* Reported rather than swallowed. A failed stat is a legitimate "nothing to carry"; a
+     * failed chmod AFTER a successful stat is the permission regression this helper exists
+     * to prevent, and discarding its result reproduces exactly the silent surprise the
+     * function was added to stop. Not fatal - the CONTENT is correct, which is what the
+     * caller asked for. */
+    if (chmod(temp_path, status.st_mode & _FILE_MODE_PERMISSION_BITS) != 0) {
+        log_message_try_1(LOG_LEVEL_WARN, "file: replaced the file but could not carry its permissions across (%s)\n", destination);
+    }
+#else
+    (void) destination;
+    (void) temp_path;
+#endif
+
+    trace_log_pop();
+}
+
+/*==============================================================================
+ * MARK: - Public API
+ *============================================================================*/
+String file_align_read_to_string(char const *const file_name, U16 const padding) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
+
+    File *file = file_open_try_1(file_name, "r");
+
+    String const file_buffer = _file_align_read_to(file, padding);
+
+    _file_close_try(&file);
+
+    trace_log_pop();
+
+    return (String) file_buffer;
+}
+
+void file_at(File *const self, USize const index, File_Position const position) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+    // The caller's own enum (contract, not data): a value outside it would reach the C runtime as a bad whence.
+    error_check_wrong_value(LOG_METADATA, "position", (U32) position > (U32) FILE_POSITION_END);
+#ifdef ERROR_CHECK_ENABLED
+    USize const file_size = file_get_size(self);
+
+    error_check_out_of_bound_uint(LOG_METADATA, "index", index, "file_size", file_size, "index > file_size", index > file_size);
+#endif
+
+    /* 64-bit seek: fseek's long offset truncates 'index' for files over 2 GiB. */
+#ifdef _WIN32
+    _fseeki64(self, (long long) index, position);
+#else
+    fseeko(self, (off_t) index, position);
+#endif
+
+    trace_log_pop();
+}
+
+char* file_basename(char const *const path) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "path", (void*) path);
+
+    char const *result = path;
+
+    for (char const *scan = path; *scan != '\0'; scan += 1) {
+#ifdef _WIN32
+        bool const separator = *scan == '/' || *scan == '\\';
+#else
+        // POSIX: '\\' is an ordinary filename byte, so "a\\b" is ONE name, not "b" under "a".
+        bool const separator = *scan == '/';
+#endif // _WIN32
+
+        if (separator) {
+            result = scan + 1;
+        }
+    }
+
+    trace_log_pop();
+
+    return (char*) result;
+}
+
+void file_close(File **const self) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+    error_check_null(LOG_METADATA, "*self", (void*) *self);
+
+    fclose(*self);
+
+    *self = nullptr;
+
+    trace_log_pop();
+}
+
+Result file_copy_1(char const *const source, char const *const destination) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "source", (void*) source);
+    error_check_null(LOG_METADATA, "destination", (void*) destination);
+
+    // The ordinary create mode; the umask narrows it, as it does for any new file.
+    Result const result = _file_copy_exclusive(source, destination, _FILE_CREATE_MODE);
+
+    trace_log_pop();
+
+    return result;
+}
+
+Result file_copy_2(Str const *const source, Str const *const destination) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "source", (void*) source);
+    error_check_null(LOG_METADATA, "destination", (void*) destination);
+
+    if (str_get_size(source) == 0 || str_get_size(destination) == 0) {
+        trace_log_pop();
+
+        return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_EMPTY_PATH, 0);
+    }
+
+    /* A NUL inside either Str is refused BEFORE the copy: char_new_3 copies all of it, but
+     * file_copy_1 reads only up to the first NUL, so "victim\0rest" would act on "victim" -
+     * an entry the caller never named, reported as a success. */
+    if (str_contains_2(source, "\0", 1) || str_contains_2(destination, "\0", 1)) {
+        trace_log_pop();
+
+        return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_EMBEDDED_NUL, 0);
+    }
+
+    char *const source_text      = char_new_3(str_get_data(source), str_get_size(source));
+    char *const destination_text = char_new_3(str_get_data(destination), str_get_size(destination));
+
+    /* The _1 below opens with error_check_null, which ABORTS - inside a family whose header
+     * promises it never aborts on an outcome. Each delete is guarded because the other
+     * allocation may have succeeded, and CFW's free aborts on nullptr. */
+    if (memory_empty(source_text) || memory_empty(destination_text)) {
+        if (!memory_empty(source_text)) {
+            char_delete(source_text);
+        }
+
+        if (!memory_empty(destination_text)) {
+            char_delete(destination_text);
+        }
+
+        trace_log_pop();
+
+        return result_make(RESULT_CATEGORY_MEMORY, 0, 0);
+    }
+
+    Result const result = file_copy_1(source_text, destination_text);
+
+    char_delete(source_text);
+    char_delete(destination_text);
+
+    trace_log_pop();
+
+    return result;
+}
+
+Result file_copy_3(String const *const source, String const *const destination) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "source", (void*) source);
+    error_check_null(LOG_METADATA, "destination", (void*) destination);
+
+    if (string_get_size(source) == 0 || string_get_size(destination) == 0) {
+        trace_log_pop();
+
+        return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_EMPTY_PATH, 0);
+    }
+
+    // Refused before the copy, for the reason file_copy_2 gives.
+    if (string_contains_2(source, "\0", 1) || string_contains_2(destination, "\0", 1)) {
+        trace_log_pop();
+
+        return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_EMBEDDED_NUL, 0);
+    }
+
+    char *const source_text      = char_new_3(string_get_data(source), string_get_size(source));
+    char *const destination_text = char_new_3(string_get_data(destination), string_get_size(destination));
+
+    /* The _1 below opens with error_check_null, which ABORTS - inside a family whose header
+     * promises it never aborts on an outcome. Each delete is guarded because the other
+     * allocation may have succeeded, and CFW's free aborts on nullptr. */
+    if (memory_empty(source_text) || memory_empty(destination_text)) {
+        if (!memory_empty(source_text)) {
+            char_delete(source_text);
+        }
+
+        if (!memory_empty(destination_text)) {
+            char_delete(destination_text);
+        }
+
+        trace_log_pop();
+
+        return result_make(RESULT_CATEGORY_MEMORY, 0, 0);
+    }
+
+    Result const result = file_copy_1(source_text, destination_text);
+
+    char_delete(source_text);
+    char_delete(destination_text);
+
+    trace_log_pop();
+
+    return result;
+}
+
+bool file_empty(File *const self) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+
+    trace_log_pop();
+
+    return file_get_size(self) == 0;
+}
+
+bool file_error(File *const self) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+
+    bool const failed = ferror(self) != 0;
+
+    trace_log_pop();
+
+    return failed;
+}
+
+bool file_exists_1(char const *const file_name) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
+
+    bool exists = false;
+
+    #ifdef __linux__
+    // Was `exists = true;` unconditionally, which reported every path as present
+    // - including paths that are not. Every caller guarding a read with this
+    // function was therefore unguarded on Linux.
+    struct stat info = DEFAULT_INITIALIZATION;
+
+    exists = stat(file_name, &info) == 0 && S_ISREG(info.st_mode);
+    #elif defined(_WIN32)
+    DWORD const attributes = GetFileAttributes((LPCSTR) file_name);
+
+    exists = (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY));
+    #endif
+
+    trace_log_pop();
+
+    return exists;
+}
+
+bool file_exists_2(Str const *const file_name) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
+
+    // An empty Str carries a nullptr buffer (str.h's EMPTY value), and char_new_3 aborts on a
+    // nullptr source - the abort primitive file_modified_2/_size_2 already refuse instead of.
+    if (str_get_size(file_name) == 0) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    /* A NUL inside the Str is refused BEFORE the copy: file_exists_1 would read only up to it
+     * and answer about "victim" for "victim\0rest", a path the caller never named. */
+    if (str_contains_2(file_name, "\0", 1)) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    char *const path_text = char_new_3(str_get_data(file_name), str_get_size(file_name));
+
+    bool const exists = file_exists_1(path_text);
+
+    char_delete(path_text);
+
+    trace_log_pop();
+
+    return exists;
+}
+
+bool file_exists_3(String const *const file_name) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
+
+    // See file_exists_2: an empty String's buffer is nullptr, which char_new_3 would abort on.
+    if (string_get_size(file_name) == 0) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    // Refused before the copy, for the reason file_exists_2 gives.
+    if (string_contains_2(file_name, "\0", 1)) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    char *const path_text = char_new_3(string_get_data(file_name), string_get_size(file_name));
+
+    bool const exists = file_exists_1(path_text);
+
+    char_delete(path_text);
+
+    trace_log_pop();
+
+    return exists;
+}
+
+char* file_extension(char const *const path) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "path", (void*) path);
+
+    char const *const base = file_basename(path);
+    char const *dot        = nullptr;
+
+    for (USize i = 0; base[i] != '\0'; i += 1) {
+        if (base[i] == '.' && i != 0) {
+            dot = &base[i + 1];
+        }
+    }
+
+    trace_log_pop();
+
+    return (char*) (!memory_empty((void*) dot) ? dot : "");
+}
+
+bool file_final_path_1(char const *const path, char *const buffer, USize const capacity) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "path", (void*) path);
+    error_check_null(LOG_METADATA, "buffer", (void*) buffer);
+
+    bool const found = _file_final_path(path, char_length(path), buffer, capacity);
+
+    trace_log_pop();
+
+    return found;
+}
+
+bool file_final_path_2(Str const *const path, char *const buffer, USize const capacity) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "path", (void*) path);
+    error_check_null(LOG_METADATA, "buffer", (void*) buffer);
+
+    // An empty Str carries a nullptr buffer: refused by value before it reaches the core's own
+    // pointer check, with no syscall.
+    if (str_get_size(path) == 0) {
+        if (capacity > 0) {
+            buffer[0] = '\0';
+        }
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    bool const found = _file_final_path(str_get_data(path), str_get_size(path), buffer, capacity);
+
+    trace_log_pop();
+
+    return found;
+}
+
+bool file_final_path_3(String const *const path, char *const buffer, USize const capacity) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "path", (void*) path);
+    error_check_null(LOG_METADATA, "buffer", (void*) buffer);
+
+    // See file_final_path_2.
+    if (string_get_size(path) == 0) {
+        if (capacity > 0) {
+            buffer[0] = '\0';
+        }
+
+        trace_log_pop();
+
+        return false;
+    }
+
+    bool const found = _file_final_path(string_get_data(path), string_get_size(path), buffer, capacity);
+
+    trace_log_pop();
+
+    return found;
+}
+
+bool file_flush(File *const self) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+
+    /* fflush is otherwise unreachable in-framework: callers that must know the
+     * bytes reached the OS (an upload endpoint answering 200) had to rely on
+     * fclose, which reports nothing. */
+    bool const flushed = fflush(self) == 0;
+
+    trace_log_pop();
+
+    return flushed;
+}
+
+bool file_get_final_path(File *const self, char *const buffer, USize const capacity) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+    error_check_null(LOG_METADATA, "buffer", (void*) buffer);
+
+    if (capacity == 0) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    bool found = false;
+#ifdef _WIN32
+    // The handle under the stream, asked directly: nothing is re-resolved by path.
+    HANDLE const handle = (HANDLE) _get_osfhandle(fileno(self));
+
+    if (handle != INVALID_HANDLE_VALUE) {
+        found = _file_final_path_wide(handle, buffer, capacity);
+    }
+#else
+    found = _file_final_path_descriptor((I32) fileno(self), buffer, capacity);
+#endif // _WIN32
+
+    if (!found) {
+        buffer[0] = '\0';
+    }
+
+    trace_log_pop();
+
+    return found;
+}
+
+bool file_get_modified(File *const self, I64 *const out) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+    error_check_null(LOG_METADATA, "out", (void*) out);
+
+    bool success = false;
+#ifdef _WIN32
+    HANDLE const handle = (HANDLE) _get_osfhandle(fileno(self));
+    FILETIME written    = DEFAULT_INITIALIZATION;
+
+    // Only the last-write slot is asked for, matching file_modified_1's ftLastWriteTime.
+    if (handle != INVALID_HANDLE_VALUE && GetFileTime(handle, nullptr, nullptr, &written)) {
+        *out    = _file_epoch_from_filetime(written);
+        success = true;
+    }
+#else
+    struct stat status = DEFAULT_INITIALIZATION;
+
+    if (fstat(fileno(self), &status) == 0) {
+        *out    = (I64) status.st_mtime;
+        success = true;
+    }
+#endif // _WIN32
+
+    trace_log_pop();
+
+    return success;
+}
+
+USize file_get_size(File *const self) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+
+    USize file_size = 0;
+#ifdef __linux__
+    /* fstat by HANDLE, not fseek/ftell: the seek pair moved the stream position
+     * (rewinding it to 0), so file_at's bound check silently reset the very
+     * position it was about to seek from, and a stat-less error turned ftell's
+     * -1 into a huge USize. This also removes the platform caveat the whole-file
+     * readers used to document. */
+    struct stat file_status = DEFAULT_INITIALIZATION;
+
+    /* The magnitude check runs BEFORE the narrowing cast: on a 32-bit target
+     * off_t outranges USize, and a >4 GiB file would otherwise wrap to a small
+     * size that sails through FILE_READ_BYTES_MAX. */
+    if (fstat(fileno(self), &file_status) == 0 && file_status.st_size > 0 && (U64) file_status.st_size <= (U64) USIZE_MAX) {
+        file_size = (USize) file_status.st_size;
+    }
+#elif defined(_WIN32)
+    HANDLE const handle = (HANDLE) _get_osfhandle(fileno(self));
+
+    // Into a LARGE_INTEGER and then assigned, never straight into file_size:
+    // GetFileSizeEx always writes 8 bytes, so casting a USize to
+    // PLARGE_INTEGER overwrites 4 bytes of stack past it on a 32-bit target.
+    LARGE_INTEGER size_info = DEFAULT_INITIALIZATION;
+
+    if (GetFileSizeEx(handle, &size_info)) {
+        file_size = (USize) size_info.QuadPart;
+    }
+#endif
+
+    trace_log_pop();
+
+    return file_size;
+}
+
+bool file_modified_1(char const *const file_name, I64 *const out) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
+    error_check_null(LOG_METADATA, "out", (void*) out);
+
+    bool success = false;
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA data = DEFAULT_INITIALIZATION;
+
+    if (GetFileAttributesExA((LPCSTR) file_name, GetFileExInfoStandard, &data)) {
+        *out    = _file_epoch_from_filetime(data.ftLastWriteTime);
+        success = true;
+    }
+#else
+    struct stat status = DEFAULT_INITIALIZATION;
+
+    if (stat(file_name, &status) == 0) {
+        *out = (I64) status.st_mtime;
+        success = true;
+    }
+#endif
+
+    trace_log_pop();
+
+    return success;
+}
+
+bool file_modified_2(Str const *const file_name, I64 *const out) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
+    error_check_null(LOG_METADATA, "out", (void*) out);
+
+    if (str_get_size(file_name) == 0) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    /* A NUL inside the Str is refused BEFORE the copy: file_modified_1 would read only up to it
+     * and answer about "victim" for "victim\0rest", a path the caller never named. */
+    if (str_contains_2(file_name, "\0", 1)) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    char *const path_text = char_new_3(str_get_data(file_name), str_get_size(file_name));
+
+    bool const success = file_modified_1(path_text, out);
+
+    char_delete(path_text);
+
+    trace_log_pop();
+
+    return success;
+}
+
+bool file_modified_3(String const *const file_name, I64 *const out) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
+    error_check_null(LOG_METADATA, "out", (void*) out);
+
+    if (string_get_size(file_name) == 0) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    // Refused before the copy, for the reason file_modified_2 gives.
+    if (string_contains_2(file_name, "\0", 1)) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    char *const path_text = char_new_3(string_get_data(file_name), string_get_size(file_name));
+
+    bool const success = file_modified_1(path_text, out);
+
+    char_delete(path_text);
+
+    trace_log_pop();
+
+    return success;
+}
+
+bool file_name_reserved_windows(char const *const name, USize const name_size) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "name", (void*) name);
+
+    /* The superscript-digit COM/LPT forms are not listed: the non-ASCII rule below answers them
+     * in both their single-byte ANSI and their UTF-8 spellings. */
+    static char const *const reserved[] = {
+        "AUX", "CLOCK$", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "CON", "CONIN$", "CONOUT$",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "NUL", "PRN"
+    };
+
+    /* Win32 strips trailing spaces and dots from a component before it looks the name up, so
+     * "nul " and "con." reach the device namespace exactly like "nul" and "con" do. Trim them
+     * first, then cut the stem at the first dot - or the first ':', since Win32 reads "CON:" and
+     * "CON::$DATA" as the device too (a stream name after a device name is ignored). */
+    USize trimmed_size = name_size;
+
+    while (trimmed_size > 0 && (name[trimmed_size - 1] == ' ' || name[trimmed_size - 1] == '.')) {
+        trimmed_size -= 1;
+    }
+
+    USize stem_size = trimmed_size;
+
+    for (USize i = 0; i < trimmed_size; i += 1) {
+        if (name[i] == '.' || name[i] == ':') {
+            stem_size = i;
+
+            break;
+        }
+    }
+
+    /* Win32 trims the stem too before its device check: "CONIN$ .txt" and "AUX .html" open the
+     * device exactly like "CONIN$.txt" and "AUX.html" do. */
+    while (stem_size > 0 && (name[stem_size - 1] == ' ' || name[stem_size - 1] == '.')) {
+        stem_size -= 1;
+    }
+
+    bool is_reserved = false;
+
+    for (USize i = 0; i < sizeof(reserved) / sizeof(reserved[0]); i += 1) {
+        if (char_compare_iequal_2(name, stem_size, reserved[i], char_length(reserved[i]))) {
+            is_reserved = true;
+
+            break;
+        }
+    }
+
+    /* COM or LPT followed only by bytes >= 0x80: the ANSI APIs read the single cp1252 byte
+     * 0xB9/0xB2/0xB3 as the superscript device digit, the wide APIs the UTF-8 pair. */
+    USize const stem = _FILE_DEVICE_DIGIT_STEM_SIZE;
+
+    if (!is_reserved && stem_size > stem && (char_compare_iequal_2(name, stem, "COM", stem) || char_compare_iequal_2(name, stem, "LPT", stem))) {
+        is_reserved = true;
+
+        for (USize i = stem; i < stem_size; i += 1) {
+            if ((U8) name[i] < _FILE_ASCII_END) {
+                is_reserved = false;
+
+                break;
+            }
+        }
+    }
+
+    trace_log_pop();
+
+    return is_reserved;
+}
+
+File* file_open_1(char const *const file_name, char const *const file_mode) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
+    error_check_null(LOG_METADATA, "file_mode", (void*) file_mode);
+
+    File *const file = file_open_try_1(file_name, file_mode);
+
+    error_check_null(LOG_METADATA, "file", (void*) file);
+
+    trace_log_pop();
+
+    return file;
+}
+
+File* file_open_2(Str const *const file_name, char const *const file_mode) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
+    error_check_null(LOG_METADATA, "file_mode", (void*) file_mode);
+
+    /* Through file_open_try_2, not file_open_1: an empty or embedded-NUL path is refused there
+     * BEFORE any open, in every build. The refusal then meets the check file_open_1 runs on a path
+     * that cannot be opened, so a checked build ends on it exactly as it does on a missing file. */
+    File *const file = file_open_try_2(file_name, file_mode);
+
+    error_check_null(LOG_METADATA, "file", (void*) file);
+
+    trace_log_pop();
+
+    return file;
+}
+
+File* file_open_3(String const *const file_name, char const *const file_mode) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
+    error_check_null(LOG_METADATA, "file_mode", (void*) file_mode);
+
+    // See file_open_2.
+    File *const file = file_open_try_3(file_name, file_mode);
+
+    error_check_null(LOG_METADATA, "file", (void*) file);
+
+    trace_log_pop();
+
+    return file;
+}
+
 File* file_open_nofollow_try_1(char const *const path) {
     trace_log_push(LOG_METADATA);
 
@@ -1926,7 +2328,7 @@ File* file_open_try_1(char const *const file_name, char const *const file_mode) 
     // CONTRACT (file.h): nothing may run between a failed fopen and the return
     // that could overwrite errno / GetLastError - callers classify the failure
     // from that state.
-    File *file = fopen(file_name, file_mode);
+    File *const file = fopen(file_name, file_mode);
 
     trace_log_pop();
 
@@ -1937,6 +2339,7 @@ File* file_open_try_2(Str const *const file_name, char const *const file_mode) {
     trace_log_push(LOG_METADATA);
 
     error_check_null(LOG_METADATA, "file_name", (void*) file_name);
+    error_check_null(LOG_METADATA, "file_mode", (void*) file_mode);
 
     // file_open_try_1 reports failure by nullptr rather than aborting; an empty Str's nullptr
     // buffer must degrade the same way, not reach file_open_1's own error_check_null on it.
@@ -1946,7 +2349,31 @@ File* file_open_try_2(Str const *const file_name, char const *const file_mode) {
         return nullptr;
     }
 
-    File *file = file_open_try_1(str_get_data(file_name), file_mode);
+    // Refused BEFORE the open, for the reason _file_open_refuse_embedded_nul gives.
+    if (str_contains_2(file_name, "\0", 1)) {
+        File *const refused = _file_open_refuse_embedded_nul();
+
+        trace_log_pop();
+
+        return refused;
+    }
+
+    /* Opened through a terminated COPY of exactly the named bytes, as file_exists_2 does: fopen
+     * reads to a terminator, so a VIEW of "victim.bak" sized 6 handed over directly would open -
+     * in a write mode create or truncate - "victim.bak", a file the caller never named. */
+    char *const path_text = char_new_3(str_get_data(file_name), str_get_size(file_name));
+
+    if (memory_empty((void*) path_text)) {
+        File *const refused = _file_open_refuse_unallocated();
+
+        trace_log_pop();
+
+        return refused;
+    }
+
+    File *const file = file_open_try_1(path_text, file_mode);
+
+    _file_open_path_delete(path_text);
 
     trace_log_pop();
 
@@ -1957,6 +2384,7 @@ File* file_open_try_3(String const *const file_name, char const *const file_mode
     trace_log_push(LOG_METADATA);
 
     error_check_null(LOG_METADATA, "file_name", (void*) file_name);
+    error_check_null(LOG_METADATA, "file_mode", (void*) file_mode);
 
     // See file_open_try_2.
     if (string_get_size(file_name) == 0) {
@@ -1965,7 +2393,29 @@ File* file_open_try_3(String const *const file_name, char const *const file_mode
         return nullptr;
     }
 
-    File *file = file_open_try_1(string_get_data(file_name), file_mode);
+    // See file_open_try_2.
+    if (string_contains_2(file_name, "\0", 1)) {
+        File *const refused = _file_open_refuse_embedded_nul();
+
+        trace_log_pop();
+
+        return refused;
+    }
+
+    // A terminated copy of exactly the named bytes - see file_open_try_2.
+    char *const path_text = char_new_3(string_get_data(file_name), string_get_size(file_name));
+
+    if (memory_empty((void*) path_text)) {
+        File *const refused = _file_open_refuse_unallocated();
+
+        trace_log_pop();
+
+        return refused;
+    }
+
+    File *const file = file_open_try_1(path_text, file_mode);
+
+    _file_open_path_delete(path_text);
 
     trace_log_pop();
 
@@ -1990,11 +2440,12 @@ File* file_open_wait_1(char const *const file_name, char const *const file_mode,
             if (attempts >= FILE_OPEN_WAIT_ATTEMPTS_MAX) {
                 break;
             }
+
             #ifdef __linux__
             // usleep, not sleep: the parameter is documented in milliseconds and
             // sleep takes SECONDS, so every caller waited a thousand times too
             // long - a 30 ms retry became half a minute.
-            usleep((useconds_t) ms * 1000);
+            usleep((useconds_t) ms * _FILE_MICROSECONDS_PER_MILLISECOND);
             #elif defined(_WIN32)
             Sleep(ms);
             #endif
@@ -2010,6 +2461,7 @@ File* file_open_wait_2(Str const *const file_name, char const *const file_mode, 
     trace_log_push(LOG_METADATA);
 
     error_check_null(LOG_METADATA, "file_name", (void*) file_name);
+    error_check_null(LOG_METADATA, "file_mode", (void*) file_mode);
 
     // See file_open_try_2: file_open_wait_1 now routes through file_open_try_1, so it
     // inherits the same reports-failure-not-abort contract on an empty container.
@@ -2019,7 +2471,29 @@ File* file_open_wait_2(Str const *const file_name, char const *const file_mode, 
         return nullptr;
     }
 
-    File *file = file_open_wait_1(str_get_data(file_name), file_mode, ms);
+    // Refused once, up front: no retry can make the name the caller passed.
+    if (str_contains_2(file_name, "\0", 1)) {
+        File *const refused = _file_open_refuse_embedded_nul();
+
+        trace_log_pop();
+
+        return refused;
+    }
+
+    // A terminated copy of exactly the named bytes - see file_open_try_2.
+    char *const path_text = char_new_3(str_get_data(file_name), str_get_size(file_name));
+
+    if (memory_empty((void*) path_text)) {
+        File *const refused = _file_open_refuse_unallocated();
+
+        trace_log_pop();
+
+        return refused;
+    }
+
+    File *const file = file_open_wait_1(path_text, file_mode, ms);
+
+    _file_open_path_delete(path_text);
 
     trace_log_pop();
 
@@ -2030,6 +2504,7 @@ File* file_open_wait_3(String const *const file_name, char const *const file_mod
     trace_log_push(LOG_METADATA);
 
     error_check_null(LOG_METADATA, "file_name", (void*) file_name);
+    error_check_null(LOG_METADATA, "file_mode", (void*) file_mode);
 
     // See file_open_try_2.
     if (string_get_size(file_name) == 0) {
@@ -2038,56 +2513,33 @@ File* file_open_wait_3(String const *const file_name, char const *const file_mod
         return nullptr;
     }
 
-    File *file = file_open_wait_1(string_get_data(file_name), file_mode, ms);
+    // See file_open_wait_2.
+    if (string_contains_2(file_name, "\0", 1)) {
+        File *const refused = _file_open_refuse_embedded_nul();
+
+        trace_log_pop();
+
+        return refused;
+    }
+
+    // A terminated copy of exactly the named bytes - see file_open_try_2.
+    char *const path_text = char_new_3(string_get_data(file_name), string_get_size(file_name));
+
+    if (memory_empty((void*) path_text)) {
+        File *const refused = _file_open_refuse_unallocated();
+
+        trace_log_pop();
+
+        return refused;
+    }
+
+    File *const file = file_open_wait_1(path_text, file_mode, ms);
+
+    _file_open_path_delete(path_text);
 
     trace_log_pop();
 
     return file;
-}
-
-/*
- * Whether one path component has the shape of an NTFS 8.3 short alias: a stem (the bytes before
- * the first '.') of at most 8 bytes holding '~' followed by an ASCII digit, an extension of at
- * most 3 bytes after that dot, and no space anywhere. Narrower than "contains ~digit": a stem
- * longer than 8 bytes or an extension longer than 3 can never be a short name, so a long name
- * like "my-report~2.pdf" is not refused for looking like one.
- */
-static bool _file_component_short_name_shaped(char const *const component, USize const component_size) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "component", (void*) component);
-
-    USize stem_size = component_size;
-
-    for (USize i = 0; i < component_size; i += 1) {
-        if (component[i] == ' ') {
-            trace_log_pop();
-
-            return false;
-        }
-
-        if (component[i] == '.' && stem_size == component_size) {
-            stem_size = i;
-        }
-    }
-
-    USize const extension_size = stem_size < component_size ? component_size - stem_size - 1 : 0;
-
-    bool shaped = false;
-
-    if (stem_size <= 8 && extension_size <= 3) {
-        for (USize i = 0; i + 1 < stem_size; i += 1) {
-            if (component[i] == '~' && char_is_number(component[i + 1])) {
-                shaped = true;
-
-                break;
-            }
-        }
-    }
-
-    trace_log_pop();
-
-    return shaped;
 }
 
 bool file_path_aliased_windows(char const *const path, USize const path_size) {
@@ -2129,6 +2581,18 @@ bool file_path_aliased_windows(char const *const path, USize const path_size) {
     trace_log_pop();
 
     return refused;
+}
+
+bool file_path_trimmed_windows(char const *const path) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "path", (void*) path);
+
+    bool const trimmed = _file_path_trimmed_windows(path, char_length(path));
+
+    trace_log_pop();
+
+    return trimmed;
 }
 
 USize file_read_1(File *const self, void *const data, USize const data_size, USize const data_count) {
@@ -2176,6 +2640,9 @@ void file_read_2(File *const self, Str *const data, USize const data_count) {
 
 void file_read_3(File *const self, String *const data) {
     trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "self", (void*) self);
+    error_check_null(LOG_METADATA, "data", (void*) data);
 
     file_read_4(self, data, string_get_capacity(data));
 
@@ -2264,12 +2731,44 @@ char* file_read_to_char(char const *const file_name) {
     return file_buffer;
 }
 
+char* file_read_to_char_wait(char const *const file_name, U32 const ms) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
+
+    File *file = file_open_wait_1(file_name, "r", ms);
+
+    char *const file_buffer = _file_read_to_raw(file);
+
+    _file_close_try(&file);
+
+    trace_log_pop();
+
+    return file_buffer;
+}
+
 Str file_read_to_str(char const *const file_name) {
     trace_log_push(LOG_METADATA);
 
     error_check_null(LOG_METADATA, "file_name", (void*) file_name);
 
     File *file = file_open_try_1(file_name, "r");
+
+    Str const file_buffer = _file_read_to_str(file);
+
+    _file_close_try(&file);
+
+    trace_log_pop();
+
+    return file_buffer;
+}
+
+Str file_read_to_str_wait(char const *const file_name, U32 const ms) {
+    trace_log_push(LOG_METADATA);
+
+    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
+
+    File *file = file_open_wait_1(file_name, "r", ms);
 
     Str const file_buffer = _file_read_to_str(file);
 
@@ -2288,38 +2787,6 @@ String file_read_to_string(char const *const file_name) {
     File *file = file_open_try_1(file_name, "r");
 
     String const file_buffer = _file_read_to(file);
-
-    _file_close_try(&file);
-
-    trace_log_pop();
-
-    return file_buffer;
-}
-
-char* file_read_to_char_wait(char const *const file_name, U32 const ms) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
-
-    File *file = file_open_wait_1(file_name, "r", ms);
-
-    char *const file_buffer = _file_read_to_raw(file);
-
-    _file_close_try(&file);
-
-    trace_log_pop();
-
-    return file_buffer;
-}
-
-Str file_read_to_str_wait(char const *const file_name, U32 const ms) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "file_name", (void*) file_name);
-
-    File *file = file_open_wait_1(file_name, "r", ms);
-
-    Str const file_buffer = _file_read_to_str(file);
 
     _file_close_try(&file);
 
@@ -2403,6 +2870,15 @@ Result file_remove_2(Str const *const path) {
         return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_EMPTY_PATH, 0);
     }
 
+    /* A NUL inside the Str is refused BEFORE the copy: char_new_3 copies all of it, but
+     * file_remove_1 reads only up to the first NUL, so "victim\0rest" would act on "victim" -
+     * an entry the caller never named, reported as a success. */
+    if (str_contains_2(path, "\0", 1)) {
+        trace_log_pop();
+
+        return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_EMBEDDED_NUL, 0);
+    }
+
     char *const path_text = char_new_3(str_get_data(path), str_get_size(path));
 
     /* The _1 below opens with error_check_null, which ABORTS - inside a family whose header
@@ -2433,6 +2909,13 @@ Result file_remove_3(String const *const path) {
         trace_log_pop();
 
         return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_EMPTY_PATH, 0);
+    }
+
+    // Refused before the copy, for the reason file_remove_2 gives.
+    if (string_contains_2(path, "\0", 1)) {
+        trace_log_pop();
+
+        return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_EMBEDDED_NUL, 0);
     }
 
     char *const path_text = char_new_3(string_get_data(path), string_get_size(path));
@@ -2515,6 +2998,15 @@ Result file_rename_2(Str const *const source, Str const *const destination) {
         return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_EMPTY_PATH, 0);
     }
 
+    /* A NUL inside either Str is refused BEFORE the copy: char_new_3 copies all of it, but
+     * file_rename_1 reads only up to the first NUL, so "victim\0rest" would act on "victim" -
+     * an entry the caller never named, reported as a success. */
+    if (str_contains_2(source, "\0", 1) || str_contains_2(destination, "\0", 1)) {
+        trace_log_pop();
+
+        return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_EMBEDDED_NUL, 0);
+    }
+
     char *const source_text      = char_new_3(str_get_data(source), str_get_size(source));
     char *const destination_text = char_new_3(str_get_data(destination), str_get_size(destination));
 
@@ -2557,6 +3049,13 @@ Result file_rename_3(String const *const source, String const *const destination
         return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_EMPTY_PATH, 0);
     }
 
+    // Refused before the copy, for the reason file_rename_2 gives.
+    if (string_contains_2(source, "\0", 1) || string_contains_2(destination, "\0", 1)) {
+        trace_log_pop();
+
+        return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_EMBEDDED_NUL, 0);
+    }
+
     char *const source_text      = char_new_3(string_get_data(source), string_get_size(source));
     char *const destination_text = char_new_3(string_get_data(destination), string_get_size(destination));
 
@@ -2585,86 +3084,6 @@ Result file_rename_3(String const *const source, String const *const destination
     trace_log_pop();
 
     return result;
-}
-
-/*
- * A path beside the destination (same directory, by construction - it is just the destination plus a
- * suffix), unique enough for one process's own use: the OS pid rules out collision with
- * another concurrently-replacing process, though not with a second file_replace_1 call
- * racing itself within this same process against the same destination (out of scope - CFW's
- * own callers are single-threaded per file per the module's Thread Safety contract).
- */
-static char* _file_replace_temp_path(char const *const destination, USize const attempt) {
-    trace_log_push(LOG_METADATA);
-
-    error_check_null(LOG_METADATA, "destination", (void*) destination);
-
-#ifdef _WIN32
-    USize const pid = (USize) GetCurrentProcessId();
-#else
-    USize const pid = (USize) getpid();
-#endif
-
-    char pid_text[_FILE_NUMBER_TEXT_MAX]     = DEFAULT_INITIALIZATION;
-    char attempt_text[_FILE_NUMBER_TEXT_MAX] = DEFAULT_INITIALIZATION;
-
-    char_from_numbers_uint_1(pid_text, sizeof(pid_text), pid);
-    char_from_numbers_uint_1(attempt_text, sizeof(attempt_text), attempt);
-
-    /* The pid alone was not enough. It rules out a COLLISION WITH ANOTHER PROCESS, which is
-     * the case the original comment considered - but not the cross-TIME case that actually
-     * bites: a killed run, or a recycled pid, leaves a stale temp behind, the exclusive
-     * create then refuses it, and file_replace_1 fails FOREVER for that destination while
-     * reporting "destination exists" about a hidden file the caller never named. The attempt
-     * counter walks past it, exactly as the trash module's name-claiming loop does. */
-    char const *const parts[] = { destination, ".tmp.", pid_text, ".", attempt_text };
-    char *const temp_path     = char_join_1(parts, 5, "");
-
-    trace_log_pop();
-
-    return temp_path;
-}
-
-/*
- * Carry the destination's existing permissions onto the temp that is about to become it.
- *
- * Without this, file_replace_1 SILENTLY RESET them: the temp is a fresh file created under
- * the umask, and the rename makes that fresh file the destination - so a 0600 secrets file
- * came back 0644 on a successful "replace the contents" call. Nothing in the contract hinted
- * that a success changes destination metadata, and a permission regression is not the kind
- * of surprise a caller finds quickly.
- *
- * Windows is a documented gap rather than a silent one: an explicit ACL on the destination
- * is replaced by fresh inheritance, which needs the security-descriptor APIs to carry over
- * and is out of this function's scope.
- */
-static void _file_replace_carry_mode(char const *const destination, char const *const temp_path) {
-    trace_log_push(LOG_METADATA);
-
-#ifdef __linux__
-    struct stat status = DEFAULT_INITIALIZATION;
-
-    if (stat(destination, &status) != 0) {
-        // Nothing to carry: a destination that does not exist yet has no mode to preserve.
-        trace_log_pop();
-
-        return;
-    }
-
-    /* Reported rather than swallowed. A failed stat is a legitimate "nothing to carry"; a
-     * failed chmod AFTER a successful stat is the permission regression this helper exists
-     * to prevent, and discarding its result reproduces exactly the silent surprise the
-     * function was added to stop. Not fatal - the CONTENT is correct, which is what the
-     * caller asked for. */
-    if (chmod(temp_path, status.st_mode & 07777) != 0) {
-        log_message_try_1(LOG_LEVEL_WARN, "file: replaced the file but could not carry its permissions across (%s)\n", destination);
-    }
-#else
-    (void) destination;
-    (void) temp_path;
-#endif
-
-    trace_log_pop();
 }
 
 Result file_replace_1(char const *const source, char const *const destination) {
@@ -2697,7 +3116,7 @@ Result file_replace_1(char const *const source, char const *const destination) {
          * directory for the whole duration of the copy, so anything broader is a window in
          * which another local user can open a secret and hold the descriptor across the
          * rename. The destination's real mode is carried over afterwards. */
-        Result const copied = _file_copy_exclusive(source, temp_path, 0600);
+        Result const copied = _file_copy_exclusive(source, temp_path, _FILE_TEMP_CREATE_MODE);
 
         if (file_result_is_exists(copied)) {
             // Someone else's temp, or our own from a previous life. Try the next name.
@@ -2751,6 +3170,15 @@ Result file_replace_2(Str const *const source, Str const *const destination) {
         return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_EMPTY_PATH, 0);
     }
 
+    /* A NUL inside either Str is refused BEFORE the copy: char_new_3 copies all of it, but
+     * file_replace_1 reads only up to the first NUL, so "victim\0rest" would act on "victim" -
+     * an entry the caller never named, reported as a success. */
+    if (str_contains_2(source, "\0", 1) || str_contains_2(destination, "\0", 1)) {
+        trace_log_pop();
+
+        return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_EMBEDDED_NUL, 0);
+    }
+
     char *const source_text      = char_new_3(str_get_data(source), str_get_size(source));
     char *const destination_text = char_new_3(str_get_data(destination), str_get_size(destination));
 
@@ -2793,6 +3221,13 @@ Result file_replace_3(String const *const source, String const *const destinatio
         return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_EMPTY_PATH, 0);
     }
 
+    // Refused before the copy, for the reason file_replace_2 gives.
+    if (string_contains_2(source, "\0", 1) || string_contains_2(destination, "\0", 1)) {
+        trace_log_pop();
+
+        return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_EMBEDDED_NUL, 0);
+    }
+
     char *const source_text      = char_new_3(string_get_data(source), string_get_size(source));
     char *const destination_text = char_new_3(string_get_data(destination), string_get_size(destination));
 
@@ -2822,27 +3257,6 @@ Result file_replace_3(String const *const source, String const *const destinatio
 
     return result;
 }
-
-/* The per-platform codes the three predicates below classify. Kept here, once, so no
- * consumer has to know them - the whole point of the predicates.
- *
- * MEASURED on this toolchain, and the reason these are not a simple code comparison:
- *   EEXIST = 17    ERROR_NOT_SAME_DEVICE = 17   <- THE SAME NUMBER
- *   ENOENT = 2     ERROR_FILE_NOT_FOUND  = 2    ERROR_PATH_NOT_FOUND = 3
- *   ERROR_FILE_EXISTS = 80   ERROR_ALREADY_EXISTS = 183
- *
- * So on Windows the code alone cannot separate "the destination exists" from "different
- * filesystem" - the natural `if (is_exists) ... else if (is_cross_device)` took the wrong
- * branch for every cross-device rename. The CATEGORY is what disambiguates: the STATE
- * spelling is file_copy_1's own refusal (which carries the C errno), and every other
- * spelling came from the OS - on Windows the copy path files _doserrno, the Win32 code the
- * CRT keeps beside errno, so every OS-shaped code in this family is Win32-shaped there.
- */
-#ifdef _WIN32
-#define _FILE_CODE_CROSS_DEVICE ERROR_NOT_SAME_DEVICE
-#else
-#define _FILE_CODE_CROSS_DEVICE EXDEV
-#endif
 
 bool file_result_is_cross_device(Result const result) {
     // Never a STATE (this module's own refusal, never an OS verdict - its EEXIST code is
@@ -2875,8 +3289,7 @@ bool file_result_is_exists(Result const result) {
 #ifdef _WIN32
     // ERROR_ALREADY_EXISTS as well as ERROR_FILE_EXISTS: MoveFileEx and CreateFile return
     // the former where the latter is the one people expect.
-    return result_code(result) == (U16) ERROR_FILE_EXISTS
-        || result_code(result) == (U16) ERROR_ALREADY_EXISTS;
+    return result_code(result) == (U16) ERROR_FILE_EXISTS || result_code(result) == (U16) ERROR_ALREADY_EXISTS;
 #else
     return result_code(result) == (U16) EEXIST;
 #endif
@@ -2890,7 +3303,10 @@ bool file_result_is_not_found(Result const result) {
     // equalled ERROR_PATH_NOT_FOUND, so this refusal read back as "the path is not there" - the
     // memsec HIGH this guard closed. The enum was also rebased to 0x8001+ as a second layer, but
     // this guard is what makes the predicate correct on its own.)
-    if (!result_is_error(result) || result_category(result) == RESULT_CATEGORY_ARGUMENT) {
+    // STATE is closed the same way: no module produces a STATE not-found - this one's STATE is
+    // its EEXIST refusal, and trash's STATE codes are refusals about the trash itself - so a STATE
+    // whose code happens to equal an OS not-found code is never "the path is not there".
+    if (!result_is_error(result) || result_category(result) == RESULT_CATEGORY_ARGUMENT || result_category(result) == RESULT_CATEGORY_STATE) {
         return false;
     }
 
@@ -2899,8 +3315,7 @@ bool file_result_is_not_found(Result const result) {
      * rename into a non-existent directory, a remove under a missing parent. Omitting it
      * made the predicate answer differently on the two platforms for the same situation,
      * which is worse than having no predicate: a caller stops checking. */
-    return result_code(result) == (U16) ERROR_FILE_NOT_FOUND
-        || result_code(result) == (U16) ERROR_PATH_NOT_FOUND;
+    return result_code(result) == (U16) ERROR_FILE_NOT_FOUND || result_code(result) == (U16) ERROR_PATH_NOT_FOUND;
 #else
     return result_code(result) == (U16) ENOENT;
 #endif
@@ -2908,10 +3323,9 @@ bool file_result_is_not_found(Result const result) {
 
 bool file_result_is_unaddressable(Result const result) {
     // The one ARGUMENT refusal with a remedy the caller can act on (the trash path still
-    // handles such a name); the other two codes in that category are plain call mistakes.
-    return result_is_error(result)
-        && result_category(result) == RESULT_CATEGORY_ARGUMENT
-        && result_code(result) == (U16) FILE_ARGUMENT_UNADDRESSABLE_PATH;
+    // handles such a name); the other codes in that category are plain call mistakes - an
+    // embedded NUL among them, which the trash path refuses too.
+    return result_is_error(result) && result_category(result) == RESULT_CATEGORY_ARGUMENT && result_code(result) == (U16) FILE_ARGUMENT_UNADDRESSABLE_PATH;
 }
 
 bool file_seek_try(File *const self, USize const index, File_Position const position) {
@@ -2977,15 +3391,14 @@ Result file_set_modified_1(char const *const path, I64 const seconds) {
          * attacker-reachable (these values come from file_modified_1), but it costs one
          * expression to be correct rather than lucky. */
         ULONGLONG const magnitude   = seconds < 0 ? ~(ULONGLONG) seconds + 1ULL : (ULONGLONG) seconds;
-        ULONGLONG const ticks       = seconds < 0
-            ? epoch_ticks - magnitude * _FILE_FILETIME_TICKS_PER_SECOND
-            : epoch_ticks + magnitude * _FILE_FILETIME_TICKS_PER_SECOND;
+        ULONGLONG const ticks       = seconds < 0 ? epoch_ticks - magnitude * _FILE_FILETIME_TICKS_PER_SECOND : epoch_ticks + magnitude * _FILE_FILETIME_TICKS_PER_SECOND;
 
         ULARGE_INTEGER value = DEFAULT_INITIALIZATION;
 
         value.QuadPart = ticks;
 
-        FILETIME filetime      = DEFAULT_INITIALIZATION;
+        FILETIME filetime = DEFAULT_INITIALIZATION;
+
         filetime.dwLowDateTime  = value.LowPart;
         filetime.dwHighDateTime = value.HighPart;
 
@@ -3033,6 +3446,15 @@ Result file_set_modified_2(Str const *const path, I64 const seconds) {
         return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_EMPTY_PATH, 0);
     }
 
+    /* A NUL inside the Str is refused BEFORE the copy: char_new_3 copies all of it, but
+     * file_set_modified_1 reads only up to the first NUL, so "victim\0rest" would act on "victim" -
+     * an entry the caller never named, reported as a success. */
+    if (str_contains_2(path, "\0", 1)) {
+        trace_log_pop();
+
+        return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_EMBEDDED_NUL, 0);
+    }
+
     char *const path_text = char_new_3(str_get_data(path), str_get_size(path));
 
     if (memory_empty(path_text)) {
@@ -3059,6 +3481,13 @@ Result file_set_modified_3(String const *const path, I64 const seconds) {
         trace_log_pop();
 
         return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_EMPTY_PATH, 0);
+    }
+
+    // Refused before the copy, for the reason file_set_modified_2 gives.
+    if (string_contains_2(path, "\0", 1)) {
+        trace_log_pop();
+
+        return result_make(RESULT_CATEGORY_ARGUMENT, FILE_ARGUMENT_EMBEDDED_NUL, 0);
     }
 
     char *const path_text = char_new_3(string_get_data(path), string_get_size(path));
@@ -3118,6 +3547,14 @@ bool file_size_2(Str const *const file_name, USize *const out) {
         return false;
     }
 
+    /* A NUL inside the Str is refused BEFORE the copy: file_size_1 would read only up to it
+     * and answer about "victim" for "victim\0rest", a path the caller never named. */
+    if (str_contains_2(file_name, "\0", 1)) {
+        trace_log_pop();
+
+        return false;
+    }
+
     char *const path_text = char_new_3(str_get_data(file_name), str_get_size(file_name));
 
     bool const success = file_size_1(path_text, out);
@@ -3136,6 +3573,13 @@ bool file_size_3(String const *const file_name, USize *const out) {
     error_check_null(LOG_METADATA, "out", (void*) out);
 
     if (string_get_size(file_name) == 0) {
+        trace_log_pop();
+
+        return false;
+    }
+
+    // Refused before the copy, for the reason file_size_2 gives.
+    if (string_contains_2(file_name, "\0", 1)) {
         trace_log_pop();
 
         return false;
@@ -3185,6 +3629,7 @@ USize file_write_1(File *const self, void const *const data, USize const data_si
 USize file_write_2(File *const self, Str const *const data) {
     trace_log_push(LOG_METADATA);
 
+    error_check_null(LOG_METADATA, "self", (void*) self);
     error_check_null(LOG_METADATA, "data", (void*) data);
 
     USize const written = file_write_3(self, data, str_get_size(data));
@@ -3197,6 +3642,7 @@ USize file_write_2(File *const self, Str const *const data) {
 USize file_write_3(File *const self, Str const *const data, USize const data_count) {
     trace_log_push(LOG_METADATA);
 
+    error_check_null(LOG_METADATA, "self", (void*) self);
     error_check_null(LOG_METADATA, "data", (void*) data);
 
     /* An empty container writes nothing and returns 0 (see file_write_1). */
@@ -3210,6 +3656,7 @@ USize file_write_3(File *const self, Str const *const data, USize const data_cou
 USize file_write_4(File *const self, String const *const data) {
     trace_log_push(LOG_METADATA);
 
+    error_check_null(LOG_METADATA, "self", (void*) self);
     error_check_null(LOG_METADATA, "data", (void*) data);
 
     USize const written = file_write_5(self, data, string_get_size(data));
@@ -3222,6 +3669,7 @@ USize file_write_4(File *const self, String const *const data) {
 USize file_write_5(File *const self, String const *const data, USize const data_count) {
     trace_log_push(LOG_METADATA);
 
+    error_check_null(LOG_METADATA, "self", (void*) self);
     error_check_null(LOG_METADATA, "data", (void*) data);
 
     /* An empty container writes nothing and returns 0 (see file_write_1). */

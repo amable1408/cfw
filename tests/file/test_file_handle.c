@@ -1,5 +1,8 @@
 #ifdef _WIN32
 #include <platform/windows/windows.h>
+// FSCTL_SET_REPARSE_POINT and REPARSE_GUID_DATA_BUFFER, for the unprivileged reparse fixtures.
+// After the shim, which supplies the <windows.h> types <winioctl.h> is not self-contained without.
+#include <winioctl.h>
 #else
 #include <sys/stat.h>
 #include <unistd.h>
@@ -15,13 +18,6 @@
 #include <test/test.h>
 #include <thread/thread.h>
 #include <types.h>
-
-#ifdef _WIN32
-// FSCTL_SET_REPARSE_POINT and REPARSE_GUID_DATA_BUFFER, for the unprivileged reparse fixtures.
-// After the CFW block, not before it: <winioctl.h> is not self-contained - it needs the
-// <windows.h> types that arrive through <file/file.h>.
-#include <winioctl.h>
-#endif // _WIN32
 
 /* Coverage for the handle-first additions of file 0.6.0: file_open_nofollow_try_1/2/3,
  * file_final_path_1/2/3, file_get_final_path and file_get_modified - the four pieces a
@@ -53,6 +49,10 @@
 #define _DEVICE_POLL_MS 10
 // How long a device row's open may take before it counts as BLOCKED - an open that never returns.
 #define _DEVICE_WAIT_MS 10000
+// Seconds the nofollow FIFO row may block before SIGALRM ends the suite instead of hanging it.
+#define _FIFO_WATCHDOG_SECONDS 10
+// Bytes for a resolved final path the by-path and by-handle rows compare.
+#define _PATH_BUFFER_SIZE 1024
 // Bytes for a pipe's name or path: the longest, "\\localhost\pipe\cfw_nofollow_unc_" plus a 10-digit id, is 44 and a terminator.
 #define _PIPE_NAME_SIZE 64
 // How many opens the identity-pin race gets to land one swap: about one in twenty does.
@@ -60,6 +60,8 @@
 // Bytes _reads_content reads into: more than _CONTENT, so a longer file shows as a size mismatch.
 #define _READ_BUFFER_SIZE 64
 #define _ROOT "file_handle_fixture"
+// Bytes for the deliberately too-small final-path buffer: shorter than any resolved path.
+#define _SMALL_BUFFER_SIZE 4
 #ifdef _WIN32
 // Reparse tags no filter driver owns: a placeholder (not name-surrogate) and a name surrogate.
 #define _TAG_PLACEHOLDER 0x00000ABCUL
@@ -427,6 +429,39 @@ static void _test_nofollow_refusals(Test *const test) {
     test_expect_null(test, "a Str with an embedded NUL -> nullptr, not the shorter name", file);
     test_expect_i(test, "with the documented embedded-NUL code", embedded_null, error);
 
+#ifdef _WIN32
+    /* Sweep MATCH (2026-10-18): CreateFile2 trims a trailing '.' or ' ', so "plain.txt." opened
+     * plain.txt - a read-only twin the caller never named. plain.txt exists, so without the
+     * refusal each of these answers a live handle. */
+    file  = file_open_nofollow_try_1(_ROOT "/plain.txt.");
+    error = _last_error();
+
+    test_expect_null(test, "a trailing-dot spelling -> nullptr, not its trimmed twin", file);
+    test_expect_i(test, "with ERROR_INVALID_NAME", (I64) ERROR_INVALID_NAME, error);
+
+    _close_if_open(&file);
+
+    file  = file_open_nofollow_try_1(_ROOT "/plain.txt ");
+    error = _last_error();
+
+    test_expect_null(test, "a trailing-space spelling -> nullptr", file);
+    test_expect_i(test, "with ERROR_INVALID_NAME", (I64) ERROR_INVALID_NAME, error);
+
+    _close_if_open(&file);
+
+    // A trimmed MIDDLE component, through the sized Str form ("file_handle_fixture." -> the root).
+    char middle[]         = _ROOT "./plain.txt";
+    Str const middle_view = str_init_3(middle, CHAR_STATIC_SIZE(middle));
+
+    file  = file_open_nofollow_try_2(&middle_view);
+    error = _last_error();
+
+    test_expect_null(test, "a trimmed middle component (Str) -> nullptr", file);
+    test_expect_i(test, "with ERROR_INVALID_NAME", (I64) ERROR_INVALID_NAME, error);
+
+    _close_if_open(&file);
+#endif // _WIN32
+
     test_case_end(test);
 }
 
@@ -513,15 +548,15 @@ static void _test_nofollow_links(Test *const test) {
     test_expect_not_null(test, "through a linked ancestor the open succeeds", file);
 
     if (!memory_empty((void*) file)) {
-        char through[1024] = DEFAULT_INITIALIZATION;
-        char target[1024]  = DEFAULT_INITIALIZATION;
+        char through[_PATH_BUFFER_SIZE] = DEFAULT_INITIALIZATION;
+        char target[_PATH_BUFFER_SIZE]  = DEFAULT_INITIALIZATION;
 
         test_expect_true(test, "file_get_final_path answers", file_get_final_path(file, through, sizeof(through)));
         test_expect_true(test, "file_final_path_1 of the real path answers", file_final_path_1(_ROOT "/dir/inner.txt", target, sizeof(target)));
         test_expect_string(test, "the handle names the TARGET tree, not the link", target, through);
         test_expect_false(test, "and the link's own name is nowhere in it", char_find_exists_1(through, "dirlink"));
 
-        char by_path[1024] = DEFAULT_INITIALIZATION;
+        char by_path[_PATH_BUFFER_SIZE] = DEFAULT_INITIALIZATION;
 
         test_expect_true(test, "file_final_path_1 THROUGH the link answers", file_final_path_1(_ROOT "/dirlink/inner.txt", by_path, sizeof(by_path)));
         test_expect_string(test, "and resolves it to the same target path", target, by_path);
@@ -588,7 +623,7 @@ static void _test_nofollow_fifo(Test *const test) {
     if (test_expect_true(test, "the FIFO fixture is made", mkfifo(_ROOT "/fifo", 0600) == 0)) {
         // WATCHDOG: a regression that drops O_NONBLOCK blocks this open forever with no writer.
         // SIGALRM's default action ends the process, failing the suite instead of hanging it.
-        alarm(10);
+        alarm(_FIFO_WATCHDOG_SECONDS);
 
         File *const file = file_open_nofollow_try_1(_ROOT "/fifo");
         I64 const error  = _last_error();
@@ -716,7 +751,7 @@ static void _test_nofollow_encoding(Test *const test) {
     if (!memory_empty((void*) file)) {
         test_expect_true(test, "and reads the fixture", _reads_content(file));
 
-        char final_path[1024] = DEFAULT_INITIALIZATION;
+        char final_path[_PATH_BUFFER_SIZE] = DEFAULT_INITIALIZATION;
 
         test_expect_true(test, "file_get_final_path answers for it", file_get_final_path(file, final_path, sizeof(final_path)));
         test_expect_true(test, "and spells the name back in UTF-8", char_ends_with_1(final_path, "caf\xC3\xA9.txt"));
@@ -752,8 +787,8 @@ static void _test_nofollow_encoding(Test *const test) {
 static void _test_final_path(Test *const test) {
     test_case_begin(test, "file_final_path_1/2/3 and file_get_final_path: absolute, no \\\\?\\, never truncated");
 
-    char by_path[1024]   = DEFAULT_INITIALIZATION;
-    char by_handle[1024] = DEFAULT_INITIALIZATION;
+    char by_path[_PATH_BUFFER_SIZE]   = DEFAULT_INITIALIZATION;
+    char by_handle[_PATH_BUFFER_SIZE] = DEFAULT_INITIALIZATION;
 
     test_expect_true(test, "final_path_1 resolves a relative path", file_final_path_1(_ROOT "/plain.txt", by_path, sizeof(by_path)));
 #ifdef _WIN32
@@ -772,7 +807,7 @@ static void _test_final_path(Test *const test) {
         test_expect_true(test, "get_final_path answers", file_get_final_path(file, by_handle, sizeof(by_handle)));
         test_expect_string(test, "get_final_path == final_path_1 of the same plain path", by_path, by_handle);
 
-        char small[4] = { 'X', 'X', 'X', 'X' };
+        char small[_SMALL_BUFFER_SIZE] = { 'X', 'X', 'X', 'X' };
 
         test_expect_false(test, "get_final_path into 4 bytes -> false", file_get_final_path(file, small, sizeof(small)));
         test_expect_true(test, "and the buffer is EMPTY, not truncated", small[0] == '\0');
@@ -785,7 +820,7 @@ static void _test_final_path(Test *const test) {
 
     _close_if_open(&file);
 
-    char small[4] = { 'X', 'X', 'X', 'X' };
+    char small[_SMALL_BUFFER_SIZE] = { 'X', 'X', 'X', 'X' };
 
     test_expect_false(test, "final_path_1 into 4 bytes -> false", file_final_path_1(_ROOT "/plain.txt", small, sizeof(small)));
     test_expect_true(test, "and the buffer is EMPTY, not truncated", small[0] == '\0');
@@ -795,20 +830,20 @@ static void _test_final_path(Test *const test) {
     test_expect_false(test, "final_path_1 of a missing path -> false", file_final_path_1(_ROOT "/missing.txt", small, sizeof(small)));
     test_expect_true(test, "and the buffer is EMPTY", small[0] == '\0');
 
-    char directory[1024] = DEFAULT_INITIALIZATION;
+    char directory[_PATH_BUFFER_SIZE] = DEFAULT_INITIALIZATION;
 
     test_expect_true(test, "final_path_1 of a DIRECTORY answers (a root is asked this way)", file_final_path_1(_ROOT, directory, sizeof(directory)));
     test_expect_true(test, "and the file's final path lives under it", char_starts_with_1(by_path, directory));
 
-    char spelled[]    = _ROOT "/plain.txt" _TAIL;
-    Str const view    = str_init_3(spelled, CHAR_STATIC_SIZE(spelled) - CHAR_STATIC_SIZE(_TAIL));
-    char by_str[1024] = DEFAULT_INITIALIZATION;
+    char spelled[] = _ROOT "/plain.txt" _TAIL;
+    Str const view = str_init_3(spelled, CHAR_STATIC_SIZE(spelled) - CHAR_STATIC_SIZE(_TAIL));
+    char by_str[_PATH_BUFFER_SIZE] = DEFAULT_INITIALIZATION;
 
     test_expect_true(test, "final_path_2 honours the Str size", file_final_path_2(&view, by_str, sizeof(by_str)));
     test_expect_string(test, "final_path_2 == final_path_1", by_path, by_str);
 
-    String path_string   = string_init_static(_ROOT "/plain.txt", CHAR_STATIC_SIZE(_ROOT "/plain.txt"));
-    char by_string[1024] = DEFAULT_INITIALIZATION;
+    String path_string = string_init_static(_ROOT "/plain.txt", CHAR_STATIC_SIZE(_ROOT "/plain.txt"));
+    char by_string[_PATH_BUFFER_SIZE] = DEFAULT_INITIALIZATION;
 
     test_expect_true(test, "final_path_3 answers", file_final_path_3(&path_string, by_string, sizeof(by_string)));
     test_expect_string(test, "final_path_3 == final_path_1", by_path, by_string);
@@ -821,6 +856,23 @@ static void _test_final_path(Test *const test) {
 
     test_expect_false(test, "final_path_2 of an empty Str -> false", file_final_path_2(&empty_str, small, sizeof(small)));
     test_expect_true(test, "and the buffer is EMPTY", small[0] == '\0');
+
+#ifdef _WIN32
+    // Sweep MATCH (2026-10-18): the trimmed spelling resolved to plain.txt's final path.
+    char trimmed[_PATH_BUFFER_SIZE] = { 'X' };
+
+    test_expect_false(test, "final_path_1 of a trailing-dot spelling -> false, not the twin's path", file_final_path_1(_ROOT "/plain.txt.", trimmed, sizeof(trimmed)));
+    test_expect_i(test, "with ERROR_INVALID_NAME", (I64) ERROR_INVALID_NAME, _last_error());
+    test_expect_true(test, "and the buffer is EMPTY", trimmed[0] == '\0');
+
+    char spaced[]          = _ROOT "/plain.txt ";
+    Str const trimmed_view = str_init_3(spaced, CHAR_STATIC_SIZE(spaced));
+
+    trimmed[0] = 'X';
+
+    test_expect_false(test, "final_path_2 of a trailing-space spelling -> false", file_final_path_2(&trimmed_view, trimmed, sizeof(trimmed)));
+    test_expect_true(test, "and the buffer is EMPTY", trimmed[0] == '\0');
+#endif // _WIN32
 
     test_case_end(test);
 }
@@ -867,8 +919,7 @@ int main(void) {
 
     test_case_begin(&test, "fixture: a plain file, a directory, and a non-ASCII name");
 
-    bool const ready = test_expect_true(&test, "the scratch directory is entered", _enter_scratch()) &&
-        test_expect_true(&test, "the fixture tree is built", _fixture_setup());
+    bool const ready = test_expect_true(&test, "the scratch directory is entered", _enter_scratch()) && test_expect_true(&test, "the fixture tree is built", _fixture_setup());
 
     test_case_end(&test);
 

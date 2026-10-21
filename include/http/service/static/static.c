@@ -754,7 +754,7 @@ static bool _http_service_static_resolve(HTTP_Service_Static const *const self,
      * a directory request appends. Opening one is the hazard ("CONIN$ .txt" blocks this thread),
      * so the refusal precedes the open. */
     {
-        char const *const   base_name   = file_basename_1(file_name);
+        char const *const   base_name   = file_basename(file_name);
         USize const         base_start  = (USize) (base_name - file_name);
 
         if (file_name_reserved_windows(file_name + base_start, file_name_size - base_start)) {

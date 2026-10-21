@@ -4,6 +4,7 @@
 #else
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #endif // _WIN32
 
@@ -88,7 +89,11 @@
 // Name buffers: every generated fixture name is shorter than this.
 #define _TEST_NAME_SIZE 64
 #define _TEST_PATH_SIZE 4096
+// Letters in the fixture pattern: 'a' through 'z'.
+#define _TEST_PATTERN_ALPHABET_SIZE 26
 #define _TEST_RAW_READER_INDEX 24
+// Bytes for the deliberately too-small final-path buffer: shorter than any resolved path.
+#define _TEST_TOO_SMALL_SIZE 4
 #define _TEST_TWIN_CAPACITY 1024
 
 /* Every case owns its block sizes, so a block leaked by one case cannot surface in another and
@@ -127,6 +132,8 @@
 #define _TEST_PROBE_PADDING 32
 #define _TEST_PROBE_REMOVE "probe_remove.txt"
 #define _TEST_PROBE_REPLACE_DESTINATION "probe_replace.txt"
+// An abort probe's runs: the unarmed control, then the armed child.
+#define _TEST_PROBE_RUN_COUNT 2
 #define _TEST_PROBE_SOURCE "probe_source.txt"
 #define _TEST_PROBE_TIMEOUT_MS 30000
 
@@ -432,8 +439,9 @@ static USize _window_live_any(Window const window) {
 
 static char _label_buffer[_TEST_LABEL_SIZE] = DEFAULT_INITIALIZATION;
 
-// "<row>: <what>" in one shared buffer - test_expect_* reports the name before it returns.
-static char const* _label(char const *const row, char const *const what) {
+/* "<row>: <what>" in one shared buffer - test_expect_* reports the name before it returns. The
+ * result is read-only to callers and valid until the next call. */
+static char* _label(char const *const row, char const *const what) {
     snprintf(_label_buffer, sizeof(_label_buffer), "%s: %s", row, what);
 
     return _label_buffer;
@@ -463,7 +471,7 @@ static void _name(char *const out, char const *const prefix, USize const length)
 
 // Byte i of a fixture seeded with SEED: printable, no CR or 0x1A, so text mode reads it verbatim.
 static char _pattern(USize const i, char const seed) {
-    return (char) ('a' + (USize) (seed + i) % 26);
+    return (char) ('a' + (USize) (seed + i) % _TEST_PATTERN_ALPHABET_SIZE);
 }
 
 static bool _fixture_write(char const *const path, USize const size, char const seed) {
@@ -629,7 +637,7 @@ static void _test_ledger_find_returns_the_newest_record(Test *const test) {
     // two writes bypass _ledger_record's capacity check, so they carry their own.
     USize const saved = _ledger_count;
     char        first = 0;
-    char        other = 0;
+    char const  other = 0;
 
     test_expect_true(test, "the ledger has room for the fabricated records", _ledger_count + 2 <= _TEST_LEDGER_CAPACITY);
 
@@ -697,10 +705,12 @@ static void _test_injector_fires(Test *const test) {
  * file_get_modified "abort only on a nullptr CONTRACT pointer ... nothing is allocated on any
  * path". Proved by refusing EVERY calloc for the whole block and requiring each call to answer
  * exactly as it would with memory available - success where the fixture is there, the
- * documented OS code where it is not - while the wrapper sees zero attempts. The try openers and
- * file_open_wait_1 ride along: they are pure CRT calls, and the by-path readers build on them. */
+ * documented OS code where it is not - while the wrapper sees zero attempts. file_open_try_1 and
+ * file_open_wait_1 ride along: they are pure CRT calls, and the by-path readers build on them.
+ * file_open_try_2/3 do NOT: they open a terminated copy of their sized path (0.7.5), so their
+ * refused copy is pinned in _test_open_path_copy_degrades instead. */
 static void _test_handle_first_family_allocates_nothing(Test *const test) {
-    test_case_begin(test, "the handle-first family and the try openers allocate nothing");
+    test_case_begin(test, "the handle-first family and the char* try openers allocate nothing");
 
     char const *const name = "handle_first.txt";
     char path_text[]       = "handle_first.txt";
@@ -715,14 +725,14 @@ static void _test_handle_first_family_allocates_nothing(Test *const test) {
 
     test_expect_true(test, "the by-path mtime is readable", file_modified_1(name, &expected_modified));
 
-    char final_by_handle[_TEST_PATH_SIZE] = DEFAULT_INITIALIZATION;
-    char final_by_path[_TEST_PATH_SIZE]   = DEFAULT_INITIALIZATION;
-    char final_by_str[_TEST_PATH_SIZE]    = DEFAULT_INITIALIZATION;
-    char final_by_string[_TEST_PATH_SIZE] = DEFAULT_INITIALIZATION;
-    char final_too_small[4]               = { 'z', 'z', 'z', '\0' };
-    I64 modified                          = 0;
-    USize const handles                   = _open_handles();
-    Window const window                   = _window_open();
+    char final_by_handle[_TEST_PATH_SIZE]      = DEFAULT_INITIALIZATION;
+    char final_by_path[_TEST_PATH_SIZE]        = DEFAULT_INITIALIZATION;
+    char final_by_str[_TEST_PATH_SIZE]         = DEFAULT_INITIALIZATION;
+    char final_by_string[_TEST_PATH_SIZE]      = DEFAULT_INITIALIZATION;
+    char final_too_small[_TEST_TOO_SMALL_SIZE] = { 'z', 'z', 'z', '\0' };
+    I64 modified                               = 0;
+    USize const handles                        = _open_handles();
+    Window const window                        = _window_open();
 
     _test_arm_any();
 
@@ -757,8 +767,6 @@ static void _test_handle_first_family_allocates_nothing(Test *const test) {
 #endif // _WIN32
 
     File *try_plain        = file_open_try_1(name, "rb");
-    File *try_str          = file_open_try_2(&path_str, "rb");
-    File *try_string       = file_open_try_3(&path_string, "rb");
     File *const try_absent = file_open_try_1("handle_first_missing.txt", "rb");
     int const try_error    = errno;
     File *waited           = file_open_wait_1(name, "rb", 1);
@@ -806,13 +814,11 @@ static void _test_handle_first_family_allocates_nothing(Test *const test) {
 #endif // _WIN32
 
     test_expect_true(test, "file_open_try_1 opened the fixture", !memory_empty((void*) try_plain));
-    test_expect_true(test, "file_open_try_2 opened the fixture", !memory_empty((void*) try_str));
-    test_expect_true(test, "file_open_try_3 opened the fixture", !memory_empty((void*) try_string));
     test_expect_true(test, "file_open_try_1 on a missing path answers nullptr", memory_empty((void*) try_absent));
     test_expect_u(test, "and keeps the open's own ENOENT", ENOENT, (USize) try_error);
     test_expect_true(test, "file_open_wait_1 opened the fixture", !memory_empty((void*) waited));
 
-    File **const opened[] = { &nofollow, &nofollow_str, &nofollow_string, &try_plain, &try_str, &try_string, &waited };
+    File **const opened[] = { &nofollow, &nofollow_str, &nofollow_string, &try_plain, &waited };
 
     for (USize i = 0; i < sizeof(opened) / sizeof(opened[0]); i += 1) {
         if (!memory_empty((void*) *opened[i])) {
@@ -1168,8 +1174,8 @@ static String _view_string(char *const name) {
  * @param sibling The other path's block size, or 0 when the call copies only one path.
  * @param intact  Whether the disk is exactly as before the call.
  */
-static void _wrapper_expect(Test *const test, char const *const row, Window const window, Result const result, USize const fired,
-    USize const handles, USize const armed, USize const sibling, bool const intact) {
+static void _wrapper_expect(
+    Test *const test, char const *const row, Window const window, Result const result, USize const fired, USize const handles, USize const armed, USize const sibling, bool const intact) {
     test_expect_u(test, _label(row, "the path copy was refused"), 1, fired);
     test_expect_u(test, _label(row, "the failure is RESULT_CATEGORY_MEMORY"), RESULT_CATEGORY_MEMORY, result_category(result));
     test_expect_true(test, _label(row, "the refused copy went through the aborting twin (production aborts here)"), _window_twin_saw(window, armed));
@@ -1446,6 +1452,113 @@ static void _test_wrapper_replace_degrades(Test *const test) {
     test_case_end(test);
 }
 
+/* file.h, Error Handling, AN EMBEDDED NUL IS REFUSED: file_open_2/3 refuse "<victim>\0x" inside
+ * file_open_try_2/3, BEFORE any open, and only then run file_open_1's check on the nullptr - the
+ * check that ends a checked process and is compiled out here. So this build is the one that sees
+ * the refusal itself: nullptr, and a write-mode open that created and truncated nothing. Before
+ * the guard both handed the Str's buffer to fopen, which stopped at the NUL and truncated the
+ * victim to nothing. */
+static void _test_open_embedded_nul_degrades(Test *const test) {
+    test_case_begin(test, "file_open_2/_3: an embedded-NUL path opens nothing (unchecked: nullptr)");
+
+    char const *const victim = "open_nul_victim.txt";
+    // "<victim>\0x": the NUL sits inside the size, so a sized check sees it and fopen would not.
+    char named[]        = "open_nul_victim.txt\0x";
+    Str const view      = str_init_3(named, CHAR_STATIC_SIZE(named));
+    String const buffer = string_init_4(named, CHAR_STATIC_SIZE(named));
+
+    test_expect_true(test, "the victim is written", _fixture_write(victim, _TEST_CONTENT_WRAPPER, 'v'));
+
+    File *opened_str    = file_open_2(&view, "wb");
+    File *opened_string = file_open_3(&buffer, "wb");
+
+    test_expect_true(test, "file_open_2 answers nullptr, not a handle on the victim", memory_empty((void*) opened_str));
+    test_expect_true(test, "file_open_3 answers nullptr, not a handle on the victim", memory_empty((void*) opened_string));
+
+    File **const opened[] = { &opened_str, &opened_string };
+
+    for (USize i = 0; i < sizeof(opened) / sizeof(opened[0]); i += 1) {
+        if (!memory_empty((void*) *opened[i])) {
+            file_close(opened[i]);
+        }
+    }
+
+    test_expect_true(test, "and the write-mode open truncated nothing", _fixture_matches(victim, _TEST_CONTENT_WRAPPER, 'v'));
+
+    remove(victim);
+
+    test_case_end(test);
+}
+
+/* file.h, Error Handling, A SIZED PATH OPENS EXACTLY ITS SIZE: file_open_try_2/3 and
+ * file_open_wait_2/3 hand fopen a terminated char_new_3 copy of the named bytes. With every calloc
+ * refused that copy cannot be made - an abort in a checked build, and here a by-value refusal:
+ * nullptr with ENOMEM, a write-mode open that created nothing, and no allocation left live. */
+static void _test_open_path_copy_degrades(Test *const test) {
+    test_case_begin(test, "file_open_try_2/_3, file_open_wait_2/_3: a refused path copy opens nothing (ENOMEM)");
+
+    char const *const absent = "open_copy_absent.txt";
+    char named[]             = "open_copy_absent.txt";
+    Str const view           = str_init_3(named, CHAR_STATIC_SIZE(named));
+    String const buffer      = string_init_4(named, CHAR_STATIC_SIZE(named));
+
+    remove(absent);
+
+    Window const window = _window_open();
+
+    _test_arm_any();
+
+    errno = 0;
+
+    File *try_str           = file_open_try_2(&view, "wb");
+    int const try_str_error = errno;
+
+    errno = 0;
+
+    File *try_string           = file_open_try_3(&buffer, "wb");
+    int const try_string_error = errno;
+
+    errno = 0;
+
+    File *wait_str           = file_open_wait_2(&view, "wb", 1);
+    int const wait_str_error = errno;
+
+    errno = 0;
+
+    File *wait_string           = file_open_wait_3(&buffer, "wb", 1);
+    int const wait_string_error = errno;
+
+    // Captured BEFORE the disarm, which zeroes it.
+    USize const refused = _fail_refused;
+
+    _test_disarm();
+
+    test_expect_true(test, "the injector refused the path copies", refused >= 4);
+    test_expect_true(test, "file_open_try_2 answers nullptr", memory_empty((void*) try_str));
+    test_expect_true(test, "file_open_try_3 answers nullptr", memory_empty((void*) try_string));
+    test_expect_true(test, "file_open_wait_2 answers nullptr", memory_empty((void*) wait_str));
+    test_expect_true(test, "file_open_wait_3 answers nullptr", memory_empty((void*) wait_string));
+    test_expect_u(test, "file_open_try_2 reports ENOMEM", ENOMEM, (USize) try_str_error);
+    test_expect_u(test, "file_open_try_3 reports ENOMEM", ENOMEM, (USize) try_string_error);
+    test_expect_u(test, "file_open_wait_2 reports ENOMEM", ENOMEM, (USize) wait_str_error);
+    test_expect_u(test, "file_open_wait_3 reports ENOMEM", ENOMEM, (USize) wait_string_error);
+
+    File **const opened[] = { &try_str, &try_string, &wait_str, &wait_string };
+
+    for (USize i = 0; i < sizeof(opened) / sizeof(opened[0]); i += 1) {
+        if (!memory_empty((void*) *opened[i])) {
+            file_close(opened[i]);
+        }
+    }
+
+    test_expect_false(test, "and the write-mode opens created nothing", _present(absent));
+    test_expect_u(test, "nothing the openers touched is left live", 0, _window_live_any(window));
+
+    remove(absent);
+
+    test_case_end(test);
+}
+
 /*==============================================================================
  * MARK: - Cases: documented abort contracts
  *============================================================================*/
@@ -1619,9 +1732,9 @@ static ProbeRow const _probes[] = {
  * exit 0 - the site is reachable and healthy - so the armed child's SIGABRT is attributable to
  * the refused allocation reaching the aborting twin, not to anything else on the path. */
 static void _probe_expect_abort(Test *const test, ProbeRow const *const row) {
-    int statuses[2] = { -1, -1 };
+    int statuses[_TEST_PROBE_RUN_COUNT] = { -1, -1 };
 
-    for (USize armed = 0; armed < 2; armed += 1) {
+    for (USize armed = 0; armed < _TEST_PROBE_RUN_COUNT; armed += 1) {
         // Flushed so the child cannot replay the parent's buffered transcript on its way out.
         fflush(nullptr);
 
@@ -1661,10 +1774,10 @@ static void _probe_expect_abort(Test *const test, ProbeRow const *const row, USi
         return;
     }
 
-    ProcessOutcome outcomes[2] = DEFAULT_INITIALIZATION;
-    Result results[2]          = DEFAULT_INITIALIZATION;
+    ProcessOutcome outcomes[_TEST_PROBE_RUN_COUNT] = DEFAULT_INITIALIZATION;
+    Result results[_TEST_PROBE_RUN_COUNT]          = DEFAULT_INITIALIZATION;
 
-    for (USize armed = 0; armed < 2; armed += 1) {
+    for (USize armed = 0; armed < _TEST_PROBE_RUN_COUNT; armed += 1) {
         char const *const argv[] = { self_path, _TEST_PROBE_ARGUMENT, row_text, armed == 1 ? "1" : "0", nullptr };
         // stderr discarded: the runtime's abort message is not the transcript's business.
         ProcessSpec const spec = { .argv = argv, .stderr_mode = PROCESS_STDERR_DISCARD, .timeout_milliseconds = _TEST_PROBE_TIMEOUT_MS };
@@ -1819,6 +1932,8 @@ int main(int argc, char **argv) {
         _test_wrapper_rename_degrades(&test);
         _test_wrapper_remove_and_set_modified_degrade(&test);
         _test_wrapper_replace_degrades(&test);
+        _test_open_embedded_nul_degrades(&test);
+        _test_open_path_copy_degrades(&test);
         test_section_end(&test);
 
         test_section_begin(&test, "unrecoverable out of memory (abort contracts)");

@@ -1,9 +1,3 @@
-#include <test/test.h>
-
-#include <container/str/str.h>
-#include <container/string/string.h>
-#include <file/file.h>
-
 #ifdef __linux__
 #include <signal.h>
 #include <sys/resource.h>
@@ -11,8 +5,40 @@
 #include <unistd.h>
 #endif
 
+#include <container/str/str.h>
+#include <container/string/string.h>
+#include <file/file.h>
+#include <test/test.h>
+
 /* Coverage for the by-path management primitives added for the porto/purgo project:
  * file_copy_*, file_replace_*, file_remove_*, file_rename_*, file_set_modified_*. */
+
+/*==============================================================================
+ * MARK: - Macros and Constants
+ *============================================================================*/
+
+// Size of the 128 KiB source the mid-copy failure case writes, far past the size limit below.
+#define _TEST_BIG_SOURCE_SIZE (128 * 1024)
+// Bytes the directory-read probe asks for: any non-zero count provokes the read error.
+#define _TEST_DIRECTORY_READ_SIZE 16
+// The 8 KiB RLIMIT_FSIZE cap the mid-copy failure case writes under.
+#define _TEST_FILE_SIZE_LIMIT (8 * 1024)
+// Room for "<victim>\0<tail>" in the embedded-NUL case: both halves plus the NUL, with slack.
+#define _TEST_NUL_PATH_SIZE 64
+// A distinctive mtime the embedded-NUL case pins on its victim, so a stray set_modified shows.
+#define _TEST_NUL_VICTIM_MTIME 1000000000
+
+#ifdef _WIN32
+#define _TEST_VERBATIM_CAPACITY 1024
+// Length of the "\\?\" prefix, and the bytes a spelling adds to the cwd and name: that prefix,
+// the separator before the name, and the terminator.
+#define _TEST_VERBATIM_EXTRA_SIZE (_TEST_VERBATIM_PREFIX_SIZE + 1 + CHAR_END_CHARACTER)
+#define _TEST_VERBATIM_PREFIX_SIZE 4
+#endif // _WIN32
+
+/*==============================================================================
+ * MARK: - Static/Internal Functions
+ *============================================================================*/
 
 static void _write_file(char const *const path, char const *const content) {
     FILE *const handle = fopen(path, "wb");
@@ -25,32 +51,195 @@ static void _write_file(char const *const path, char const *const content) {
     }
 }
 
+/* Pin one refused opener call: nullptr, with the documented EINVAL read before anything else can
+ * move errno - and, should a regression hand back a handle, that handle closed, so the rows after
+ * it and the teardown still see the disk. errno is cleared on the way out, so each row's EINVAL
+ * is its own call's and never one a row before it left behind (the caller clears it for the
+ * first). */
+static void _expect_open_refused(Test *const test, char const *const label, File *file) {
+    int const error = errno;
+
+    test_expect_null(test, label, file);
+    test_expect_i(test, "and errno is EINVAL, a bad name", EINVAL, error);
+
+    if (!memory_empty((void*) file)) {
+        file_close(&file);
+    }
+
+    errno = 0;
+}
+
+#ifdef _WIN32
+/* The "\\?\" absolute spelling of a cwd-relative ASCII name - the one spelling Win32 does not
+ * trim - so the fixture can create "keep." beside "keep" and inspect each on its own. '/'
+ * becomes '\': a verbatim path takes no forward slashes. */
+static bool _verbatim_wide(char const *const name, WCHAR *const out) {
+    out[0] = L'\\';
+    out[1] = L'\\';
+    out[2] = L'?';
+    out[3] = L'\\';
+
+    DWORD const cwd_size  = GetCurrentDirectoryW(_TEST_VERBATIM_CAPACITY - _TEST_VERBATIM_PREFIX_SIZE, out + _TEST_VERBATIM_PREFIX_SIZE);
+    USize const name_size = char_length(name);
+
+    if (cwd_size == 0 || (USize) cwd_size + name_size + _TEST_VERBATIM_EXTRA_SIZE > _TEST_VERBATIM_CAPACITY) {
+        out[0] = L'\0';
+
+        return false;
+    }
+
+    USize const base = _TEST_VERBATIM_PREFIX_SIZE + (USize) cwd_size;
+
+    out[base] = L'\\';
+
+    for (USize i = 0; i < name_size; i += 1) {
+        out[base + 1 + i] = name[i] == '/' ? L'\\' : (WCHAR) (U8) name[i];
+    }
+
+    out[base + 1 + name_size] = L'\0';
+
+    return true;
+}
+
+// The same verbatim spelling, narrow, for handing to the API under test itself.
+static bool _verbatim_narrow(char const *const name, char *const out) {
+    out[0] = '\\';
+    out[1] = '\\';
+    out[2] = '?';
+    out[3] = '\\';
+
+    DWORD const cwd_size  = GetCurrentDirectoryA(_TEST_VERBATIM_CAPACITY - _TEST_VERBATIM_PREFIX_SIZE, out + _TEST_VERBATIM_PREFIX_SIZE);
+    USize const name_size = char_length(name);
+
+    if (cwd_size == 0 || (USize) cwd_size + name_size + _TEST_VERBATIM_EXTRA_SIZE > _TEST_VERBATIM_CAPACITY) {
+        out[0] = '\0';
+
+        return false;
+    }
+
+    USize const base = _TEST_VERBATIM_PREFIX_SIZE + (USize) cwd_size;
+
+    out[base] = '\\';
+
+    for (USize i = 0; i < name_size; i += 1) {
+        out[base + 1 + i] = name[i] == '/' ? '\\' : name[i];
+    }
+
+    out[base + 1 + name_size] = '\0';
+
+    return true;
+}
+
+static bool _verbatim_create_file(char const *const name, char const *const content) {
+    WCHAR wide[_TEST_VERBATIM_CAPACITY] = DEFAULT_INITIALIZATION;
+
+    if (!_verbatim_wide(name, wide)) {
+        return false;
+    }
+
+    HANDLE const handle = CreateFileW(wide, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+    if (handle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    DWORD const size = (DWORD) char_length(content);
+    DWORD written    = 0;
+    bool const wrote = WriteFile(handle, content, size, &written, nullptr) != 0 && written == size;
+
+    CloseHandle(handle);
+
+    return wrote;
+}
+
+static bool _verbatim_create_directory(char const *const name) {
+    WCHAR wide[_TEST_VERBATIM_CAPACITY] = DEFAULT_INITIALIZATION;
+
+    return _verbatim_wide(name, wide) && (CreateDirectoryW(wide, nullptr) != 0 || GetLastError() == ERROR_ALREADY_EXISTS);
+}
+
+static bool _verbatim_exists(char const *const name) {
+    WCHAR wide[_TEST_VERBATIM_CAPACITY] = DEFAULT_INITIALIZATION;
+
+    return _verbatim_wide(name, wide) && GetFileAttributesW(wide) != INVALID_FILE_ATTRIBUTES;
+}
+
+// The byte size of the named file, or USIZE_MAX when it cannot be read.
+static USize _verbatim_size(char const *const name) {
+    WCHAR wide[_TEST_VERBATIM_CAPACITY]  = DEFAULT_INITIALIZATION;
+    WIN32_FILE_ATTRIBUTE_DATA attributes = DEFAULT_INITIALIZATION;
+
+    if (!_verbatim_wide(name, wide) || GetFileAttributesExW(wide, GetFileExInfoStandard, &attributes) == 0) {
+        return USIZE_MAX;
+    }
+
+    return (USize) attributes.nFileSizeLow;
+}
+
+static void _verbatim_remove(char const *const name) {
+    WCHAR wide[_TEST_VERBATIM_CAPACITY] = DEFAULT_INITIALIZATION;
+
+    if (!_verbatim_wide(name, wide)) {
+        return;
+    }
+
+    DWORD const attributes = GetFileAttributesW(wide);
+
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        return;
+    }
+
+    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        RemoveDirectoryW(wide);
+    }
+    else {
+        DeleteFileW(wide);
+    }
+}
+
+// Children before parents, so a removal never meets a populated directory.
+static void _trimmed_fixture_cleanup(void) {
+    char const *const names[] = {
+        "trim_keep", "trim_keep.", "trim_keep ", "trim_source", "trim_moved", "trim_new", "trim_new.",
+        "trim_sub/inner", "trim_sub./inner", "trim_sub", "trim_sub.", "trim_dot_segment.tmp"
+    };
+
+    for (USize i = 0; i < sizeof(names) / sizeof(names[0]); i += 1) {
+        _verbatim_remove(names[i]);
+    }
+}
+#endif // _WIN32
+
+/*==============================================================================
+ * MARK: - Test Cases
+ *============================================================================*/
+
 static void _test_copy(Test *const test) {
     test_case_begin(test, "file_copy_1: success, refuses existing destination, missing source");
 
-    char const *const src = "file_copy_src.tmp";
-    char const *const dst = "file_copy_dst.tmp";
+    char const *const source = "file_copy_src.tmp";
+    char const *const destination = "file_copy_dst.tmp";
 
-    remove(src);
-    remove(dst);
+    remove(source);
+    remove(destination);
 
-    _write_file(src, "hello copy");
+    _write_file(source, "hello copy");
 
-    Result const copied = file_copy_1(src, dst);
+    Result const copied = file_copy_1(source, destination);
 
     test_expect_true(test, "copy succeeds", result_is_success(copied));
 
-    char *const dst_content = file_read_to_char(dst);
+    char *const destination_content = file_read_to_char(destination);
 
-    test_expect_string(test, "destination content matches", "hello copy", dst_content);
-    memory_free(dst_content);
+    test_expect_string(test, "destination content matches", "hello copy", destination_content);
+    memory_free(destination_content);
 
-    Result const overwrite = file_copy_1(src, dst);
+    Result const overwrite = file_copy_1(source, destination);
 
     test_expect_true(test, "refuses existing destination", result_is_error(overwrite));
     test_expect_true(test, "existing-destination category is STATE", result_category(overwrite) == RESULT_CATEGORY_STATE);
 
-    char *const kept = file_read_to_char(dst);
+    char *const kept = file_read_to_char(destination);
 
     test_expect_string(test, "AND THE REFUSAL PRESERVED THE DESTINATION'S CONTENT", "hello copy", kept);
     memory_free(kept);
@@ -58,7 +247,7 @@ static void _test_copy(Test *const test) {
     /* A destination under a missing DIRECTORY: not-found on both platforms - and on Windows
      * specifically ERROR_PATH_NOT_FOUND (3), the Win32 code the CRT keeps in _doserrno, where
      * filing errno (ENOENT, 2) into the Win32-shaped classifier reported the file code. */
-    Result const no_directory = file_copy_1(src, "no_such_dir_for_copy/never.tmp");
+    Result const no_directory = file_copy_1(source, "no_such_dir_for_copy/never.tmp");
 
     test_expect_true(test, "a destination under a missing directory is not-found", file_result_is_not_found(no_directory));
 #ifdef _WIN32
@@ -70,8 +259,8 @@ static void _test_copy(Test *const test) {
     test_expect_true(test, "missing source is an error", result_is_error(missing));
     test_expect_false(test, "missing source creates nothing", file_exists_1("file_copy_never_created.tmp"));
 
-    remove(src);
-    remove(dst);
+    remove(source);
+    remove(destination);
 
     test_case_end(test);
 }
@@ -133,48 +322,48 @@ static void _test_rename(Test *const test) {
 static void _test_replace(Test *const test) {
     test_case_begin(test, "file_replace_1: atomic, creates when missing, leaves destination untouched on failure");
 
-    char const *const src = "file_replace_src.tmp";
-    char const *const dst = "file_replace_dst.tmp";
+    char const *const source = "file_replace_src.tmp";
+    char const *const destination = "file_replace_dst.tmp";
 
-    remove(src);
-    remove(dst);
+    remove(source);
+    remove(destination);
 
-    _write_file(src, "version one");
+    _write_file(source, "version one");
 
-    test_expect_true(test, "replace creates a missing destination", result_is_success(file_replace_1(src, dst)));
+    test_expect_true(test, "replace creates a missing destination", result_is_success(file_replace_1(source, destination)));
 
-    char *const first_content = file_read_to_char(dst);
+    char *const first_content = file_read_to_char(destination);
 
     test_expect_string(test, "destination holds version one", "version one", first_content);
     memory_free(first_content);
 
-    _write_file(src, "version two, longer than before");
+    _write_file(source, "version two, longer than before");
 
-    test_expect_true(test, "replace overwrites an existing destination", result_is_success(file_replace_1(src, dst)));
+    test_expect_true(test, "replace overwrites an existing destination", result_is_success(file_replace_1(source, destination)));
 
-    char *const second_content = file_read_to_char(dst);
+    char *const second_content = file_read_to_char(destination);
 
     test_expect_string(test, "destination holds version two", "version two, longer than before", second_content);
     memory_free(second_content);
 
     // Source still holds its own content: file_replace_1 is a copy-and-replace, not a move.
-    char *const src_content = file_read_to_char(src);
+    char *const source_content = file_read_to_char(source);
 
-    test_expect_string(test, "source is untouched by replace", "version two, longer than before", src_content);
-    memory_free(src_content);
+    test_expect_string(test, "source is untouched by replace", "version two, longer than before", source_content);
+    memory_free(source_content);
 
-    remove(src);
+    remove(source);
 
-    Result const missing_source = file_replace_1("file_replace_does_not_exist.tmp", dst);
+    Result const missing_source = file_replace_1("file_replace_does_not_exist.tmp", destination);
 
     test_expect_true(test, "replace with a missing source is an error", result_is_error(missing_source));
 
-    char *const untouched_content = file_read_to_char(dst);
+    char *const untouched_content = file_read_to_char(destination);
 
     test_expect_string(test, "destination is UNTOUCHED after a failed replace", "version two, longer than before", untouched_content);
     memory_free(untouched_content);
 
-    remove(dst);
+    remove(destination);
 
     test_case_end(test);
 }
@@ -245,6 +434,22 @@ static void _test_result_predicates(Test *const test) {
     test_expect_false(test, "success is not cross-device", file_result_is_cross_device(RESULT_SUCCESS));
     test_expect_false(test, "success is not not-found", file_result_is_not_found(RESULT_SUCCESS));
 
+    /* Mid 37: a STATE is never an OS not-found answer, even when its code equals one - no
+     * module produces a STATE not-found (this one's STATE is its EEXIST refusal; trash's STATE
+     * codes are refusals about the trash). Spelled with the platform's own not-found codes so
+     * the pin fails if the STATE guard is dropped. */
+#ifdef _WIN32
+    U32 const not_found_code = (U32) ERROR_FILE_NOT_FOUND;
+    U32 const path_not_found = (U32) ERROR_PATH_NOT_FOUND;
+#else
+    U32 const not_found_code = (U32) ENOENT;
+    U32 const path_not_found = (U32) ENOENT;
+#endif
+
+    test_expect_false(test, "a STATE carrying the not-found code is NOT not-found", file_result_is_not_found(result_make(RESULT_CATEGORY_STATE, not_found_code, 0)));
+    test_expect_false(test, "a STATE carrying the path-not-found code is NOT not-found", file_result_is_not_found(result_make(RESULT_CATEGORY_STATE, path_not_found, 0)));
+    test_expect_true(test, "while the same code as an OS answer IS not-found", file_result_is_not_found(result_from_os_code(not_found_code)));
+
     remove(source);
     remove(taken);
 
@@ -282,7 +487,7 @@ static void _test_file_error(Test *const test) {
     test_expect_true(test, "the directory probe opened (glibc's fopen accepts a directory)", !memory_empty((void*) directory));
 
     if (!memory_empty((void*) directory)) {
-        char buffer[16] = DEFAULT_INITIALIZATION;
+        char buffer[_TEST_DIRECTORY_READ_SIZE] = DEFAULT_INITIALIZATION;
 
         file_read_1(directory, buffer, 1, sizeof(buffer));
 
@@ -328,11 +533,10 @@ static void _test_failure_cleanup(Test *const test) {
      * the cleanup at the end of _file_copy_exclusive is the only thing between this case and
      * a partial left behind. SIGXFSZ is ignored so the limit reports instead of killing. */
     char const *const source   = "cleanup_big_source.tmp";
-    USize const big_size       = 128 * 1024;
-    char *const big            = (char*) memory_alloc(big_size + 1);
+    USize const big_size       = _TEST_BIG_SOURCE_SIZE;
+    char *const big            = (char*) memory_alloc(big_size + CHAR_END_CHARACTER);
 
     char_fill(big, big_size, 'x');
-    big[big_size] = '\0';
 
     remove(source);
     _write_file(source, big);
@@ -344,7 +548,7 @@ static void _test_failure_cleanup(Test *const test) {
 
     struct rlimit small = saved;
 
-    small.rlim_cur = 8 * 1024;
+    small.rlim_cur = _TEST_FILE_SIZE_LIMIT;
 
     void (*const previous)(int) = signal(SIGXFSZ, SIG_IGN);
 
@@ -572,6 +776,84 @@ static void _test_unaddressable_path_refused(Test *const test) {
     test_case_end(test);
 }
 
+/*
+ * A component ending in '.' or ' ' is REFUSED, never trimmed onto its twin.
+ *
+ * Windows-only because the defect is: Win32 path normalisation strips a trailing '.' or ' '
+ * from every component of a non-"\\?\" path, so file_remove_1("report.") deleted "report" -
+ * purgo --purge 'report.' destroyed a file nobody named. Each twin pair is created through
+ * "\\?\" (CreateFileW), which does not trim, and every assertion checks BOTH twins.
+ */
+static void _test_trimmed_name_refused(Test *const test) {
+    test_case_begin(test, "a component ending in '.' or ' ' is REFUSED, never trimmed onto its twin");
+
+#ifdef _WIN32
+    _trimmed_fixture_cleanup();
+
+    bool const fixture = _verbatim_create_file("trim_keep", "plain")
+        && _verbatim_create_file("trim_keep.", "dotted")
+        && _verbatim_create_file("trim_keep ", "spaced")
+        && _verbatim_create_file("trim_source", "source!")
+        && _verbatim_create_directory("trim_sub")
+        && _verbatim_create_directory("trim_sub.")
+        && _verbatim_create_file("trim_sub/inner", "plain")
+        && _verbatim_create_file("trim_sub./inner", "dotted");
+
+    test_expect_true(test, "fixture: every twin pair exists side by side", fixture);
+
+    if (!fixture) {
+        _trimmed_fixture_cleanup();
+        test_case_end(test);
+
+        return;
+    }
+
+    // Removal: the final component, its trailing-space twin, and a MIDDLE component.
+    test_expect_true(test, "file_remove_1(\"trim_keep.\") is refused as unaddressable", file_result_is_unaddressable(file_remove_1("trim_keep.")));
+    test_expect_true(test, "and trim_keep survives it", _verbatim_exists("trim_keep"));
+    test_expect_true(test, "and trim_keep. survives it", _verbatim_exists("trim_keep."));
+    test_expect_true(test, "file_remove_1(\"trim_keep \") is refused as unaddressable", file_result_is_unaddressable(file_remove_1("trim_keep ")));
+    test_expect_true(test, "and trim_keep survives the trailing space too", _verbatim_exists("trim_keep"));
+    test_expect_true(test, "and \"trim_keep \" survives it", _verbatim_exists("trim_keep "));
+    test_expect_true(test, "file_remove_1(\"trim_sub./inner\") - a middle component - is refused", file_result_is_unaddressable(file_remove_1("trim_sub./inner")));
+    test_expect_true(test, "and trim_sub/inner survives it", _verbatim_exists("trim_sub/inner"));
+    test_expect_true(test, "and trim_sub./inner survives it", _verbatim_exists("trim_sub./inner"));
+
+    // Rename: a trimmed SOURCE would move the twin; a trimmed DESTINATION would replace it.
+    test_expect_true(test, "file_rename_1 refuses a trimmed source", file_result_is_unaddressable(file_rename_1("trim_keep.", "trim_moved")));
+    test_expect_true(test, "and trim_keep was not moved", _verbatim_exists("trim_keep") && !_verbatim_exists("trim_moved"));
+    test_expect_true(test, "file_rename_1 refuses a trimmed destination", file_result_is_unaddressable(file_rename_1("trim_source", "trim_keep.")));
+    test_expect_true(test, "and the source stayed put", _verbatim_exists("trim_source"));
+    test_expect_true(test, "and trim_keep was not replaced (still 5 bytes)", _verbatim_size("trim_keep") == 5);
+
+    // Copy, replace and set_modified: the other by-path mutators inherit the same refusal.
+    test_expect_true(test, "file_copy_1 refuses a trimmed destination", file_result_is_unaddressable(file_copy_1("trim_source", "trim_new.")));
+    test_expect_false(test, "and trim_new was not created", _verbatim_exists("trim_new"));
+    test_expect_true(test, "file_replace_1 refuses a trimmed destination", file_result_is_unaddressable(file_replace_1("trim_source", "trim_keep.")));
+    test_expect_true(test, "and trim_keep was not replaced by it (still 5 bytes)", _verbatim_size("trim_keep") == 5);
+    test_expect_true(test, "and trim_keep. was not replaced either (still 6 bytes)", _verbatim_size("trim_keep.") == 6);
+    test_expect_true(test, "file_set_modified_1 refuses a trimmed path", file_result_is_unaddressable(file_set_modified_1("trim_keep.", 0)));
+
+    // THE POINT: the rule is not collateral damage. "." segments and "\\?\" paths still work.
+    test_expect_true(test, "fixture: a plain file for the dot-segment check", _verbatim_create_file("trim_dot_segment.tmp", "x"));
+    test_expect_true(test, "a \".\" component is not a trimmed name", result_is_success(file_remove_1("./trim_dot_segment.tmp")));
+
+    char verbatim[_TEST_VERBATIM_CAPACITY] = DEFAULT_INITIALIZATION;
+
+    test_expect_true(test, "fixture: the narrow \\\\?\\ spelling of trim_keep.", _verbatim_narrow("trim_keep.", verbatim));
+    test_expect_true(test, "a \\\\?\\ path is exempt: it removes exactly trim_keep.", result_is_success(file_remove_1(verbatim)));
+    test_expect_false(test, "trim_keep. is gone", _verbatim_exists("trim_keep."));
+    test_expect_true(test, "and trim_keep is untouched", _verbatim_exists("trim_keep") && _verbatim_size("trim_keep") == 5);
+
+    _trimmed_fixture_cleanup();
+#else
+    // Linux trims nothing: "report." is a name of its own there, and nothing is refused.
+    test_expect_true(test, "not applicable on this platform", true);
+#endif
+
+    test_case_end(test);
+}
+
 static void _test_empty_path_guard(Test *const test) {
     test_case_begin(test, "empty Str/String path returns an error (no abort)");
 
@@ -616,6 +898,247 @@ static void _test_empty_path_guard(Test *const test) {
     test_case_end(test);
 }
 
+/*
+ * memsec MED (2026-10-18): every _2/_3 wrapper copied its sized path whole with char_new_3 and
+ * handed the copy to the _1 form, which reads only up to the first NUL - so "<victim>\0x"
+ * removed, renamed, overwrote or re-dated "<victim>", a file the caller never named, and
+ * reported SUCCESS. The fixture is that prefix, so the defect is its disappearance or change.
+ */
+static void _test_embedded_nul_refused(Test *const test) {
+    test_case_begin(test, "a Str / String path holding a NUL byte is refused, never cut down to its prefix");
+
+    char const *const victim = "file_nul_victim.tmp";
+    char const *const source = "file_nul_source.tmp";
+    char const *const other  = "file_nul_other.tmp";
+    char const *const fresh  = "file_nul_fresh.tmp";
+
+    remove(victim);
+    remove(source);
+    remove(other);
+    remove(fresh);
+    _write_file(victim, "victim");
+    _write_file(source, "source content");
+
+    bool const dated = result_is_success(file_set_modified_1(victim, _TEST_NUL_VICTIM_MTIME));
+
+    test_expect_true(test, "fixture: the victim exists", file_exists_1(victim));
+    test_expect_true(test, "fixture: the victim carries the pinned mtime", dated);
+
+    USize const victim_size         = char_length(victim);
+    char const tail[]               = "x";
+    char named[_TEST_NUL_PATH_SIZE] = DEFAULT_INITIALIZATION;
+
+    // "<victim>\0x": the zero-initialised buffer supplies the NUL between the two halves.
+    memory_copy_1(named, victim, victim_size);
+    memory_copy_1(named + victim_size + 1, tail, sizeof(tail) - 1);
+
+    // Owned deep copies (str_init_static copies its whole size), so the NUL travels with them.
+    USize const named_size = victim_size + 1 + sizeof(tail) - 1;
+    Str view               = str_init_static(named, named_size);
+    String buffer          = string_init_static(named, named_size);
+    Str source_view        = str_init_static(source, char_length(source));
+    String source_buffer   = string_init_static(source, char_length(source));
+    Str other_view         = str_init_static(other, char_length(other));
+    String other_buffer    = string_init_static(other, char_length(other));
+
+    // The queries: without the guard each answers about the victim, which is there.
+    USize size = 0;
+    I64 mtime  = 0;
+
+    test_expect_false(test, "exists_2 answers false, not the victim's true", file_exists_2(&view));
+    test_expect_false(test, "exists_3 answers false, not the victim's true", file_exists_3(&buffer));
+    test_expect_false(test, "size_2 answers false, not the victim's size", file_size_2(&view, &size));
+    test_expect_false(test, "size_3 answers false, not the victim's size", file_size_3(&buffer, &size));
+    test_expect_false(test, "modified_2 answers false, not the victim's mtime", file_modified_2(&view, &mtime));
+    test_expect_false(test, "modified_3 answers false, not the victim's mtime", file_modified_3(&buffer, &mtime));
+
+    /* The openers (memsec MED, 2026-10-18): they handed the Str's own buffer to fopen, which stops
+     * at the NUL - so each answered a handle on the victim, and a write mode truncated it to
+     * nothing. file_open_2/3 are not called here: in this checked build their refusal ends the
+     * process, so test_oom.c (unchecked) pins them. */
+    errno = 0;
+
+    _expect_open_refused(test, "open_try_2 (rb) is nullptr, not a handle on the victim", file_open_try_2(&view, "rb"));
+    _expect_open_refused(test, "open_try_3 (rb) is nullptr, not a handle on the victim", file_open_try_3(&buffer, "rb"));
+    _expect_open_refused(test, "open_wait_2 (rb) is nullptr, not a handle on the victim", file_open_wait_2(&view, "rb", 1));
+    _expect_open_refused(test, "open_wait_3 (rb) is nullptr, not a handle on the victim", file_open_wait_3(&buffer, "rb", 1));
+    _expect_open_refused(test, "open_try_2 (wb) is nullptr", file_open_try_2(&view, "wb"));
+    _expect_open_refused(test, "open_try_3 (wb) is nullptr", file_open_try_3(&buffer, "wb"));
+    _expect_open_refused(test, "open_wait_2 (wb) is nullptr", file_open_wait_2(&view, "wb", 1));
+    _expect_open_refused(test, "open_wait_3 (wb) is nullptr", file_open_wait_3(&buffer, "wb", 1));
+
+    char *const after_open = file_read_to_char(victim);
+
+    test_expect_string(test, "and the victim was not truncated", "victim", after_open);
+    memory_free(after_open);
+
+    // A prefix that is NOT there: a write-mode open of the cut-down name would CREATE it.
+    USize const fresh_size                = char_length(fresh);
+    char fresh_named[_TEST_NUL_PATH_SIZE] = DEFAULT_INITIALIZATION;
+
+    memory_copy_1(fresh_named, fresh, fresh_size);
+    memory_copy_1(fresh_named + fresh_size + 1, tail, sizeof(tail) - 1);
+
+    USize const fresh_named_size = fresh_size + 1 + sizeof(tail) - 1;
+    Str fresh_view               = str_init_static(fresh_named, fresh_named_size);
+    String fresh_buffer          = string_init_static(fresh_named, fresh_named_size);
+
+    _expect_open_refused(test, "open_try_2 (wb) of a missing prefix is nullptr", file_open_try_2(&fresh_view, "wb"));
+    _expect_open_refused(test, "open_try_3 (ab) of a missing prefix is nullptr", file_open_try_3(&fresh_buffer, "ab"));
+    test_expect_false(test, "and the prefix was not created", file_exists_1(fresh));
+
+    str_uninit(&fresh_view);
+    string_uninit(&fresh_buffer);
+
+    // Copy: as the source, the victim would be read into other; as the destination, the copy
+    // refuses an existing file anyway, so the CODE is what tells the guard from that refusal.
+    Result const copy_from_2 = file_copy_2(&view, &other_view);
+    Result const copy_from_3 = file_copy_3(&buffer, &other_buffer);
+    Result const copy_onto_2 = file_copy_2(&source_view, &view);
+    Result const copy_onto_3 = file_copy_3(&source_buffer, &buffer);
+
+    test_expect_u(test, "copy_2 (source) is EMBEDDED_NUL", (USize) FILE_ARGUMENT_EMBEDDED_NUL, (USize) result_code(copy_from_2));
+    test_expect_u(test, "copy_3 (source) is EMBEDDED_NUL", (USize) FILE_ARGUMENT_EMBEDDED_NUL, (USize) result_code(copy_from_3));
+    test_expect_u(test, "copy_2 (destination) is EMBEDDED_NUL", (USize) FILE_ARGUMENT_EMBEDDED_NUL, (USize) result_code(copy_onto_2));
+    test_expect_u(test, "copy_3 (destination) is EMBEDDED_NUL", (USize) FILE_ARGUMENT_EMBEDDED_NUL, (USize) result_code(copy_onto_3));
+    test_expect_true(test, "and both are ARGUMENT", result_category(copy_from_2) == RESULT_CATEGORY_ARGUMENT && result_category(copy_onto_3) == RESULT_CATEGORY_ARGUMENT);
+    test_expect_false(test, "and the victim was not copied anywhere", file_exists_1(other));
+
+    // Replace: as the destination, the victim's content would become the source's.
+    Result const replace_onto_2 = file_replace_2(&source_view, &view);
+    Result const replace_onto_3 = file_replace_3(&source_buffer, &buffer);
+    Result const replace_from_2 = file_replace_2(&view, &other_view);
+    Result const replace_from_3 = file_replace_3(&buffer, &other_buffer);
+
+    test_expect_u(test, "replace_2 (destination) is EMBEDDED_NUL", (USize) FILE_ARGUMENT_EMBEDDED_NUL, (USize) result_code(replace_onto_2));
+    test_expect_u(test, "replace_3 (destination) is EMBEDDED_NUL", (USize) FILE_ARGUMENT_EMBEDDED_NUL, (USize) result_code(replace_onto_3));
+    test_expect_u(test, "replace_2 (source) is EMBEDDED_NUL", (USize) FILE_ARGUMENT_EMBEDDED_NUL, (USize) result_code(replace_from_2));
+    test_expect_u(test, "replace_3 (source) is EMBEDDED_NUL", (USize) FILE_ARGUMENT_EMBEDDED_NUL, (USize) result_code(replace_from_3));
+
+    char *const after_replace = file_read_to_char(victim);
+
+    test_expect_string(test, "and the victim's content is its own", "victim", after_replace);
+    memory_free(after_replace);
+
+    test_expect_false(test, "and nothing was replaced into other", file_exists_1(other));
+
+    // Set modified: the victim would be re-dated to the epoch.
+    Result const dated_2 = file_set_modified_2(&view, 0);
+    Result const dated_3 = file_set_modified_3(&buffer, 0);
+    I64 victim_mtime     = 0;
+
+    test_expect_u(test, "set_modified_2 is EMBEDDED_NUL", (USize) FILE_ARGUMENT_EMBEDDED_NUL, (USize) result_code(dated_2));
+    test_expect_u(test, "set_modified_3 is EMBEDDED_NUL", (USize) FILE_ARGUMENT_EMBEDDED_NUL, (USize) result_code(dated_3));
+    test_expect_true(test, "and the victim keeps its mtime", file_modified_1(victim, &victim_mtime) && victim_mtime == _TEST_NUL_VICTIM_MTIME);
+
+    // Rename: as the destination, the source would REPLACE the victim; as the source, it would move.
+    Result const rename_onto_2 = file_rename_2(&source_view, &view);
+    Result const rename_onto_3 = file_rename_3(&source_buffer, &buffer);
+
+    test_expect_u(test, "rename_2 (destination) is EMBEDDED_NUL", (USize) FILE_ARGUMENT_EMBEDDED_NUL, (USize) result_code(rename_onto_2));
+    test_expect_u(test, "rename_3 (destination) is EMBEDDED_NUL", (USize) FILE_ARGUMENT_EMBEDDED_NUL, (USize) result_code(rename_onto_3));
+    test_expect_true(test, "and the source stayed put", file_exists_1(source));
+
+    char *const after_rename = file_read_to_char(victim);
+
+    test_expect_string(test, "and the victim was not replaced by it", "victim", after_rename);
+    memory_free(after_rename);
+
+    Result const rename_from_2 = file_rename_2(&view, &other_view);
+
+    test_expect_u(test, "rename_2 (source) is EMBEDDED_NUL", (USize) FILE_ARGUMENT_EMBEDDED_NUL, (USize) result_code(rename_from_2));
+    test_expect_true(test, "and the victim was not moved (rename_2)", file_exists_1(victim) && !file_exists_1(other));
+
+    Result const rename_from_3 = file_rename_3(&buffer, &other_buffer);
+
+    test_expect_u(test, "rename_3 (source) is EMBEDDED_NUL", (USize) FILE_ARGUMENT_EMBEDDED_NUL, (USize) result_code(rename_from_3));
+    test_expect_true(test, "and the victim was not moved (rename_3)", file_exists_1(victim) && !file_exists_1(other));
+
+    // Remove, last: a regression here takes the victim with it.
+    Result const removed_2 = file_remove_2(&view);
+
+    test_expect_true(test, "remove_2 is ARGUMENT", result_category(removed_2) == RESULT_CATEGORY_ARGUMENT);
+    test_expect_u(test, "remove_2 is EMBEDDED_NUL", (USize) FILE_ARGUMENT_EMBEDDED_NUL, (USize) result_code(removed_2));
+    test_expect_true(test, "remove_2: THE VICTIM SURVIVES", file_exists_1(victim));
+
+    Result const removed_3 = file_remove_3(&buffer);
+
+    test_expect_true(test, "remove_3 is ARGUMENT", result_category(removed_3) == RESULT_CATEGORY_ARGUMENT);
+    test_expect_u(test, "remove_3 is EMBEDDED_NUL", (USize) FILE_ARGUMENT_EMBEDDED_NUL, (USize) result_code(removed_3));
+    test_expect_true(test, "remove_3: THE VICTIM SURVIVES", file_exists_1(victim));
+
+    // A plain call mistake, not the refusal the trash path is the remedy for, and no OS answer.
+    test_expect_false(test, "EMBEDDED_NUL is not the unaddressable refusal", file_result_is_unaddressable(removed_2));
+    test_expect_false(test, "EMBEDDED_NUL is not reported as not-found", file_result_is_not_found(removed_2));
+    test_expect_false(test, "EMBEDDED_NUL is not reported as an existing destination", file_result_is_exists(removed_2));
+
+    str_uninit(&view);
+    string_uninit(&buffer);
+    str_uninit(&source_view);
+    string_uninit(&source_buffer);
+    str_uninit(&other_view);
+    string_uninit(&other_buffer);
+    remove(victim);
+    remove(source);
+    remove(other);
+    remove(fresh);
+
+    test_case_end(test);
+}
+
+/* Open one sized VIEW of "victim.bak" in "wb" and pin what it reached: the named "victim" exists
+ * and was truncated from its "stale" fixture, and the longer "victim.bak" kept its content. */
+static void _expect_view_open_named(Test *const test, char const *const label, File *file) {
+    test_expect_true(test, label, !memory_empty((void*) file));
+
+    if (!memory_empty((void*) file)) {
+        file_close(&file);
+    }
+
+    USize named_size = 1;
+    bool const sized = file_size_1("victim", &named_size);
+    char *const kept = file_read_to_char("victim.bak");
+
+    test_expect_true(test, "  and it created / truncated the named \"victim\"", sized && named_size == 0);
+    test_expect_string(test, "  and \"victim.bak\" survived with its content", "keep me", kept);
+    memory_free(kept);
+    _write_file("victim", "stale");
+}
+
+/*
+ * design Mid (2026-10-18): file_open_try_2/3 and file_open_wait_2/3 handed the Str/String's own
+ * buffer to fopen, which reads to a terminator - so a VIEW of "victim.bak" sized 6 opened, and in
+ * "wb" truncated, "victim.bak", a file the caller never named. They now open a terminated copy of
+ * exactly the named bytes, as file_exists_2 does.
+ */
+static void _test_sized_view_opens_its_size(Test *const test) {
+    test_case_begin(test, "a sized Str / String VIEW opens exactly its size, never the longer buffer");
+
+    remove("victim");
+    remove("victim.bak");
+    _write_file("victim.bak", "keep me");
+    _write_file("victim", "stale");
+
+    char spelled[]           = "victim.bak";
+    USize const named_size   = char_length("victim");
+    Str const view           = str_init_3(spelled, named_size);
+    String const buffer_view = string_init_4(spelled, named_size);
+
+    _expect_view_open_named(test, "open_try_2 (wb) of the 6-byte view opens", file_open_try_2(&view, "wb"));
+    _expect_view_open_named(test, "open_try_3 (wb) of the 6-byte view opens", file_open_try_3(&buffer_view, "wb"));
+    _expect_view_open_named(test, "open_wait_2 (wb) of the 6-byte view opens", file_open_wait_2(&view, "wb", 1));
+    _expect_view_open_named(test, "open_wait_3 (wb) of the 6-byte view opens", file_open_wait_3(&buffer_view, "wb", 1));
+
+    remove("victim");
+    remove("victim.bak");
+
+    test_case_end(test);
+}
+
+/*==============================================================================
+ * MARK: - Entry Point
+ *============================================================================*/
+
 int main(void) {
     LogConfig const log_config = {
         .level             = LOG_LEVEL_ERROR,
@@ -639,11 +1162,14 @@ int main(void) {
     _test_failure_cleanup(&test);
     _test_cross_device_true(&test);
     _test_unaddressable_path_refused(&test);
+    _test_trimmed_name_refused(&test);
 #ifdef __linux__
     _test_replace_permissions(&test);
     _test_dangling_symlink_destination(&test);
 #endif
     _test_empty_path_guard(&test);
+    _test_embedded_nul_refused(&test);
+    _test_sized_view_opens_its_size(&test);
     test_suite_end(&test);
 
     return test_uninit(&test);
