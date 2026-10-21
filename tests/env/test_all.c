@@ -2,6 +2,10 @@
 #include <string.h>
 #include <malloc.h>
 
+#ifdef _WIN32
+#include <io.h> // _get_osfhandle: file/file.h no longer re-exports its platform headers
+#endif
+
 #include <env/env.h>
 #include <test/test.h>
 

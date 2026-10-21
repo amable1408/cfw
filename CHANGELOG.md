@@ -130,6 +130,8 @@ upstream; a version is tagged when a family is complete, so entries accumulate h
 - file 0.8.0: on Windows every by-path mutator (copy, remove, rename, replace, set_modified) and the read-only openers (`file_open_nofollow_try_*`, `file_final_path_*`) refuse a component ending in `.` or ` ` outside a `\\?\` path with `FILE_ARGUMENT_UNADDRESSABLE_PATH`: Win32 trims those, so `remove("report.")` deleted `report`. Every Str/String path wrapper and opener refuses a path carrying an embedded NUL (`FILE_ARGUMENT_EMBEDDED_NUL`; it used to act on the shorter path before the NUL), and the openers copy the sized path instead of handing the caller's buffer to `fopen`. `file_result_is_not_found` no longer answers true for a STATE result.
 - dir 0.1.2 (first version marker): the same Windows trailing dot/space refusal in the one wide-path normaliser, so remove, remove_all, rename, copy_all, create, exists, list and set_current refuse such a name (`ERROR_INVALID_NAME`) instead of acting on its twin; the Str/String wrappers refuse an embedded NUL (`EINVAL` / `ERROR_INVALID_NAME` - `dir_remove_all_2("important\0junk")` used to remove `important`); a listed link with such a name skips the follow-up attribute query rather than reporting its twin's.
 - http/service/static 0.5.2: follows the `file_basename` rename.
+- sync: env
+- env (tests only): the suite includes `<io.h>` itself for `_get_osfhandle` on Windows; it had relied on `file/file.h` re-exporting its platform headers, which file 0.8.0 no longer does.
 
 ## 0.2.0 - release
 
